@@ -100,4 +100,14 @@ In our case, since our architecture is well validated, we’ll want to focus on 
 
 However, our training run performed well! If yours doesn’t, modern LLMs such as ChatGPT and Claude are quite knowledgeable and can be helpful as you try to improve your model's performance.
 
-We should be able to find a `best.pt` file, which are the weights of the best performing checkpoint produced during the training process. We can now use this with our GUI!
+We should be able to find a `best.pt` file, which are the weights of the best performing checkpoint produced during the training process.
+
+Finally, export it to ONNX so the GUI (and the standalone app) can run it without PyTorch:
+
+```bash
+pip install "ultralytics>=8.3" onnx onnxslim
+yolo export model=best.pt format=onnx imgsz=640 opset=12 simplify=True
+```
+
+Copy both `best.pt` and `best.onnx` into `stepper/ckpts/`. The standalone app bundles `ckpts/best.onnx`
+the next time it is built.

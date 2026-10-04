@@ -8,7 +8,7 @@ src = os.path.join(root, "src")
 name = "HackerfabStepper"
 
 hiddenimports = ["gui", "settings", "camera.webcam", "camera.discovery", "serial.tools.list_ports",
-                 "projector_window", "fullscreen_preview",
+                 "projector_window", "fullscreen_preview", "alignment_detector",
                  "PIL._tkinter_finder", "PIL.ImageTk"]  # ttkbootstrap draws its widgets with Pillow
 if sys.platform == "win32":
     hiddenimports.append("pygrabber.dshow_graph")
@@ -20,6 +20,7 @@ a = Analysis(
         (os.path.join(root, "default.toml"), "."),
         (os.path.join(src, "uvFocusImage", "plus.png"), os.path.join("src", "uvFocusImage")),
         (os.path.join(root, "docs", "HOW-TO-GUIDE.html"), "."),  # opened by Help & guide / F1
+        (os.path.join(root, "ckpts", "best.onnx"), "ckpts"),     # alignment-marker model (runs on OpenCV)
     ],
     hiddenimports=hiddenimports,
     excludes=["ultralytics", "torch", "torchvision", "matplotlib", "pandas", "scipy", "pytest", "IPython"],

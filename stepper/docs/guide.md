@@ -24,25 +24,26 @@ TODO
 
 ## Detection
 
-The GUI allows for alignment marker detection using `ultralytics`.
+The GUI detects alignment markers with a YOLO model (a fine-tuned 2.6M-parameter YOLOv11n).
+The repository includes it twice:
 
-Any `ultralytics` YOLO model is supported. In this repository, we include the `best.pt` file in the root directory, which contains the weights of a finetuned 2.6M parameter YOLOv11n model, which is capable of detecting alignment markers in real time.
+- `ckpts/best.onnx`: used by default. It runs on OpenCV's DNN module (`src/alignment_detector.py`),
+  so neither the standalone app nor `run.bat` / `run.sh` needs PyTorch.
+- `ckpts/best.pt`: the original training checkpoint. It needs the `ultralytics` package. A `.pt`
+  path in the config also picks up a `.onnx` file with the same name next to it.
 
-To train a YOLO model on your own data using `ultralytics`, see [this guide](model.md).
-
-There are two configuration options for detection, housed under the `alignment` section in the TOML config.
-
-These are:
+To train a model on your own data, see [this guide](model.md); it ends with exporting the result to ONNX.
 
 ```toml
 [alignment]
-# Enable or disable real-time detection of alignment markers
+# Start with real-time detection of alignment markers on
 enabled = false
-# Path to the YOLO model weights file
-model_path = "best.pt"
+# The marker model
+model_path = "ckpts/best.onnx"
 ```
 
-The GUI has a checkbox which can be used to enable or disable real-time alignment.
+The **Detect alignment markers in real time** checkbox (Image alignment page) draws the detections
+on the camera preview, refreshed twice a second.
 
 ## Alignment
 
@@ -50,7 +51,7 @@ The alignment system allows for automatic positioning of chips on the stage for 
 
 #### How Alignment Works
 
-1. The system detects alignment markers in the camera image using the YOLO model specified in the configuration.
+1. The system detects alignment markers in the camera image using the model specified in the configuration.
 2. For each detected marker, the system calculates its position relative to predefined reference coordinates.
 3. Based on these differences, the system computes the necessary stage movements to align the chip correctly.
 
@@ -68,6 +69,14 @@ left_marker_x = 280.0    # x-coordinate for markers on the left side
 x_scale_factor = -1100   # Scaling factor for x-axis movements
 y_scale_factor = 800     # Scaling factor for y-axis movements
 ```
+
+The marker coordinates are pixels at the camera resolution given by `reference-width` and
+`reference-height` (default 1920 × 1080). They are scaled automatically when the camera runs at a
+different resolution, so record the resolution you calibrate at.
+
+**Auto-align** moves the stage once and reports the move; click it again to refine. During **tiling**,
+each tile after the first is corrected using only the marks on the edge shared with the previous
+tile (left, right or top, following the snake order).
 
 #### Calibrating Alignment Parameters
 

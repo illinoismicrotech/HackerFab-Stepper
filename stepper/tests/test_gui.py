@@ -20,6 +20,8 @@ from stage_control.stage_controller import StageController
 
 class GuiTests(unittest.TestCase):
     def test_workspaces_settings_and_camera_disabled(self):
+        import ttkbootstrap.style
+        ttkbootstrap.style.Style.instance = None  # other test classes may have made a window already
         try:
             root = ttk.Window(themename='darkly')
         except tkinter.TclError as exc:
@@ -28,7 +30,7 @@ class GuiTests(unittest.TestCase):
         root.report_callback_exception = lambda *args: errors.append("".join(traceback.format_exception(*args)))
         config = gui.LithographerConfig(StageController(), None, .25, 4167, 25000,
                   gui.AlignmentConfig(False, '', 1820, 280, 269, 1075, -1100, 800))
-        with tempfile.TemporaryDirectory() as folder, patch('gui.TkProjector', return_value=TkProjector(root)), patch('gui.YOLO', side_effect=RuntimeError('No model in smoke test')):
+        with tempfile.TemporaryDirectory() as folder, patch('gui.TkProjector', return_value=TkProjector(root)), patch('gui.load_marker_detector', return_value=None):
             app = gui.LithographerGui(config, root, {'camera': {'type': 'none'}}, Path(folder) / 'config.toml')
             try:
                 root.update()

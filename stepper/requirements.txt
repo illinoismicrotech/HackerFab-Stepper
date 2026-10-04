@@ -1,8 +1,8 @@
-# Cross-platform, direct-pip dependencies. Do not freeze a Linux environment
-# here: PyTorch/CUDA packages are selected by pip for the user's OS instead.
+# Cross-platform, direct-pip dependencies for run.bat / run.sh.
+# Alignment-marker detection runs ckpts/best.onnx on OpenCV, so PyTorch is not needed.
+# To retrain the model (docs/model.md), also install: pip install "ultralytics>=8.3,<9"
 opencv-python>=4.10,<5
 pillow>=11.1,<12
 pyserial>=3.5,<4
 toml>=0.10,<0.11
 ttkbootstrap>=1.10,<2
-ultralytics>=8.3,<9

@@ -134,16 +134,28 @@ def _smoke_test() -> int:
     config.setdefault("camera", {})["type"] = "none"
     lithographer_config = gui.LithographerConfig(
         StageController(), None, 0.25, 4167, 25000,
-        gui.AlignmentConfig(False, "", 1820, 280, 269, 1075, -1100, 800))
-    gui.LithographerGui(lithographer_config, root, config, str(Path.cwd() / "smoke-test-config.toml"))
+        gui.AlignmentConfig(False, "ckpts/best.onnx", 1820, 280, 269, 1075, -1100, 800))
+    app = gui.LithographerGui(lithographer_config, root, config, str(Path.cwd() / "smoke-test-config.toml"))
     root.update()
+
+    # The alignment model must be bundled and must run on OpenCV.
+    detector = app.event_dispatcher.model
+    detector_ok = False
+    if detector is not None:
+        try:
+            import numpy as np
+            detector.detect(np.zeros((720, 1280, 3), np.uint8))
+            detector_ok = True
+        except Exception as exc:
+            print(f"Alignment model failed to run: {exc}")
+    print(f"Alignment model: {'ok' if detector_ok else 'MISSING OR BROKEN'} ({getattr(detector, 'path', None)})")
 
     processes_ok = _process_start_works()
     print(f"Child process check: {'ok' if processes_ok else 'FAILED'}")
     if sys.platform == "darwin":
         # Opening any camera on macOS triggers a permission prompt, which a CI machine cannot answer.
         root.destroy()
-        ok = not errors and processes_ok
+        ok = not errors and processes_ok and detector_ok
         if errors:
             print("UI callback errors:\n" + "\n".join(errors))
         print("SMOKE TEST " + ("PASSED" if ok else "FAILED"))
@@ -168,7 +180,7 @@ def _smoke_test() -> int:
     # The worker must answer from its own process ("No usable camera mode" / "No camera found");
     # a timeout or a crashed worker means multiprocessing is broken in this build.
     reported = any(text in worker_status for text in ("No usable camera mode", "No camera found"))
-    ok = not errors and processes_ok and worker_state == "error" and reported
+    ok = not errors and processes_ok and detector_ok and worker_state == "error" and reported
     print("SMOKE TEST " + ("PASSED" if ok else "FAILED"))
     return 0 if ok else 1
 

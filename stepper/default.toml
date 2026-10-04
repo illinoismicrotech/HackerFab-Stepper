@@ -57,8 +57,13 @@ invert-z = true
 [alignment]
 # Enable or disable real-time detection of alignment markers
 enabled = true
-# Path to the YOLO model weights file
-model_path = "ckpts/best.pt"
+# Alignment-marker model. best.onnx runs without PyTorch (also in the standalone app);
+# best.pt needs the ultralytics package. A .pt path also uses a .onnx file next to it.
+model_path = "ckpts/best.onnx"
+# Camera resolution the marker coordinates below were measured at. They are scaled to
+# whatever resolution the camera actually runs at.
+reference-width = 1920
+reference-height = 1080
 # Alignment marker reference coordinates (in pixels)
 right_marker_x = 1820.0  # x-coordinate for markers on the right side
 top_marker_y = 269.0     # y-coordinate for markers on the top

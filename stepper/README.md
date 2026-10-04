@@ -39,7 +39,7 @@ The easiest way to run the stepper: download one file from the repository's **Re
 
 - **Where files go:** on first run it creates `default.toml`, `src/uvFocusImage/plus.png`, `stepper_captures/`, the guide and `HackerfabStepper.log` in its home folder: next to the app on Windows and Linux (or `%LOCALAPPDATA%\HackerfabStepper` / `~/.local/share/HackerfabStepper` if that folder is read-only), and `~/Documents/HackerfabStepper` on macOS. Set `HACKERFAB_HOME` to choose another folder.
 - **Unsigned:** Windows SmartScreen may warn (**More info → Run anyway**); on macOS right-click → **Open** the first time.
-- **No YOLO:** alignment marker detection is left out, because PyTorch would make the download over 1 GB. Use `run.bat` / `run.sh` when you need it.
+- **Alignment:** alignment-marker detection (Auto-align, tiling) is included; it runs `ckpts/best.onnx` on OpenCV.
 - **Projector:** a borderless projector window opens on the projector's display at launch (the OS must *extend*, not mirror, the desktop). `[projector] window = "off"` disables it.
 - **Camera bands:** to remove the coloured bands the DLP causes in the Arducam image on Windows, set `[camera] exposure` to `-5` or `-4` (Settings → Camera → Exposure) and dim the red image with the **Red brightness** slider. The Windows camera backend defaults to Media Foundation; with DirectShow the Arducam B0477 streams a solid white image.
 
@@ -287,8 +287,11 @@ baud-rate = 115200
 [alignment]
 # Enable or disable real-time detection of alignment markers
 enabled = false
-# Path to the YOLO model weights file
-model_path = "best.pt"
+# Alignment-marker model (runs on OpenCV; a .pt file needs the ultralytics package)
+model_path = "ckpts/best.onnx"
+# Camera resolution the marker coordinates below were measured at
+reference-width = 1920
+reference-height = 1080
 # Alignment marker reference coordinates (in pixels)
 right_marker_x = 1634.0  # x-coordinate for markers on the right side
 top_marker_y = 117.5     # y-coordinate for markers on the top

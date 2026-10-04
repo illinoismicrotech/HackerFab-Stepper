@@ -34,4 +34,4 @@ jobs:
         run: |
           $Python = (Get-ChildItem .venv-*\Scripts\python.exe | Select-Object -First 1).FullName
           & $Python -m compileall -q src
-          & $Python -c "import tkinter, cv2, serial, toml, ttkbootstrap, ultralytics; print('Windows dependencies OK')"
+          & $Python -c "import tkinter, cv2, serial, toml, ttkbootstrap; cv2.dnn.readNetFromONNX('ckpts/best.onnx'); print('Windows dependencies OK')"

@@ -1,6 +1,5 @@
 # Dependencies bundled into the standalone app (Windows, macOS and Linux), plus the builder.
-# ultralytics/PyTorch are intentionally left out to keep the download small: alignment marker
-# detection is disabled in the standalone app. Use run.bat / run.sh when you need it.
+# ultralytics/PyTorch are not needed: alignment-marker detection runs the ONNX model on OpenCV.
 opencv-python-headless>=4.10,<5   # the app never uses OpenCV's own windows, so the smaller build is enough
 numpy>=2.0,<2.3
 pillow>=11.1,<12

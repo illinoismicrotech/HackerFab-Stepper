@@ -48,7 +48,6 @@ if (-not (Test-Path $VenvPython)) {
     & $PythonExe @PythonArgs -m venv $VenvDir
 }
 
-# First run downloads PyTorch and its dependencies (~1-2 GB). This is normal.
 Write-Host "  Checking dependencies..." -ForegroundColor Yellow
 & $VenvPython -m pip install --prefer-binary --requirement requirements.txt
 if ($LASTEXITCODE -ne 0) {

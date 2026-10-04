@@ -229,7 +229,7 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
 
 <p>HackerFab Stepper controls a maskless photolithography stepper. Instead of a physical mask, a DLP projector shines a pattern image through the optics onto a resist-coated chip sitting on a motorized stage. A USB microscope camera looks at the same spot so you can see what you are doing.</p>
 
-<p>This guide covers the standalone HackerFab Stepper app for Windows, macOS and Linux. It runs without installing Python. It is built from the same source code as the <span class="path">run.bat</span> launcher in the repository, minus the YOLO alignment-marker model, which would make it over 1 GB.</p>
+<p>This guide covers the standalone HackerFab Stepper app for Windows, macOS and Linux. It runs without installing Python. It is built from the same source code as the <span class="path">run.bat</span> launcher in the repository, including alignment-marker detection.</p>
 
 <h3>How a session goes</h3>
 <ol class="steps">
@@ -557,7 +557,7 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
   <tr><td><span class="dot">5</span></td><td><b class="ui">Before you expose</b>, a live checklist: whether a pattern is loaded, the exposure time in seconds, whether the stage is connected, and a reminder about the projector display. Red lines are problems to fix first.</td></tr>
 </table></div>
 <ol class="steps uv">
-  <li><strong>Open the Expose tab.</strong> The app switches to UV mode and the projector goes dark; nothing is projected until you ask. If <span class="ui">Auto-save snapshot on UV mode entry</span> is on, a camera snapshot named <span class="path">uv_mode_entry_&lt;date-time&gt;.png</span> is saved at this moment.</li>
+  <li><strong>Open the Expose tab.</strong> The app switches to UV mode and the projector goes dark; nothing is projected until you ask. If <span class="ui">Save a photo automatically when entering UV</span> is on, a camera snapshot named <span class="path">uv_mode_entry_&lt;date-time&gt;.png</span> is saved at this moment.</li>
   <li><strong>Optional, UV focus check.</strong> UV light often focuses at a slightly different Z than red; the tiling code in this app assumes 40 µm. On the left, <span class="ui">Plus Mark</span> is a crosshair: select it and click <span class="ui">Use selected mark</span> to project it in UV, then adjust Z with the Z buttons. <span class="ui">Add mark image…</span> adds your own mark images. <b>The crosshair exposes resist where it lands</b>, so do this on a spot you don't need, and click <span class="ui">Clear projector (black)</span> when done.</li>
   <li><strong>Set Exposure Time (ms).</strong> The default is 8000, which is 8 seconds. The right value depends on your resist, projector brightness and optics; use your team's calibrated value. The pattern actually stays on about 30 to 40 ms longer than the number you enter, which is negligible at several seconds but significant for exposures under half a second.</li>
   <li><strong>Optional, Posterize Cutoff (%).</strong> Tick it to turn the pattern into pure black and white: pixels brighter than the cutoff become fully on, the rest fully off. Useful for greyscale or anti-aliased images.</li>
@@ -587,21 +587,21 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
   <li><b>Relative:</b> under <span class="ui">Adjustment</span>, the <span class="ui">+X</span>, <span class="ui">−X</span>, <span class="ui">+Y</span>, <span class="ui">−Y</span>, <span class="ui">+T</span> and <span class="ui">−T</span> buttons nudge by the amounts in <span class="ui">Step Size (pixels, pixels, degrees)</span>, which default to 10, 10 and 10.</li>
 </ul>
 
-<h3>Global Settings</h3>
+<h3>Focus &amp; detection options</h3>
 <div class="table-wrap"><table>
   <tr><th>Control</th><th>What it does</th></tr>
   <tr><td><span class="ui">Autofocus when switching between red and UV</span></td><td>Off by default. When on, switching to <span class="ui">2 · Focus (red light)</span> runs autofocus in red, and switching to <span class="ui">3 · Expose (UV light)</span> waits 2 seconds and then runs autofocus in UV.</td></tr>
-  <tr><td><span class="ui">Detect alignment markers in real time</span></td><td><b class="no">Not in the standalone app.</b> Draws boxes around detected alignment marks using the YOLO model. Use <span class="path">run.bat</span> for this.</td></tr>
-  <tr><td><span class="ui">Auto-align (needs marker detection)</span></td><td><b class="no">Not in the standalone app.</b> Moves the stage so detected marks line up with the calibrated positions in <code>[alignment]</code>.</td></tr>
+  <tr><td><span class="ui">Detect alignment markers in real time</span></td><td>Draws green boxes around the alignment marks the model finds in the camera view (updated twice a second). Use it to check that the marks are detected before Auto-align or tiling.</td></tr>
+  <tr><td><span class="ui">Auto-align</span></td><td>Finds the marks, moves the stage so they line up with the calibrated positions in <code>[alignment]</code>, and says how far it moved. Click again to refine. If no marks are found it says so and does not move.</td></tr>
   <tr><td><span class="ui">Autofocus now</span></td><td>Runs autofocus once, as described in <a href="#exp-focus">Part 7</a>.</td></tr>
   <tr><td><span class="ui">Black border around pattern (%)</span></td><td>Shrinks the pattern within the canvas: 0 uses the full canvas, 50 makes it half the width and height, centered. Applies to the pattern only.</td></tr>
-  <tr><td><span class="ui">Current Pattern</span></td><td>A thumbnail of the pattern as it will be projected.</td></tr>
-  <tr><td><span class="ui">Auto-save snapshot on UV mode entry</span></td><td>Saves a camera snapshot each time you switch to <span class="ui">3 · Expose (UV light)</span>, as a record of the alignment just before exposing.</td></tr>
+  <tr><td><span class="ui">Pattern in use</span></td><td>A thumbnail of the pattern as it will be projected.</td></tr>
+  <tr><td><span class="ui">Save a photo automatically when entering UV</span></td><td>Saves a camera snapshot each time you switch to <span class="ui">3 · Expose (UV light)</span>, as a record of the alignment just before exposing.</td></tr>
   <tr><td><span class="ui">Save photos to</span>, <span class="ui">Choose folder…</span></td><td>Where snapshots go. Defaults to <span class="path">stepper_captures\</span> in the app's folder.</td></tr>
 </table></div>
 
-<div class="callout exe"><b>Why alignment detection is missing</b>
-<p>Marker detection uses a YOLO model run by PyTorch, which adds 1 to 2 GB. The app leaves it out; the checkbox and button are still there but do nothing useful. Everything else works. On a PC that needs detection, use <span class="path">run.bat</span> from the repository.</p></div>
+<div class="callout"><b>About the detector</b>
+<p>Marks are found by a small YOLO neural network trained on photos of real alignment marks (<span class="path">ckpts/best.onnx</span>). It runs on OpenCV, built into the app, so no extra software is needed. The calibrated mark positions under <code>[alignment]</code> were measured on one station's camera; if Auto-align moves the wrong way or too far on yours, recalibrate them as described in <span class="path">docs/guide.md</span>.</p></div>
 </section>
 
 <!-- =============================== 9 =============================== -->
@@ -630,12 +630,14 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
 <p>Tiling exposes a pattern larger than one field by cutting it into overlapping tiles and exposing them one after another in a snake pattern.</p>
 <ul>
   <li><span class="ui">Split pattern into tiles</span> cuts the current pattern into tiles saved in a <span class="path">tiles\</span> folder in the app's folder, and fills in the tile counts.</li>
-  <li>The <span class="ui">X</span> and <span class="ui">Y</span> boxes set <span class="ui">Offset (µm)</span>, the stage move between tiles (defaults 983 and 512 µm), and <span class="ui">Amount</span>, the number of tiles.</li>
-  <li><span class="ui">Start tiling</span> runs the sequence: for each tile it moves, autofocuses in red, aligns to the previous tile's marks, shifts Z by the UV offset, autofocuses in UV, exposes, and returns.</li>
-  <li><span class="ui">Photograph the whole chip Chip Images</span> moves the stage over the chip in a grid, photographs each spot, and stitches an overview image shown under the button.</li>
+  <li>Tiles sit on an even grid. Where the last row or column reaches past the pattern, the extra area is black (no light).</li>
+  <li>The <span class="ui">X</span> and <span class="ui">Y</span> boxes set <span class="ui">Distance between tiles (µm)</span>, the stage move between tiles (defaults 983 and 512 µm), and <span class="ui">Number of tiles</span>, filled in by the split. A negative number reverses that direction.</li>
+  <li><span class="ui">Start tiling</span> asks for confirmation, then for each tile: moves, autofocuses in red, finds the previous tile's marks on the edge where that tile is (left, right or top) and corrects the stage position, shifts Z by the UV offset, autofocuses in UV, exposes, and returns to red.</li>
+  <li><span class="ui">Stop tiling</span> (or <span class="ui">Stop exposure</span>) stops the whole run. It also stops by itself if an exposure is refused or the stage fails. At the end a summary lists what happened to each tile, including any tile where no marks were found.</li>
+  <li><span class="ui">Photograph the whole chip</span> moves the stage over the chip in a grid, photographs each spot, and stitches an overview image shown under the button.</li>
 </ul>
-<div class="callout exe"><b>Tiling needs the full Python version</b>
-<p>Each tile after the first is aligned with the YOLO model, which the app does not include; you get an <span class="ui">Alignment unavailable</span> message for each tile. Run tiling from <span class="path">run.bat</span>. Also note that <span class="ui">Stop tiling</span> is not implemented yet and stays greyed out: <span class="ui">Stop exposure</span> only stops the current tile's exposure. Closing the app is the only way to stop the whole run.</p></div>
+<div class="callout"><b>Before a real tiling run</b>
+<p>Try it on a scrap chip first: check with <span class="ui">Detect alignment markers in real time</span> that the marks are found, and that the stage steps between tiles go the right way on your stage.</p></div>
 </section>
 
 <!-- =============================== 10 =============================== -->
@@ -706,11 +708,12 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
 </table></div>
 
 <h3>[alignment]</h3>
-<p>Used only by marker detection, Auto-Align and tiling, so the app ignores it. It is documented here so a <span class="path">config.toml</span> can be shared with <span class="path">run.bat</span> installations.</p>
+<p>Used by marker detection, Auto-align and tiling.</p>
 <div class="table-wrap"><table>
   <tr><th>Key</th><th>Default</th><th>Meaning</th></tr>
   <tr><td><code>enabled</code></td><td><code>true</code></td><td>Start with real-time detection on.</td></tr>
-  <tr><td><code>model_path</code></td><td><code>"ckpts/best.pt"</code></td><td>The YOLO model file.</td></tr>
+  <tr><td><code>model_path</code></td><td><code>"ckpts/best.onnx"</code></td><td>The marker model. <code>.onnx</code> runs on OpenCV; a <code>.pt</code> file needs the ultralytics package (and a <code>.onnx</code> next to it is used instead when present).</td></tr>
+  <tr><td><code>reference-width</code>, <code>reference-height</code></td><td><code>1920</code>, <code>1080</code></td><td>Camera resolution the marker positions below were measured at. They are scaled to the camera's actual resolution.</td></tr>
   <tr><td><code>left_marker_x</code>, <code>right_marker_x</code></td><td><code>280.0</code>, <code>1820.0</code></td><td>Camera pixel x-positions where left and right marks should sit when aligned.</td></tr>
   <tr><td><code>top_marker_y</code>, <code>bottom_marker_y</code></td><td><code>269.0</code>, <code>1075.0</code></td><td>Camera pixel y-positions for top and bottom marks.</td></tr>
   <tr><td><code>x_scale_factor</code>, <code>y_scale_factor</code></td><td><code>-1100</code>, <code>800</code></td><td>Convert a mark's offset (as a fraction of the image) into stage movement in µm. The sign sets direction.</td></tr>
@@ -862,7 +865,7 @@ text-scale = 1.25</pre>
 <h2 class="part"><span class="n">13</span><span>For maintainers</span></h2>
 
 <h3>What the standalone app is</h3>
-<p>A PyInstaller build of the <span class="path">stepper/</span> folder: a one-file program on Windows and Linux, and an <span class="path">.app</span> bundle on macOS. It bundles Python 3.12, OpenCV (headless), NumPy, Pillow, pyserial, toml and ttkbootstrap. It leaves out ultralytics and PyTorch; <span class="path">gui.py</span> imports YOLO optionally, so the app runs without it.</p>
+<p>A PyInstaller build of the <span class="path">stepper/</span> folder: a one-file program on Windows and Linux, and an <span class="path">.app</span> bundle on macOS. It bundles Python 3.12, OpenCV (headless), NumPy, Pillow, pyserial, toml and ttkbootstrap. Alignment-marker detection uses <span class="path">ckpts/best.onnx</span> on OpenCV's DNN module (<span class="path">src/alignment_detector.py</span>), so neither the app nor <span class="path">run.bat</span> / <span class="path">run.sh</span> needs PyTorch.</p>
 
 <h3>What happens at startup</h3>
 <ol class="steps">

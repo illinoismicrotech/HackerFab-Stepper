@@ -13,10 +13,11 @@ dependencies = [
     "pyserial>=3.5",
     "toml>=0.10",
     "ttkbootstrap>=1.10",
-    "ultralytics>=8.3",
 ]
 
 [project.optional-dependencies]
+# Only needed to retrain or re-export the alignment model: uv sync --extra training
+training = ["ultralytics>=8.3", "onnx>=1.12", "onnxslim>=0.1.71"]
 # Install with: uv sync --extra basler
 basler = ["pypylon>=4.1"]
 

@@ -42,7 +42,6 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 
-# On first run this downloads PyTorch and its dependencies (~1-2 GB).
 echo "  Checking dependencies..."
 "$VENV_DIR/bin/python" -m pip install --prefer-binary --requirement requirements.txt
 echo "  Dependencies OK"

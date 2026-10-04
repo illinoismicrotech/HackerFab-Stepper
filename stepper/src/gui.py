@@ -28,12 +28,7 @@ import numpy as np
 import serial
 import math
 from PIL import Image, ImageOps, ImageTk
-try:
-    # Optional: alignment marker detection needs ultralytics + PyTorch (~1-2 GB).
-    # The standalone Windows exe ships without it; everything else still works.
-    from ultralytics import YOLO
-except ImportError:
-    YOLO = None
+from alignment_detector import load_marker_detector, marker_centers
 from camera.camera_module import CameraModule
 from camera.webcam import Webcam
 from settings import SettingsPage
@@ -89,28 +84,70 @@ def compute_focus_score(camera_image, blue_only, save=False):
 
 
 def detect_alignment_markers(model, image, draw_rectangle=False):
+    """Find alignment marks in an RGB camera frame. Returns ([((x0, y0), (x1, y1)), ...], annotated copy)."""
     detections = []
-    display_image = image.copy()
+    display_image = image.copy() if draw_rectangle else image
     try:
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        original_height, original_width = image_rgb.shape[:2]
-        resized = cv2.resize(image_rgb, (640, 640))
-        results = model(resized)
-        boxes = results[0].boxes
-        for box in boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            x1 = int(x1 * original_width / 640)
-            x2 = int(x2 * original_width / 640)
-            y1 = int(y1 * original_height / 640)
-            y2 = int(y2 * original_height / 640)
-            detections.append(((x1, y1), (x2, y2)))
-            print('mark at ', (x1 + x2) / 2, (y1 + y2) / 2)
+        for (corner0, corner1), score in model.detect(image):
+            detections.append((corner0, corner1))
             if draw_rectangle:
-                cv2.rectangle(display_image, (x1, y1), (x2, y2), (0, 255, 0), 5)
+                cv2.rectangle(display_image, corner0, corner1, (0, 255, 0), max(2, image.shape[1] // 400))
     except Exception as e:
         print(f"Detection failed: {e}")
+    return detections, display_image
 
-    return detections, display_image 
+
+def alignment_correction(centers, alignment, tiling=False):
+    """Stage move (µm) that brings detected marks onto their calibrated positions.
+
+    centers are mark centres as fractions of the frame. The calibrated positions are in
+    pixels of a reference camera resolution, so they stay valid at any capture resolution.
+    For tiling only marks near the top give a Y correction, because the previous row's
+    marks are the only ones that exist yet. Returns (dx, dy, marks used for x, for y).
+    """
+    left = alignment.left_marker_x / alignment.reference_width
+    right = alignment.right_marker_x / alignment.reference_width
+    top = alignment.top_marker_y / alignment.reference_height
+    bottom = alignment.bottom_marker_y / alignment.reference_height
+    xs, ys = [], []
+    for x, y in centers:
+        xs.append(alignment.x_scale_factor * ((right if x > 0.5 else left) - x))
+        if tiling:
+            if y < 0.3:
+                ys.append(alignment.y_scale_factor * (top - y))
+        else:
+            ys.append(alignment.y_scale_factor * ((bottom if y > 0.5 else top) - y))
+    dx = sum(xs) / len(xs) if xs else 0.0
+    dy = sum(ys) / len(ys) if ys else 0.0
+    return dx, dy, len(xs), len(ys)
+
+
+def filter_edge(centers, edge, edge_fraction=0.25):
+    """Keep only marks near one edge of the frame ('left', 'right' or 'top')."""
+    if edge == "left":
+        return [c for c in centers if c[0] <= edge_fraction]
+    if edge == "right":
+        return [c for c in centers if c[0] >= 1 - edge_fraction]
+    if edge == "top":
+        return [c for c in centers if c[1] <= edge_fraction]
+    return list(centers)
+
+
+def tiling_alignment_edge(x_idx, y_idx, x_count):
+    """Which edge of the camera view shows the previous tile's marks, for a snake-order run:
+    rows go left-to-right on even rows and right-to-left on odd rows."""
+    first_in_row = x_idx == (0 if y_idx % 2 == 0 else x_count - 1)
+    if first_in_row:
+        return None if y_idx == 0 else "top"
+    return "left" if y_idx % 2 == 0 else "right"
+
+
+def tile_positions(length, tile, overlap):
+    """Top-left offsets of tiles along one axis. The grid is evenly spaced (constant stage
+    step); the last tile may extend past the image and is padded with black."""
+    stride = tile - overlap
+    count = max(1, math.ceil(max(0, length - overlap) / stride))
+    return [i * stride for i in range(count)] 
 
 
 class StrAutoEnum(str, Enum):
@@ -181,6 +218,8 @@ class AlignmentConfig:
     bottom_marker_y: float
     x_scale_factor: float
     y_scale_factor: float
+    reference_width: float = 1920.0   # camera resolution the marker positions were measured at
+    reference_height: float = 1080.0
 
 
 @dataclass
@@ -443,7 +482,7 @@ def describe_stage_error(exc: Exception, state: str = "") -> str:
 class EventDispatcher:
     hardware: Lithographer
     root: Tk
-    model: Optional[YOLO]
+    model: Optional[object]  # alignment-marker detector, see alignment_detector.py
     camera: Optional[CameraModule]
     red_focus: ProcessedImage
     uv_focus: ProcessedImage
@@ -1097,17 +1136,9 @@ class EventDispatcher:
     def initialize_alignment(self, config: LithographerConfig):
         self.config = config
         self.realtime_detection = config.alignment.enabled
-        # Attempt loading the model even if detection is off by default
-        if YOLO is None:
-            print("Alignment detection unavailable: the 'ultralytics' package is not installed in this build.")
-            return
-        try:
-            print("loading model")
-            model_path = config.alignment.model_path
-            self.model = YOLO(model_path)
-            print("loaded model")
-        except Exception as e:
-            print(f"Failed to load YOLO model: {e}")
+        # Load the model even if live detection is off by default (Auto-align and tiling use it).
+        self.model = load_marker_detector(config.alignment.model_path)
+        print(f"Alignment model: {getattr(self.model, 'path', 'not available')}")
 
     def set_snapshot_directory(self, directory: Path):
         self.snapshot_directory = directory
@@ -1287,7 +1318,15 @@ class CameraFrame:
         self.event_dispatcher.set_latest_image(camera_image)
         model = self.event_dispatcher.model
         if model and self.event_dispatcher.realtime_detection:
-            _, camera_image = detect_alignment_markers(model, camera_image, draw_rectangle=True)
+            # Detection takes tens of ms; run it twice a second and reuse the boxes in between,
+            # so the preview stays smooth.
+            now = time.monotonic()
+            if now - getattr(self, "_last_detection_at", 0.0) > 0.5:
+                self._last_detection_at = now
+                self._last_marks, _ = detect_alignment_markers(model, camera_image)
+            camera_image = camera_image.copy()
+            for corner0, corner1 in getattr(self, "_last_marks", []):
+                cv2.rectangle(camera_image, corner0, corner1, (0, 255, 0), max(2, camera_image.shape[1] // 400))
         width = max(320, min(760, self.frame.winfo_width() - 36))
         image = Image.fromarray(camera_image)
         image.thumbnail((width, 360), Image.Resampling.LANCZOS)
@@ -1808,7 +1847,7 @@ class ChipFrame:
         self.model.add_event_listener(Event.CHIP_CHANGED, on_chip_changed)
 
         _cbtn_grid = dict(padx=4, pady=4)
-        _cbtn_w = 14
+        _cbtn_w = 0  # size each button to its label
         self.open_chip_button = ttk.Button(self.chip_select_frame, text="Open record…",
                                            command=on_open, bootstyle="secondary-outline", width=_cbtn_w)
         self.open_chip_button.grid(row=0, column=2, **_cbtn_grid)
@@ -2372,55 +2411,40 @@ class GlobalSettingsFrame:
 
         def do_align():
             if event_dispatcher.camera_image is None or event_dispatcher.model is None:
-                messagebox.showinfo("Alignment unavailable", "Connect a live camera and load an alignment model first.")
+                messagebox.showinfo("Alignment unavailable", "Auto-align needs a live camera image and the alignment "
+                                    "model (ckpts/best.onnx).")
                 return
-            h, w, _ = event_dispatcher.camera_image.shape
-            markers, _ = detect_alignment_markers(event_dispatcher.model, event_dispatcher.camera_image)
-            dx, dy = 0, 0
-            if len(markers) == 0:
+            image = event_dispatcher.camera_image
+            h, w = image.shape[:2]
+            markers, _ = detect_alignment_markers(event_dispatcher.model, image)
+            if not markers:
+                self.align_status.configure(text="No alignment marks found. Focus in red and make sure the marks are in view.")
                 return
-
-            # Get alignment parameters from config
-            alignment = event_dispatcher.config.alignment
-
-            for m in markers:
-                xy0, xy1 = m
-                x0, y0 = xy0
-                x1, y1 = xy1
-                # compute normalized centers of the bounding box
-                x = (x0 + x1) / 2 / w
-                y = (y0 + y1) / 2 / h
-
-                if x > 0.5:
-                    dx += alignment.x_scale_factor * (alignment.right_marker_x / w - x)
-                else:
-                    dx += alignment.x_scale_factor * (alignment.left_marker_x / w - x)
-                if y > 0.5:
-                    dy += alignment.y_scale_factor * (alignment.bottom_marker_y / h - y)
-                else:
-                    dy += alignment.y_scale_factor * (alignment.top_marker_y / h - y)
-
-            dx /= len(markers)
-            dy /= len(markers)
-            event_dispatcher.move_relative({ 'x': dx, 'y': dy })
-
-            print(markers)
+            dx, dy, _, _ = alignment_correction(marker_centers(markers, w, h), event_dispatcher.config.alignment)
+            try:
+                event_dispatcher.move_relative({'x': dx, 'y': dy})
+            except StageError:
+                return
+            self.align_status.configure(text=f"Moved X {dx:+.1f} µm, Y {dy:+.1f} µm using {len(markers)} mark(s). "
+                                             "Click again to refine.")
 
         self.alignbutton = ttk.Button(
             self.frame,
-            text="Auto-align (needs marker detection)",
+            text="Auto-align",
             command=do_align,
             state="disabled" if event_dispatcher.model is None else "normal",
             bootstyle="primary-outline",
-            width=12,
         )
         self.alignbutton.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+        self.align_status = ttk.Label(self.frame, text="" if event_dispatcher.model is not None else
+                                      "Alignment model not found, so marker detection and Auto-align are off.",
+                                      bootstyle="secondary", wraplength=420)
+        self.align_status.grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
 
         self.autofocus_button = ttk.Button(
             self.frame, text="Autofocus now",
             command=lambda: event_dispatcher.autofocus(blue_only=event_dispatcher.in_uv(), interactive=True),
             bootstyle="secondary-outline",
-            width=12,
         )
         self.autofocus_button.grid(row=2, column=0, padx=4, pady=4, sticky="ew")
 
@@ -2428,9 +2452,9 @@ class GlobalSettingsFrame:
         # Or, even further, maybe this should just be the same as the interface for posterization strength?
         self.border_size_var = IntVar()
         self.border_label = ttk.Label(self.frame, text="Black border around pattern (%)")
-        self.border_label.grid(row=3, column=0)
+        self.border_label.grid(row=4, column=0, sticky="w", padx=4, pady=(8, 14))
         self.border_entry = IntEntry(self.frame, var=self.border_size_var, default=0, min_value=0, max_value=100)
-        self.border_entry.widget.grid(row=3, column=1, sticky="nesw")
+        self.border_entry.widget.grid(row=4, column=1, sticky="ew", padx=4, pady=(8, 14))
 
         def on_border_size_change(*_):
             event_dispatcher.set_border_size(self.border_size_var.get())
@@ -2441,9 +2465,9 @@ class GlobalSettingsFrame:
         self.photo = None
 
         ttk.Label(self.frame, text="Pattern in use", anchor="center").grid(
-            row=4, column=0, columnspan=2, pady=(6, 2))
+            row=5, column=0, columnspan=2, pady=(6, 2))
         self.current_image = ttk.Label(self.frame, image=self.placeholder_photo)  # type:ignore
-        self.current_image.grid(row=5, column=0, columnspan=2, pady=(0, 4))
+        self.current_image.grid(row=6, column=0, columnspan=2, pady=(0, 4))
 
         # Disable the autofocus button if autofocus is already running
         def movement_lock_changed():
@@ -2466,7 +2490,7 @@ class GlobalSettingsFrame:
         event_dispatcher.add_event_listener(Event.SHOWN_IMAGE_CHANGED, shown_image_changed)
 
         self.snapshot_frame = ttk.Labelframe(self.frame, text="Camera photos")
-        self.snapshot_frame.grid(row=6, column=0, columnspan=2, sticky="ew", pady=5)
+        self.snapshot_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=5)
 
         self.auto_snapshot_var = BooleanVar(value=event_dispatcher.auto_snapshot_on_uv)
         self.auto_snapshot_check = ttk.Checkbutton(
@@ -2559,274 +2583,192 @@ class TilingFrame:
         self.x_settings = OffsetAmountFrame(self.frame, "X", 1037-54) #Move amount between exposures in X
         self.y_settings = OffsetAmountFrame(self.frame, "Y", 539-27)  #Move amount between exposures in y
 
-        #Tiling verisons of alignment
-        def detect_alignment_markers_tiling(yolo_model, image, draw_rectangle=False, edge=None, edge_fraction=0.25):
-            #Detects alignment markers and optionally filters detections by image edge(s).
-            #yolo_model: YOLO model
-            #image: image to detect on 
-            #draw_rectangle: If True, draw rectangles
-            #edge: 'left', 'right', 'top', or a list like ['left', 'right'] where markers are expected
-                                                    #none means that markers are expect on all edges
-            #edge_fraction: Fraction of width/height considered as edge region
+        self.running = False
+        self.stop_requested = False
+        self.tile_dir = Path("tiles")
+        self.tile_size = (3840, 2160)   # pattern pixels per exposure (the projector's full field)
+        self.tile_overlap = (200, 200)  # shared strip holding the alignment marks, in pattern pixels
 
-            detections = []
-            display_image = image.copy()
-            try:
-                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                original_height, original_width = image_rgb.shape[:2]
-                resized = cv2.resize(image_rgb, (640, 640))
-                results = yolo_model(resized)
-                boxes = results[0].boxes
-
-                if isinstance(edge, str):
-                    edge = [edge]  # allow single string or list
-
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    x1 = int(x1 * original_width / 640)
-                    x2 = int(x2 * original_width / 640)
-                    y1 = int(y1 * original_height / 640)
-                    y2 = int(y2 * original_height / 640)
-                    x_center = (x1 + x2) / 2
-                    y_center = (y1 + y2) / 2
-
-                    # If edge filtering is enabled
-                    if edge is not None:
-                        if 'left' in edge and x_center > original_width * edge_fraction:
-                            continue
-                        if 'right' in edge and x_center < original_width * (1 - edge_fraction):
-                            continue
-                        if 'top' in edge and y_center > original_height * edge_fraction:
-                            continue
-
-                    detections.append(((x1, y1), (x2, y2)))
-                    if draw_rectangle:
-                        cv2.rectangle(display_image, (x1, y1), (x2, y2), (0, 255, 0), 3)
-
-                print(f"Detected {len(detections)} marker(s)")
-            except Exception as e:
-                print(f"Detection failed: {e}")
-
-            return detections, display_image
-
-        def do_align_tiling(edge):
-            if model.camera_image is None or model.model is None:
-                messagebox.showinfo("Alignment unavailable", "Connect a live camera and load an alignment model first.")
-                return
-            #edge = ['left', 'right', 'top']
-            h, w, _ = model.camera_image.shape
-
-            # Detect markers on the left, right, and top edges
-            markers, _ = detect_alignment_markers_tiling(model.model, model.camera_image, edge)
-            if len(markers) == 0:
-                print("No markers detected.")
-                return
-
-            alignment = model.config.alignment
-            dx, dy = 0.0, 0.0
-            count_x, count_y = 0, 0
-
-            for m in markers:
-                xy0, xy1 = m
-                x0, y0 = xy0
-                x1, y1 = xy1
-                x = (x0 + x1) / 2 / w
-                y = (y0 + y1) / 2 / h
-
-                # Horizontal alignment (left/right markers)
-                if x < 0.5:
-                    dx += alignment.x_scale_factor * (alignment.left_marker_x / w - x)
-                    count_x += 1
-                elif x > 0.5:
-                    dx += alignment.x_scale_factor * (alignment.right_marker_x / w - x)
-                    count_x += 1
-
-                # Vertical alignment (top markers only)
-                if y < 0.3:  # top region
-                    dy += alignment.y_scale_factor * (alignment.top_marker_y / h - y)
-                    count_y += 1
-
-            # Average corrections based on detected edges
-            if count_x > 0:
-                dx /= count_x
-            if count_y > 0:
-                dy /= count_y
-
-            # Move accordingly (if no top markers, dy=0)
-            #If a small amount of alignment is needed move the image otherwise move the stage since we have far more percision in moving the image than the stage
-            #The con of this is that large movements of the image result in cropping of the image
-            #TODO calibrate the stage move threshold
-            if(dx or dy < 10):
-                #move the image instead of the stage
-                model.set_image_position(dx, dy, t=0)
-            else:
-              model.move_relative({'x': dx, 'y': dy})
-              print(f"Alignment correction: dx={dx:.5f}, dy={dy:.5f} using {len(markers)} markers.")
-
-        #function that takes in an arbitrary sized image composed of 3840x2160 tiles
-        #with shared alignment marks that are 200 pixels from the edge
-        def split_image_with_overlap(image_path, 
-                                          tile_width=3840, 
-                                          tile_height=2160, 
-                                          overlap_x=200, 
-                                          overlap_y=200, 
-                                          output_dir="tiles"):
-            img = Image.open(image_path)
-            img_w, img_h = img.size
-            self.overall_pattern_size_w = img_w
-            self.overall_pattern_size_h = img_h
-            os.makedirs(output_dir, exist_ok=True)
-
-            stride_x = tile_width - overlap_x
-            stride_y = tile_height - overlap_y
-
-            # Compute all top-left coordinates
-            x_positions = []
-            y_positions = []
-
-            # Horizontal positions
-            x = 0
-            while True:
-                if x + tile_width >= img_w:
-                    x = max(0, img_w - tile_width)
-                    x_positions.append(x)
-                    break
-                x_positions.append(x)
-                x += stride_x
-
-            # Vertical positions
-            y = 0
-            while True:
-                if y + tile_height >= img_h:
-                    y = max(0, img_h - tile_height)
-                    y_positions.append(y)
-                    break
-                y_positions.append(y)
-                y += stride_y
-
-            tile_count = 0
-            #Set amount of tiles for later use when exposing
-            self.x_settings.amount_var = len(x_positions)
-            self.y_settings.amount_var = len(y_positions)
-            #Crop and Save the tile images
-            for tile_id_y, top in enumerate(y_positions):
-                for tile_id_x, left in enumerate(x_positions):
-                    right = left + tile_width
-                    bottom = top + tile_height
-
-                    box = (left, top, right, bottom)
-                    tile = img.crop(box)
-                    tile.save(os.path.join(output_dir, f"tile_{tile_id_y},{tile_id_x}.png"))
-                    tile_count += 1
-
-            print("X amount = "+str(self.x_settings.amount_var))
-            print("Y amount = "+str(self.y_settings.amount_var))
-            print(f"Saved {tile_count} tiles to {output_dir}")
-
-        #function that patterns a single tile
-        def pattern_for_tile(self, model, x_start, x_dir, x_idx, x_offset, y_start, y_dir, y_idx, y_offset, y_idx_max, x_idx_max, tile_dir="tiles"):
-            #change image
-            image_path = tile_dir+"/tile_"+str(y_idx)+","+str(x_idx)+".png"
-            current_tile = Image.open(image_path)
-            model.set_pattern_image(current_tile, image_path)
-            #move to the next position if not the first tile
-            #the first tile is exposed where the operator(user of the stepper) places it
-            if not (x_idx == 0 and y_idx == 0):
-                self.model.move_absolute(
-                    {
-                        "x": x_start + x_dir * x_idx * x_offset,
-                        "y": y_start + y_dir * y_idx * y_offset,
-                    }
-                )
-            #Red autofocus
-            self.model.autofocus(blue_only=False)
-
-            #align to previous alignment marks if not first tile
-            if not (x_idx == 0 and y_idx == 0):
-                if x_idx != 0 and x_idx != x_idx_max:
-                    if(y_idx % 2 == 0):
-                        do_align_tiling('left')
-                    else:
-                        do_align_tiling('right')
-                else:
-                    do_align_tiling('top')
-
-
-
-            #Do automatic offset for UV then autofocus
-            self.model.move_relative({"z": self.red_to_uv_offset})
-            self.model.non_blocking_delay(0.5)
-            self.model.enter_uv_mode(mode_switch_autofocus=False)
-            self.model.autofocus(blue_only=True)
-
-            #expose the image
-            self.model.begin_patterning()
-
-            #TODO Add second exposure of the alignment markers
-            # I tried doing this with a non blocking delay but didnt have success
-            # I think that loading a pattern of the alignment marks that is hardcoded into the software might be the best bet
-
-            #Offset back to red mode
-            self.model.enter_red_mode(mode_switch_autofocus=False)
-            self.model.move_relative({"z": -1 * self.red_to_uv_offset})
-
-
-
-        def segment():
-            #create tile directory and segment images
-            split_image_with_overlap(model.pattern_image_path)
-            #load the first tile for operator placement
-            model.set_red_focus_source(RedFocusSource.PATTERN)
-            image_path = "tiles/tile_"+str(0)+","+str(0)+".png"
-            current_tile = Image.open(image_path)
-            model.set_pattern_image(current_tile, image_path)
-
-
-        def on_begin():
-            model.set_red_focus_source(RedFocusSource.PATTERN)
-
-            x_amount = self.x_settings.amount_var
-            x_offset = int(self.x_settings.offset_var.get())
-            x_dir = 1 if x_amount > 0 else -1
-            x_amount = abs(x_amount)
-
-            y_amount = self.y_settings.amount_var
-            y_offset = int(self.y_settings.offset_var.get())
-            y_dir = 1 if y_amount > 0 else -1
-            y_amount = abs(y_amount)
-
-            x_start, y_start = self.model.stage_setpoint[0], self.model.stage_setpoint[1]
-
-            #Move in Snake pattern with left to right on even rows and right to left on odd rows
-            for y_idx in range(y_amount):
-                if(y_idx %2 == 0):
-                  for x_idx in range(x_amount):
-                      pattern_for_tile(self, model, x_start, -x_dir, x_idx, x_offset, y_start, -y_dir, y_idx, y_offset, y_idx_max=y_amount, x_idx_max=x_amount)
-                      print("Patterned x_idx:" + str(x_idx) + " y_idx: "+str(y_idx))
-                else:
-                    for x_idx in range(x_amount - 1, -1, -1):
-                      pattern_for_tile(self, model, x_start, -x_dir, x_idx, x_offset, y_start, -y_dir, y_idx, y_offset, y_idx_max=y_amount, x_idx_max=x_amount)
-                      print("Patterned x_idx:" + str(x_idx) + " y_idx: "+str(y_idx))
-
-        #TODO IMPLEMENT ABORT
-        def on_abort():
-            pass
-
-        #Segment Images must be done before begining tiling
-        #TODO enforce above
-        #Tiling check must be done before segment images if needed
+        # Tiling check must be done before splitting, if needed.
         self.tiling_check_button = TilingCheckFrame(self.frame, model)
-        self.tiling_check_button.frame.grid(row=0, column = 0)
+        self.tiling_check_button.frame.grid(row=0, column=0)
         _tbtn = dict(sticky="ew", padx=6, pady=3)
         self.segment_images_button = ttk.Button(self.frame, text="Split pattern into tiles",
-                                                command=segment, bootstyle="secondary-outline", width=16)
+                                                command=self.segment, bootstyle="secondary-outline", width=16)
         self.segment_images_button.grid(row=1, column=0, **_tbtn)
         self.begin_tiling_button = ttk.Button(self.frame, text="▶  Start tiling",
-                                              command=on_begin, bootstyle="success", width=16)
+                                              command=self.on_begin, bootstyle="success", width=16)
         self.begin_tiling_button.grid(row=2, column=0, **_tbtn)
         self.abort_tiling_button = ttk.Button(self.frame, text="■  Stop tiling",
-                                              command=on_abort, bootstyle="danger", width=16, state="disabled")
+                                              command=self.on_abort, bootstyle="danger", width=16, state="disabled")
         self.abort_tiling_button.grid(row=3, column=0, **_tbtn)
+        self.status = ttk.Label(self.frame, text="Choose a pattern on the 1 · Choose pattern tab, then click "
+                                "Split pattern into tiles.", bootstyle="secondary", wraplength=520, justify="left")
+        self.status.grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 3))
+        self.x_settings.frame.grid(row=1, column=1, rowspan=1, sticky="ew", padx=6, pady=3)
+        self.y_settings.frame.grid(row=2, column=1, rowspan=1, sticky="ew", padx=6, pady=3)
+        for settings in (self.x_settings, self.y_settings):
+            for child in settings.frame.winfo_children():
+                child.grid_configure(padx=4, pady=4)
+
+    # ── Splitting ────────────────────────────────────────────────────────
+    def tile_path(self, x_idx, y_idx) -> Path:
+        return self.tile_dir / f"tile_{y_idx},{x_idx}.png"
+
+    def segment(self):
+        model = self.model
+        if not model.pattern_image_path or not Path(model.pattern_image_path).exists():
+            messagebox.showinfo("Choose a pattern", "Choose the large pattern on the 1 · Choose pattern tab first.")
+            return
+        try:
+            image = Image.open(model.pattern_image_path)
+            image.load()
+        except OSError as exc:
+            messagebox.showerror("Could not open image", str(exc))
+            return
+        width, height = image.size
+        (tile_w, tile_h), (overlap_x, overlap_y) = self.tile_size, self.tile_overlap
+        xs = tile_positions(width, tile_w, overlap_x)
+        ys = tile_positions(height, tile_h, overlap_y)
+        self.overall_pattern_size_w, self.overall_pattern_size_h = width, height
+        self.tile_dir.mkdir(exist_ok=True)
+        for old in self.tile_dir.glob("tile_*.png"):
+            old.unlink()  # never mix tiles from a previous pattern
+        for y_idx, top in enumerate(ys):
+            for x_idx, left in enumerate(xs):
+                # Areas past the image edge come out black (no light), so every tile sits on the
+                # same evenly spaced grid as the stage steps.
+                image.crop((left, top, left + tile_w, top + tile_h)).save(self.tile_path(x_idx, y_idx))
+        self.x_settings.amount_var.set(str(len(xs)))
+        self.y_settings.amount_var.set(str(len(ys)))
+        model.set_red_focus_source(RedFocusSource.PATTERN)
+        first = self.tile_path(0, 0)
+        model.set_pattern_image(load_pattern_image(first), str(first))
+        self.status.configure(text=f"Split into {len(xs)} × {len(ys)} = {len(xs) * len(ys)} tiles. Tile 1 is now the "
+                              "pattern: place and focus it, then click Start tiling.")
+        print(f"Saved {len(xs) * len(ys)} tiles ({len(xs)} x {len(ys)}) to {self.tile_dir}")
+
+    # ── Running ──────────────────────────────────────────────────────────
+    class _Stopped(Exception):
+        pass
+
+    def _check_stop(self):
+        if self.stop_requested:
+            raise self._Stopped("stopped by you")
+
+    def _align_to_previous_tile(self, edge) -> str:
+        model = self.model
+        if model.model is None or model.camera_image is None:
+            return "not aligned: no alignment model or no camera image"
+        image = model.camera_image
+        h, w = image.shape[:2]
+        markers, _ = detect_alignment_markers(model.model, image)
+        centers = filter_edge(marker_centers(markers, w, h), edge)
+        if not centers:
+            return f"not aligned: no marks found on the {edge} edge"
+        dx, dy, _, _ = alignment_correction(centers, model.config.alignment, tiling=True)
+        model.move_relative({"x": dx, "y": dy})
+        return f"aligned ({edge} edge, {len(centers)} mark(s)): moved X {dx:+.1f} µm, Y {dy:+.1f} µm"
+
+    def _expose_tile(self, x_idx, y_idx, x_count, start, step):
+        model = self.model
+        path = self.tile_path(x_idx, y_idx)
+        model.set_pattern_image(load_pattern_image(path), str(path))
+        if (x_idx, y_idx) != (0, 0):
+            # The first tile is exposed where the operator placed it.
+            model.move_absolute({"x": start[0] + step[0] * x_idx, "y": start[1] + step[1] * y_idx})
+        self._check_stop()
+        model.autofocus(blue_only=False)
+        self._check_stop()
+        edge = tiling_alignment_edge(x_idx, y_idx, x_count)
+        note = self._align_to_previous_tile(edge) if edge else "first tile, placed by you"
+        self._check_stop()
+        # Offset for UV focus, then autofocus in UV.
+        model.move_relative({"z": self.red_to_uv_offset})
+        model.non_blocking_delay(0.5)
+        model.enter_uv_mode(mode_switch_autofocus=False)
+        model.autofocus(blue_only=True)
+        self._check_stop()
+        exposures = model.chip.layers[-1].exposures
+        before = len(exposures)
+        model.begin_patterning()
+        # Back to red focus whatever happened.
+        model.enter_red_mode(mode_switch_autofocus=False)
+        model.move_relative({"z": -1 * self.red_to_uv_offset})
+        if len(exposures) == before:
+            raise self._Stopped("the exposure did not start (see the message shown)")
+        if exposures[-1].aborted:
+            raise self._Stopped("the exposure was stopped")
+        return note
+
+    def on_begin(self):
+        model = self.model
+        if self.running or model.patterning_busy or model.autofocus_busy:
+            return
+        try:
+            x_amount, y_amount = int(self.x_settings.amount_var.get()), int(self.y_settings.amount_var.get())
+            x_offset, y_offset = float(self.x_settings.offset_var.get()), float(self.y_settings.offset_var.get())
+            if x_amount == 0 or y_amount == 0 or not (math.isfinite(x_offset) and math.isfinite(y_offset)):
+                raise ValueError
+        except (ValueError, tkinter.TclError):
+            messagebox.showerror("Tiling settings", "Enter a whole number of tiles (not 0) and a distance in µm for X and Y.")
+            return
+        # A negative tile count reverses that axis.
+        x_dir, y_dir = (1 if x_amount > 0 else -1), (1 if y_amount > 0 else -1)
+        x_count, y_count = abs(x_amount), abs(y_amount)
+        missing = [(x, y) for y in range(y_count) for x in range(x_count) if not self.tile_path(x, y).exists()]
+        if missing:
+            messagebox.showinfo("Split the pattern first", "Some tiles have not been made yet. Click Split pattern "
+                                "into tiles first, and keep the tile counts it fills in.")
+            return
+        if model.model is None and (x_count > 1 or y_count > 1):
+            if not messagebox.askokcancel("No alignment", "The alignment model is not available, so tiles after the "
+                                          "first will be placed by stage steps only, without correction.\n\nContinue?"):
+                return
+        if not messagebox.askokcancel("Start tiling", f"Expose {x_count * y_count} tiles ({x_count} × {y_count}) "
+                                      "starting here?\n\nThe stage moves between tiles. Keep hands clear. "
+                                      "Click Stop tiling (or Stop exposure) to stop."):
+            return
+        model.set_red_focus_source(RedFocusSource.PATTERN)
+        start = model.stage_setpoint[:2]
+        step = (-x_dir * x_offset, -y_dir * y_offset)
+        self.running, self.stop_requested = True, False
+        self.begin_tiling_button.configure(state="disabled")
+        self.segment_images_button.configure(state="disabled")
+        self.abort_tiling_button.configure(state="normal")
+        report, stopped_because = [], None
+        try:
+            # Snake order: left to right on even rows, right to left on odd rows.
+            for y_idx in range(y_count):
+                columns = range(x_count) if y_idx % 2 == 0 else range(x_count - 1, -1, -1)
+                for x_idx in columns:
+                    self._check_stop()
+                    number = len(report) + 1
+                    self.status.configure(text=f"Exposing tile {number} of {x_count * y_count}…")
+                    note = self._expose_tile(x_idx, y_idx, x_count, start, step)
+                    report.append(f"Tile {number} (column {x_idx + 1}, row {y_idx + 1}): {note}")
+                    print(report[-1])
+        except self._Stopped as exc:
+            stopped_because = str(exc)
+        except StageError:
+            stopped_because = "the stage did not move (see the message shown)"
+        finally:
+            self.running = False
+            self.begin_tiling_button.configure(state="normal")
+            self.segment_images_button.configure(state="normal")
+            self.abort_tiling_button.configure(state="disabled")
+        total = x_count * y_count
+        headline = (f"Tiling stopped after {len(report)} of {total} tiles: {stopped_because}." if stopped_because
+                    else f"Tiling finished: {total} tiles exposed.")
+        self.status.configure(text=headline)
+        details = "\n".join(report[-12:])
+        (messagebox.showwarning if stopped_because else messagebox.showinfo)("Tiling", headline + ("\n\n" + details if details else ""))
+
+    def on_abort(self):
+        self.stop_requested = True
+        if self.model.patterning_busy:
+            self.model.abort_patterning()
+        self.status.configure(text="Stopping after the current step…")
 
 
 class ProjectorDisplayFrame:
@@ -3861,13 +3803,15 @@ def main():
     ac = config.get("alignment", {})
     alignment_config = AlignmentConfig(
         enabled         = flag("alignment", "enabled", False),
-        model_path      = ac.get("model_path",      "ckpts/best.pt"),
+        model_path      = ac.get("model_path",      "ckpts/best.onnx"),
         right_marker_x  = number("alignment", "right_marker_x",  1820.0),
         left_marker_x   = number("alignment", "left_marker_x",    280.0),
         top_marker_y    = number("alignment", "top_marker_y",     269.0),
         bottom_marker_y = number("alignment", "bottom_marker_y", 1075.0),
         x_scale_factor  = number("alignment", "x_scale_factor",  -1100),
         y_scale_factor  = number("alignment", "y_scale_factor",    800),
+        reference_width = number("alignment", "reference-width", 1920, positive=True),
+        reference_height = number("alignment", "reference-height", 1080, positive=True),
     )
 
     stage_limits = {axis: limit for axis in AXES if (limit := reader.limits("stage", f"{axis}-limits"))}

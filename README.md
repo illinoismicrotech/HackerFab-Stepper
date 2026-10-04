@@ -17,14 +17,14 @@ The newest build of `main` is always under **Latest build**; numbered versions (
 
 When it starts, click **Start** in the small setup window. The full step-by-step guide is built in: press **F1** or click **Help & guide** in the app.
 
-> The download leaves out the YOLO alignment-marker detector (it needs PyTorch, 1–2 GB). Everything else works. For auto-alignment and tiling, run from source as below.
+Everything is included, including the alignment-marker detector used by **Auto-align** and **tiling**.
 
-## Run from source (developers, or for auto-alignment)
+## Run from source (developers)
 
-Needs [Python 3.10–3.13](https://www.python.org/downloads/) (3.13 recommended). The launchers create a project-local environment and install everything on first run (about 1–2 GB, mostly PyTorch).
+Needs [Python 3.10–3.13](https://www.python.org/downloads/) (3.13 recommended). The launchers create a project-local environment and install everything on first run (about 150 MB).
 
 ```bash
-git clone https://github.com/audicakes/Hackerfab-Stepper.git
+git clone https://github.com/illinoismicrotech/Hackerfab-Stepper.git
 cd Hackerfab-Stepper/stepper
 ```
 
@@ -39,6 +39,13 @@ See the [application guide](stepper/README.md) for GRBL setup, camera support, a
 - In the setup window, pick the stage controller, or **No stage** to try the software without hardware.
 - Settings live in `default.toml` / `config.toml` (next to the app; on macOS in `Documents/HackerfabStepper`). The **Settings** page in the app edits them for you.
 - If text is too small on a high-resolution display, start the app with the environment variable `HACKERFAB_UI_SCALE=1.6`.
+
+## Alignment and tiling
+
+- **Auto-align** (Image alignment page) finds the alignment marks in the camera view and moves the stage so they line up with the calibrated positions under `[alignment]`. Turn on **Detect alignment markers in real time** first to check the marks are found.
+- **Tiling** (Chip records & tiling page) exposes a pattern bigger than one projector field: **Split pattern into tiles**, then **Start tiling**. Each tile after the first is corrected using the previous tile's marks. **Stop tiling** stops the run.
+- The marker positions in `default.toml` were calibrated on one station's camera. Check them on yours before relying on Auto-align or tiling: see [`stepper/docs/guide.md`](stepper/docs/guide.md#calibrating-alignment-parameters).
+- The detector is a small YOLO model, `stepper/ckpts/best.onnx`, run by OpenCV (no PyTorch). To retrain it, see [`stepper/docs/model.md`](stepper/docs/model.md).
 
 ## How the downloads are made
 
