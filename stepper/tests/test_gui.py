@@ -32,7 +32,7 @@ class GuiTests(unittest.TestCase):
             app = gui.LithographerGui(config, root, {'camera': {'type': 'none'}}, Path(folder) / 'config.toml')
             try:
                 root.update()
-                self.assertFalse(any(isinstance(widget, tkinter.Toplevel) for widget in root.winfo_children()))
+                self.assertFalse(any(isinstance(widget, tkinter.Toplevel) and widget.winfo_viewable() for widget in root.winfo_children()))
                 app.camera.label.event_generate('<Button-1>')
                 root.update()
                 self.assertEqual(app.fullscreen.kind, 'camera')
@@ -77,7 +77,7 @@ class GuiTests(unittest.TestCase):
                 self.assertEqual(tkfont.nametofont('TkDefaultFont').cget('size'), 15)
                 # Explicit stage controls retain movement locking.
                 controls = app.mode_select_frame.red_mode_frame.stage_position_frame
-                right = next(w for w in controls.xy_widgets if isinstance(w, ttk.Button) and w.cget('text') == 'X →')
+                right = next(w for w in controls.xy_widgets if isinstance(w, ttk.Button) and w.cget('text') == 'X+')
                 controls.step_size.set('25')
                 with patch.object(app.event_dispatcher, 'move_relative') as move:
                     right.invoke()

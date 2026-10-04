@@ -9,6 +9,13 @@ type = "webcam"
 # The index field is optional and is only used to select which of multiple webcams or basler/pylon cameras should be used,
 # e.g. on a laptop where there may be a builtin webcam in addition to an external USB camera.
 device = "auto"
+# Capture API. "auto" = Media Foundation on Windows, V4L2 on Linux, AVFoundation on macOS.
+# Other choices: "msmf", "dshow", "v4l2", "any". Note: with "dshow" the Arducam B0477 shows a solid white image.
+backend = "auto"
+# Camera exposure in DirectShow units (log2 of seconds): -11 = 0.5 ms, -6 = 16 ms, -5 = 31 ms, -4 = 62 ms.
+# "auto" leaves the camera's own setting alone. Long exposures (-5 or -4) remove the coloured bands
+# caused by the DLP projector's colour flashes. Setting a number makes "auto" backend use DirectShow.
+exposure = "auto"
 # Auto validates decoded frames and favors moderate-bandwidth MJPEG modes.
 mode = "auto"
 width = 1280
@@ -27,7 +34,7 @@ uv-exposure = 25000.0
 # This section configures the motion stage
 [stage]
 # Set enabled to false to disable all motion.
-enabled = true #NEW NEW NEW; set enabled to true in other part of file too
+enabled = true
 # Set homing to false if your stage does not have limit sensors
 homing = false
 # Serial port for the GRBL board.
@@ -37,13 +44,19 @@ port = "auto"
 
 # GRBL's baud rate is almost always 115200, do not change this value
 baud-rate = 115200
+# Reverse the Z axis so that +Z in the app brings the camera and chip closer together.
+invert-z = true
+# Optional travel limits in micrometers, as [lowest, highest]. Moves outside them are refused.
+# Measure your stage's real range before turning these on. Example for a homed 15 mm stage:
+# x-limits = [-15000, 0]
+# y-limits = [-15000, 0]
+# z-limits = [-15000, 0]
 
 # This section configures alignment marker detection
-invert-z = true
 
 [alignment]
 # Enable or disable real-time detection of alignment markers
-enabled = true #new
+enabled = true
 # Path to the YOLO model weights file
 model_path = "ckpts/best.pt"
 # Alignment marker reference coordinates (in pixels)
@@ -57,3 +70,14 @@ y_scale_factor = 800     # Scaling factor for y-axis movements
 
 [ui]
 theme = "studio-dark"
+
+[projector]
+# Dedicated projector window. "auto" opens it at launch on the first display that is not
+# your main screen (Windows must be set to Extend with Win+P, not Duplicate).
+# "off" never opens it; exposures then fill the main window instead.
+window = "auto"
+# Which display to use: "auto", or a display number such as 2 (saved when you pick one
+# under Projector window and then click Save settings).
+display = "auto"
+# Brightness of the red focus image, in percent (2-100). Lower it if a long camera exposure washes out.
+red-brightness = 100

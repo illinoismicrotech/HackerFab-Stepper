@@ -28,3 +28,11 @@ focusblue.png
 # Operating-system metadata
 .DS_Store
 Thumbs.db
+
+# Standalone app build output
+stepper/build/
+stepper/dist/
+.venv-build/
+
+# Local downloads (not part of the project)
+/HackerFabGUI_V2-*.zip

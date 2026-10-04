@@ -32,6 +32,30 @@ To validate installation without opening the GUI, open PowerShell in this direct
 .\run.ps1 -SetupOnly
 ```
 
+### Standalone app (Windows, macOS, Linux)
+
+The easiest way to run the stepper: download one file from the repository's **Releases** page (see the
+[top-level README](../README.md#download-and-run-easiest)). It needs no Python.
+
+- **Where files go:** on first run it creates `default.toml`, `src/uvFocusImage/plus.png`, `stepper_captures/`, the guide and `HackerfabStepper.log` in its home folder: next to the app on Windows and Linux (or `%LOCALAPPDATA%\HackerfabStepper` / `~/.local/share/HackerfabStepper` if that folder is read-only), and `~/Documents/HackerfabStepper` on macOS. Set `HACKERFAB_HOME` to choose another folder.
+- **Unsigned:** Windows SmartScreen may warn (**More info → Run anyway**); on macOS right-click → **Open** the first time.
+- **No YOLO:** alignment marker detection is left out, because PyTorch would make the download over 1 GB. Use `run.bat` / `run.sh` when you need it.
+- **Projector:** a borderless projector window opens on the projector's display at launch (the OS must *extend*, not mirror, the desktop). `[projector] window = "off"` disables it.
+- **Camera bands:** to remove the coloured bands the DLP causes in the Arducam image on Windows, set `[camera] exposure` to `-5` or `-4` (Settings → Camera → Exposure) and dim the red image with the **Red brightness** slider. The Windows camera backend defaults to Media Foundation; with DirectShow the Arducam B0477 streams a solid white image.
+
+**Building it.** `.github/workflows/build.yml` tests and builds all platforms on every push (files under the run's
+**Artifacts**), refreshes the **Latest build** pre-release on pushes to `main`, and publishes a release for tags
+like `v1.0.0`. To build locally for the computer you are on:
+
+```bash
+cd stepper
+python -m venv .venv-build
+.venv-build/bin/python -m pip install -r packaging/requirements-build.txt   # Windows: .venv-build\Scripts\python
+.venv-build/bin/python packaging/build.py                                   # Linux without a desktop: prefix with xvfb-run -a
+```
+
+The result, already smoke-tested, is in `dist/release/`.
+
 ### Linux / macOS
 
 ```bash
@@ -277,7 +301,7 @@ y_scale_factor = -580    # Scaling factor for y-axis movements
 
 ## Camera and device settings
 
-The sidebar separates **Operate**, **Alignment**, **Wafer & tiling**, and
+The sidebar separates **Main screen**, **Image alignment**, **Chip records & tiling**, and
 **Settings**. The workspaces scroll on smaller screens; camera previews fit their
 panel while snapshots and focus measurements retain the original image.
 
@@ -293,7 +317,7 @@ explicit selection in Auto device mode. Windows and macOS expose index candidate
 
 In **Settings**:
 
-1. Refresh devices and select the intended camera, or enter a device path/index.
+1. Click **Find cameras** and select the intended camera, or enter a device path/index.
 2. Leave capture configuration on **auto**, or read the advertised modes and
    select one. Manual mode checks the driver's returned resolution, format and
    frame rate rather than silently claiming the requested settings worked.
@@ -331,14 +355,13 @@ Mode discovery follows the [V4L2 format enumeration API](https://docs.kernel.org
 Requested properties may differ from driver results, as documented by
 [OpenCV's capture property API](https://docs.opencv.org/4.x/d4/d15/group__videoio__flags__base.html).
 
-Run the camera/configuration regression checks with:
+Run the test suite with:
 
 ```bash
-PYTHONPATH=src .venv-3.12/bin/python -m unittest discover -s tests -v
+./run_tests.sh          # Linux/macOS; GUI tests use an invisible screen when Xvfb is installed
 ```
 
-Use the Python executable from your launcher-created virtual environment if its
-version differs.
+On Windows: `set PYTHONPATH=src` then `python -m unittest discover -s tests`.
 
 ### Readable text on Linux
 
@@ -377,17 +400,18 @@ This is an application coordinate reversal; it does not change the controller's
 stored direction-polarity or homing settings. Verify direction on the stepper
 computer with a small jog before using saved absolute positions.
 
-If connection fails, **Settings → Camera → Copy camera diagnostics** includes
+If connection fails, **Settings → Camera → Copy camera report (for asking for help)** includes
 the selected device, discovered cameras, and each failed capture attempt. The
 preview clears its connecting state on failure and disables snapshots until
 a live frame is available.
 
 ### Fullscreen previews
 
-The app starts with one window. Click either the camera preview or projector
-preview to view it fullscreen in that same window. **Esc** or the **×** button
-returns to the workspace. Camera fullscreen remains live and preserves aspect
-ratio. Projector output uses the same view during an exposure; exiting that
-view stops the exposure and clears the pattern. To use the DLP, put the app on
-the DLP display before opening projector fullscreen. The projector's pattern
+Click either the camera preview or projector preview to open it in its own
+borderless fullscreen window on the same monitor as the app. **Esc** or the
+**× Close (Esc)** button returns to the workspace. Camera fullscreen stays live
+and preserves aspect ratio. Everything around the image is pure black, so the
+view is safe to use as projector output. Without a dedicated projector window,
+exposures use this view; closing it stops the exposure and clears the pattern.
+In that case put the app on the DLP display before starting. The projector's pattern
 canvas stays 1280×720 regardless of preview size.

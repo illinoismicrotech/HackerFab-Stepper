@@ -3,9 +3,12 @@
 
 import time
 
+import serial
+
 from stage_control.stage_controller import StageController, UnsupportedCommand
 
 _SERIAL_TIMEOUT = 5.0  # seconds to wait for a GRBL response before raising
+_HOMING_TIMEOUT = 120.0  # GRBL only answers $H after the whole homing cycle finishes
 
 
 class GrblStage(StageController):
@@ -16,7 +19,10 @@ class GrblStage(StageController):
         self.controller_target.timeout = _SERIAL_TIMEOUT
         self.enable_homing = enable_homing
         self.z_direction = -1.0 if invert_z else 1.0
+        self.last_state = "Unknown"
+        self._wait_for_boot()
 
+    def _wait_for_boot(self) -> None:
         # Give GRBL time to boot, then discard the startup banner
         time.sleep(2.0)
         self.controller_target.reset_input_buffer()
@@ -59,6 +65,7 @@ class GrblStage(StageController):
                 .decode('ascii', errors='replace')
             )
             if line.startswith('<') and line.endswith('>'):
+                self.last_state = line[1:-1].split('|')[0] or "Unknown"
                 idle, position = self._parse_state(line)
                 # Keep readback in the same coordinate system as application moves.
                 return idle, (position[0], position[1], position[2] * self.z_direction)
@@ -83,13 +90,23 @@ class GrblStage(StageController):
                     pass
         return idle, position
 
-    def wait_for_idle(self) -> None:
-        """Poll GRBL status until it reports Idle."""
-        while True:
+    def wait_for_idle(self, timeout: float = 60.0) -> bool:
+        """Poll GRBL status until it reports Idle. Returns False if it did not within timeout."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             idle, _ = self._query_state()
             if idle:
-                return
+                return True
             time.sleep(0.05)
+        return False
+
+    def is_idle(self) -> bool:
+        idle, _ = self._query_state()
+        return idle
+
+    def state_name(self) -> str:
+        """Last reported GRBL state, e.g. Idle, Run, Jog, Hold:0, Alarm."""
+        return self.last_state
 
     # ------------------------------------------------------------------ #
     # StageController interface
@@ -101,7 +118,14 @@ class GrblStage(StageController):
     def home(self) -> None:
         if not self.enable_homing:
             raise UnsupportedCommand()
-        self._send_msg(b'$H\n')
+        # The 'ok' for $H arrives only when homing completes, which can take far longer
+        # than the normal reply timeout. Timing out early would also leave that late 'ok'
+        # queued, and the next command would mistake it for its own reply.
+        self.controller_target.timeout = _HOMING_TIMEOUT
+        try:
+            self._send_msg(b'$H\n')
+        finally:
+            self.controller_target.timeout = _SERIAL_TIMEOUT
 
     def _move(self, microns: dict[str, float], relative: bool) -> None:
         self._send_msg(b'G91\n' if relative else b'G90\n')
@@ -121,6 +145,19 @@ class GrblStage(StageController):
     def move_to(self, amounts: dict[str, float]) -> None:
         print('moving absolute', amounts)
         self._move(amounts, relative=False)
+
+    def position_um(self) -> tuple[float, float, float]:
+        _, (x, y, z) = self._query_state()
+        return (x * 1000.0, y * 1000.0, z * 1000.0)
+
+    def reconnect(self) -> None:
+        """Re-open the serial port after the controller dropped off USB (e.g. it reset)."""
+        try:
+            self.controller_target.close()
+        except (OSError, serial.SerialException):
+            pass
+        self.controller_target.open()
+        self._wait_for_boot()
 
     def close(self) -> None:
         if self.controller_target.is_open:

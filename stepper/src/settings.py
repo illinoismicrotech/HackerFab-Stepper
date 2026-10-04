@@ -4,16 +4,18 @@ from datetime import datetime
 from pathlib import Path
 import math
 import os
+import platform
 import queue
 import shutil
 import threading
 import tkinter as tk
 from tkinter import messagebox
 
+import cv2
 import toml
 import ttkbootstrap as ttk
 from camera.discovery import discover_devices, parse_modes, v4l_info
-from camera.webcam import Webcam
+from camera.webcam import Webcam, capture_backend, exposure_ms, manual_exposure
 from ui_theme import configure_theme, prepare_dropdowns
 
 
@@ -38,7 +40,7 @@ class SettingsPage:
         self.results = queue.Queue()
         self.devices, self.modes, self.vars = [], [], {}
         ttk.Label(self.frame, text='Settings', font='StepperTitle').grid(row=0, column=0, sticky='w')
-        ttk.Label(self.frame, text='Make this workspace work for your equipment.', bootstyle='secondary').grid(row=1, column=0, sticky='w', pady=(6, 24))
+        ttk.Label(self.frame, text='Choose your camera, stage and display options. Click Save settings to keep them.', bootstyle='secondary').grid(row=1, column=0, sticky='w', pady=(6, 24))
         notebook = ttk.Notebook(self.frame)
         notebook.grid(row=2, column=0, sticky='ew')
         camera_page = ttk.Frame(notebook, padding=24)
@@ -53,17 +55,17 @@ class SettingsPage:
         self.device = self.widgets['device']
         self.device.bind('<<ComboboxSelected>>', lambda _: self.scan_modes())
         self.connection_hint = tk.StringVar(value='Connect the Arducam, then refresh this list. Choose its name to avoid the laptop camera.')
-        ttk.Button(camera_page, text='Refresh', command=self.scan, bootstyle='secondary-outline').grid(row=0, column=2, padx=(12, 0))
+        ttk.Button(camera_page, text='Find cameras', command=self.scan, bootstyle='secondary-outline').grid(row=0, column=2, padx=(12, 0))
         ttk.Label(camera_page, textvariable=self.connection_hint, wraplength=650, bootstyle='secondary').grid(row=1, column=1, columnspan=2, sticky='w', pady=(0, 20))
         self.field(2, 'Image quality', 'mode', cam.get('mode', 'auto'), ['auto', 'manual'], camera_page)
         ttk.Label(camera_page, text='Auto finds a working resolution and frame rate. Use Manual for a specific capture mode.', wraplength=650, bootstyle='secondary').grid(row=3, column=1, columnspan=2, sticky='w', pady=(0, 16))
-        self.manual = ttk.Labelframe(camera_page, text='Manual capture', padding=20)
+        self.manual = ttk.Labelframe(camera_page, text='Manual camera mode', padding=20)
         self.manual.columnconfigure(1, weight=1)
         self.mode_choice = ttk.Combobox(self.manual, state='readonly')
-        ttk.Label(self.manual, text='Supported modes').grid(row=0, column=0, sticky='w', padx=(0, 20), pady=8)
+        ttk.Label(self.manual, text="Camera's modes").grid(row=0, column=0, sticky='w', padx=(0, 20), pady=8)
         self.mode_choice.grid(row=0, column=1, sticky='ew')
         self.mode_choice.bind('<<ComboboxSelected>>', self.choose_mode)
-        ttk.Button(self.manual, text='Read modes', command=self.scan_modes, bootstyle='secondary-outline').grid(row=0, column=2, padx=12)
+        ttk.Button(self.manual, text='List modes', command=self.scan_modes, bootstyle='secondary-outline').grid(row=0, column=2, padx=12)
         for row, label, key, default in [(1, 'Width · pixels', 'width', 1280), (2, 'Height · pixels', 'height', 720), (3, 'Frame rate · fps', 'fps', 30)]:
             self.field(row, label, key, cam.get(key, default), parent=self.manual)
         self.field(4, 'Image format', 'fourcc', cam.get('fourcc', 'MJPG'), ['MJPG', 'YUYV', 'YUY2', 'RGB3'], self.manual)
@@ -75,15 +77,21 @@ class SettingsPage:
         self.vars['mode'].trace_add('write', show_manual)
         show_manual()
         self.reject = tk.BooleanVar(value=cam.get('reject-green', True))
-        ttk.Checkbutton(camera_page, text='Detect corrupted green frames', variable=self.reject, bootstyle='round-toggle').grid(row=5, column=0, columnspan=3, sticky='w', pady=(4, 8))
+        ttk.Checkbutton(camera_page, text='Skip broken (all-green) frames', variable=self.reject, bootstyle='round-toggle').grid(row=5, column=0, columnspan=3, sticky='w', pady=(4, 8))
         ttk.Label(camera_page, text='Turn this off only if your specimen really fills the image with green.', wraplength=650, bootstyle='secondary').grid(row=6, column=0, columnspan=3, sticky='w', pady=(0, 20))
-        ttk.Separator(camera_page).grid(row=7, column=0, columnspan=3, sticky='ew', pady=(0, 16))
-        self.field(8, 'Camera driver', 'type', cam.get('type', 'webcam'), ['webcam', 'basler', 'flir', 'none'], camera_page)
-        ttk.Label(camera_page, text='Use webcam for a standard USB camera. Basler and FLIR require their vendor software.', wraplength=650, bootstyle='secondary').grid(row=9, column=1, columnspan=2, sticky='w')
-        ttk.Button(camera_page, text='Connect camera', command=self.apply).grid(row=10, column=0, columnspan=3, sticky='w', pady=(24, 12))
+        exposure = manual_exposure(cam)
+        self.field(7, 'Exposure', 'exposure', 'auto' if exposure is None else str(exposure), parent=camera_page)
+        ttk.Label(camera_page, text='Longer exposures remove the coloured bands caused by the projector. '
+                  'Around −5 (31 ms) or −4 (62 ms) works with the Arducam; dim the red image on the Focus & align tab '
+                  'if the picture washes out. Applied with Connect camera; a set exposure uses DirectShow.',
+                  wraplength=650, bootstyle='secondary').grid(row=8, column=0, columnspan=3, sticky='w', pady=(0, 20))
+        ttk.Separator(camera_page).grid(row=9, column=0, columnspan=3, sticky='ew', pady=(0, 16))
+        self.field(10, 'Camera driver', 'type', cam.get('type', 'webcam'), ['webcam', 'basler', 'flir', 'none'], camera_page)
+        ttk.Label(camera_page, text='Use webcam for a standard USB camera. Basler and FLIR require their vendor software.', wraplength=650, bootstyle='secondary').grid(row=11, column=1, columnspan=2, sticky='w')
+        ttk.Button(camera_page, text='Connect camera', command=self.apply).grid(row=12, column=0, columnspan=3, sticky='w', pady=(24, 12))
         self.status = tk.StringVar(value='Ready to connect a camera.')
-        ttk.Label(camera_page, textvariable=self.status, wraplength=780, justify='left').grid(row=11, column=0, columnspan=3, sticky='w', pady=(8, 0))
-        ttk.Button(camera_page, text='Copy camera diagnostics', command=self.copy_diagnostics, bootstyle='secondary-outline').grid(row=12, column=0, columnspan=3, sticky='w', pady=(16, 0))
+        ttk.Label(camera_page, textvariable=self.status, wraplength=780, justify='left').grid(row=13, column=0, columnspan=3, sticky='w', pady=(8, 0))
+        ttk.Button(camera_page, text='Copy camera report (for asking for help)', command=self.copy_diagnostics, bootstyle='secondary-outline').grid(row=14, column=0, columnspan=3, sticky='w', pady=(16, 0))
         stage = config.get('stage', {})
         ttk.Label(stage_page, text='Stage connection', font='StepperSection').grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 16))
         self.stage_enabled = tk.BooleanVar(value=stage.get('enabled', True))
@@ -93,11 +101,11 @@ class SettingsPage:
         ttk.Checkbutton(stage_page, text='Reverse Z direction', variable=self.invert_z, bootstyle='round-toggle').grid(row=4, column=0, columnspan=2, sticky='w', pady=12)
         ttk.Label(stage_page, text='Reverses Z movement and position readback in this app. Save and restart to apply.', wraplength=650, bootstyle='secondary').grid(row=5, column=0, columnspan=2, sticky='w')
         ttk.Label(stage_page, text='Use auto to find the controller, or enter its serial port. Save and restart to apply stage changes.', wraplength=650, bootstyle='secondary').grid(row=3, column=0, columnspan=2, sticky='w', pady=16)
-        ttk.Label(appearance_page, text='Comfortable for your display', font='StepperSection').grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 16))
+        ttk.Label(appearance_page, text='Look and text size', font='StepperSection').grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 16))
         self.field(1, 'Color theme', 'theme', config.get('ui', {}).get('theme', 'studio-dark'), ['studio', 'studio-dark'], appearance_page)
         self.field(2, 'Text size', 'text-scale', str(config.get('ui', {}).get('text-scale', 1.0)), ['1.0', '1.25', '1.5'], appearance_page)
         ttk.Label(appearance_page, text='Choose 1.25 or 1.5 for larger text and controls. You can preview this without reconnecting any devices.', wraplength=650, bootstyle='secondary').grid(row=3, column=0, columnspan=2, sticky='w', pady=16)
-        ttk.Button(appearance_page, text='Apply appearance', command=self.apply_appearance).grid(row=4, column=0, columnspan=2, sticky='w', pady=12)
+        ttk.Button(appearance_page, text='Preview look', command=self.apply_appearance).grid(row=4, column=0, columnspan=2, sticky='w', pady=12)
         actions = ttk.Frame(self.frame)
         actions.grid(row=3, column=0, sticky='ew', pady=(24, 12))
         ttk.Button(actions, text='Save settings', command=self.save).pack(side='left')
@@ -133,6 +141,8 @@ class SettingsPage:
             'mode': {'auto': 'Automatic · recommended', 'manual': 'Choose a capture mode'},
             'theme': {'studio': 'Light', 'studio-dark': 'Dark'},
             'text-scale': {'1.0': 'Comfortable · 100%', '1.25': 'Large · 125%', '1.5': 'Extra large · 150%'},
+            'exposure': {'auto': 'Camera default (not changed)',
+                         **{str(v): f"{v} · {exposure_ms(v):.3g} ms" for v in range(-13, 0)}},
         }.get(key)
         if labels:
             display = tk.StringVar(value=labels.get(str(value), str(value)))
@@ -164,7 +174,11 @@ class SettingsPage:
 
     def scan(self):
         self.notice.set('Scanning camera devices…')
-        threading.Thread(target=lambda: self.results.put(('devices', discover_devices())), daemon=True).start()
+        # Camera names on Windows follow Media Foundation's numbering; only use them with that backend.
+        backend = capture_backend(self.config.get('camera', {}))
+        api = {cv2.CAP_MSMF: 'msmf', cv2.CAP_DSHOW: 'dshow'}.get(backend)
+        named = api is not None or platform.system() != 'Windows'
+        threading.Thread(target=lambda: self.results.put(('devices', discover_devices(named=named, api=api or 'msmf'))), daemon=True).start()
 
     def scan_modes(self):
         device = self.selected_device()
@@ -201,6 +215,7 @@ class SettingsPage:
         if cam['type'] == 'basler':
             cam['index'] = int(cam['device']) if cam['device'] != 'auto' else 0
         cam['reject-green'] = self.reject.get()
+        cam['exposure'] = 'auto' if self.vars['exposure'].get() == 'auto' else int(self.vars['exposure'].get())
         result.setdefault('stage', {})['port'] = self.vars['stage-port'].get().strip()
         result['stage']['enabled'] = self.stage_enabled.get()
         result['stage']['invert-z'] = self.invert_z.get()

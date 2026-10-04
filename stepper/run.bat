@@ -3,7 +3,7 @@
 :: Double-click this file to start the application.
 title HackerFab Stepper
 
-:: Run the PowerShell launcher (handles uv install + dependency sync).
+:: Run the PowerShell launcher (creates a Python environment and installs dependencies).
 :: Arguments are forwarded, e.g. run.bat -SetupOnly for an install-only check.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run.ps1" %*
 set "EXIT_CODE=%ERRORLEVEL%"

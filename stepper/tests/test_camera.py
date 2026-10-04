@@ -128,5 +128,34 @@ class CameraTests(unittest.TestCase):
             self.assertEqual(next(Path(directory).glob('*.bak')).read_text(), original)
 
 
+    def test_windows_defaults_to_media_foundation_with_override(self):
+        import cv2
+        from camera.webcam import capture_backend
+        with patch('camera.webcam.platform.system', return_value='Windows'):
+            self.assertEqual(capture_backend({}), cv2.CAP_MSMF)
+            self.assertEqual(capture_backend({'backend': 'dshow'}), cv2.CAP_DSHOW)
+        with patch('camera.webcam.platform.system', return_value='Linux'):
+            self.assertEqual(capture_backend({'backend': 'auto'}), cv2.CAP_V4L2)
+
+    def test_msmf_never_sets_fourcc_and_skips_duplicate_sizes(self):
+        import cv2
+        stop = threading.Event()
+        opened, props = [], []
+        class Capture:
+            def __init__(self, *args): opened.append(args)
+            def isOpened(self): return True
+            def set(self, prop, value): props.append(prop); return True
+            def get(self, prop): return 30 if prop == cv2.CAP_PROP_FPS else 0
+            def read(self):
+                frame = np.zeros((48, 64, 3), np.uint8); frame[:] = (0, 128, 0)  # always rejected
+                return True, frame
+            def release(self): pass
+        modes = [CaptureMode('MJPG', 1280, 720, 30), CaptureMode('YUYV', 1280, 720, 30), CaptureMode('YUYV', 640, 480, 15)]
+        with patch('camera.webcam.candidate_modes', return_value=modes), patch('camera.webcam.cv2.VideoCapture', side_effect=Capture):
+            _capture({'device': '1', 'backend': 'msmf'}, queue.Queue(), stop)
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(all(args[1] == cv2.CAP_MSMF for args in opened))
+        self.assertNotIn(cv2.CAP_PROP_FOURCC, props)
+
 if __name__ == '__main__':
     unittest.main()

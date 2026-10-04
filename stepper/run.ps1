@@ -51,6 +51,9 @@ if (-not (Test-Path $VenvPython)) {
 # First run downloads PyTorch and its dependencies (~1-2 GB). This is normal.
 Write-Host "  Checking dependencies..." -ForegroundColor Yellow
 & $VenvPython -m pip install --prefer-binary --requirement requirements.txt
+if ($LASTEXITCODE -ne 0) {
+    throw "Installing dependencies failed (see the messages above). Check your internet connection and try again."
+}
 Write-Host "  Dependencies OK" -ForegroundColor Green
 Write-Host ""
 

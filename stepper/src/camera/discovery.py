@@ -65,7 +65,99 @@ def parse_modes(output):
     return list(dict.fromkeys(modes))
 
 
-def discover_devices():
+def _msmf_device_names():
+    """Camera names in the order OpenCV's Media Foundation backend numbers them.
+
+    Uses MFEnumDeviceSources, the same call cv2.CAP_MSMF uses, so index i here is
+    cv2.VideoCapture(i, cv2.CAP_MSMF). DirectShow order can differ (virtual cameras
+    such as OBS appear only in DirectShow), so these names are for MSMF only.
+    """
+    import ctypes
+    import uuid
+    from ctypes import POINTER, byref, c_uint32, c_void_p, c_wchar_p
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("data", ctypes.c_ubyte * 16)]
+
+        def __init__(self, text):
+            super().__init__()
+            ctypes.memmove(self.data, uuid.UUID(text).bytes_le, 16)
+
+    source_type = GUID("c60ac5fe-252a-478f-a0ef-bc8fa5f7cad3")   # MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE
+    video_capture = GUID("8ac3587a-4ae7-42d8-99e0-0a6013eef90f")  # ..._SOURCE_TYPE_VIDCAP_GUID
+    friendly_name = GUID("60d0e559-52f8-4fa2-bbce-acdb34a8ec01")  # MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME
+
+    def call(obj, index, argtypes, *args):
+        # IMFAttributes vtable: 2 Release, 13 GetAllocatedString, 24 SetGUID
+        vtable = ctypes.cast(obj, POINTER(POINTER(c_void_p)))[0]
+        return ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p, *argtypes)(vtable[index])(obj, *args)
+
+    ole32, mfplat, mf = ctypes.oledll.ole32, ctypes.oledll.mfplat, ctypes.oledll.mf
+    ole32.CoTaskMemFree.restype = None
+    ole32.CoTaskMemFree.argtypes = [c_void_p]
+    com_started = False
+    try:
+        ole32.CoInitializeEx(None, 0)  # COINIT_MULTITHREADED
+        com_started = True
+    except OSError:
+        pass  # COM already initialised on this thread in another mode; that is fine
+    names = []
+    attributes = c_void_p()
+    devices = POINTER(c_void_p)()
+    count = c_uint32()
+    try:
+        mfplat.MFStartup(0x00020070, 0)  # MF_VERSION, MFSTARTUP_FULL
+        try:
+            mfplat.MFCreateAttributes(byref(attributes), 1)
+            call(attributes, 24, [c_void_p, c_void_p], byref(source_type), byref(video_capture))
+            mf.MFEnumDeviceSources(attributes, byref(devices), byref(count))
+            for i in range(count.value):
+                text = c_wchar_p()
+                length = c_uint32()
+                try:
+                    call(devices[i], 13, [c_void_p, c_void_p, c_void_p], byref(friendly_name), byref(text), byref(length))
+                    names.append(text.value or f"Camera {i}")
+                    ole32.CoTaskMemFree(ctypes.cast(text, c_void_p))
+                except OSError:
+                    names.append(f"Camera {i}")
+                call(devices[i], 2, [])
+            if devices:
+                ole32.CoTaskMemFree(ctypes.cast(devices, c_void_p))
+        finally:
+            if attributes:
+                call(attributes, 2, [])
+            mfplat.MFShutdown()
+    finally:
+        if com_started:
+            ole32.CoUninitialize()
+    return names
+
+
+def _windows_priority(name):
+    """Lower sorts first: the Arducam, then other USB cameras, then laptop built-in cameras."""
+    lowered = name.lower()
+    if any(word in lowered for word in ("arducam", "imx283", "b0477")):
+        return 0
+    if any(word in lowered for word in ("integrated", "built-in", "internal", "front", "rear", "ir camera")):
+        return 2
+    return 1
+
+
+def _dshow_device_names():
+    """Camera names in DirectShow order, i.e. cv2.VideoCapture(i, cv2.CAP_DSHOW)."""
+    from pygrabber.dshow_graph import FilterGraph
+    return list(FilterGraph().get_input_devices())
+
+
+def discover_devices(named=True, api="msmf"):
+    if platform.system() == "Windows" and named:
+        try:
+            names = _dshow_device_names() if api == "dshow" else _msmf_device_names()
+        except Exception:
+            names = []
+        if names:
+            devices = [CameraDevice(str(i), name) for i, name in enumerate(names)]
+            return sorted(devices, key=lambda d: (_windows_priority(d.name), int(d.device)))
     if platform.system() != "Linux":
         # OpenCV has no portable named-device enumeration. These are candidates,
         # validated in an isolated capture process when selected.

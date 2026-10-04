@@ -1,0 +1,11 @@
+# Dependencies bundled into the standalone app (Windows, macOS and Linux), plus the builder.
+# ultralytics/PyTorch are intentionally left out to keep the download small: alignment marker
+# detection is disabled in the standalone app. Use run.bat / run.sh when you need it.
+opencv-python-headless>=4.10,<5   # the app never uses OpenCV's own windows, so the smaller build is enough
+numpy>=2.0,<2.3
+pillow>=11.1,<12
+pyserial>=3.5,<4
+toml>=0.10,<0.11
+ttkbootstrap>=1.10,<2
+pygrabber>=0.2,<1; sys_platform == "win32"   # DirectShow camera names (exposure control uses DirectShow)
+pyinstaller>=6.10,<7

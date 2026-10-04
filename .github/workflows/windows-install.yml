@@ -32,5 +32,6 @@ jobs:
 
       - name: Compile source and verify runtime imports
         run: |
-          uv run python -m compileall -q src
-          uv run python -c "import tkinter, cv2, serial, toml, ttkbootstrap, ultralytics; print('Windows dependencies OK')"
+          $Python = (Get-ChildItem .venv-*\Scripts\python.exe | Select-Object -First 1).FullName
+          & $Python -m compileall -q src
+          & $Python -c "import tkinter, cv2, serial, toml, ttkbootstrap, ultralytics; print('Windows dependencies OK')"

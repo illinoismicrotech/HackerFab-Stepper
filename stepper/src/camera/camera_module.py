@@ -98,13 +98,13 @@ class CameraModule(ABC):
         return self.__singleImageReady__
 
     def getSingleCaptureImage(self):
-        if singleImageReady():
+        if self.singleImageReady():
             return (self.__singleImage__, self.__resolutionA__, "RGB888")
         else:
             return None
 
     def getStreamCaptureImage(self):
-        if streamImageReady():
+        if self.streamImageReady():
             return (self.__streamImage__, self.__resolutionB__, "RGB888")
         else:
             return None
