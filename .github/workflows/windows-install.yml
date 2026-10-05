@@ -2,7 +2,7 @@ name: Windows installation check
 
 on:
   push:
-    branches: [main, UI+Packaging]
+    branches: [main, 'UI\+Packaging']  # '+' is a pattern symbol in branch filters, so it must be escaped
   pull_request:
   workflow_dispatch:
 
