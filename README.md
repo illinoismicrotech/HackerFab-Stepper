@@ -13,7 +13,7 @@ No Python, no installing, no command line. Go to the **[Releases page](../../rel
 | Mac, Intel | `HackerfabStepper-macOS-x86_64.zip` | Same as above. |
 | Linux (64-bit) | `HackerfabStepper-Linux-x86_64.tar.gz` | `tar xzf HackerfabStepper-Linux-x86_64.tar.gz && ./HackerfabStepper` |
 
-The newest build of `main` is always under **Latest build**; numbered versions (e.g. `v1.0.0`) are the stable releases.
+The newest build of `main` is always under **Latest build**; numbered versions (e.g. `v1.0.0`) are the stable releases. Versions marked **Pre-release** (`v0.x`, or names with a dash like `v1.1.0-beta`) are test builds.
 
 When it starts, click **Start** in the small setup window. The full step-by-step guide is built in: press **F1** or click **Help & guide** in the app.
 

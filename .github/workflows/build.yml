@@ -4,7 +4,8 @@
 #                               "Artifacts" on the workflow run's page (needs a GitHub login).
 #   Push to main                also refreshes the "Latest build" pre-release on the
 #                               Releases page: one plain download per OS, no login needed.
-#   Push a tag like v1.2.0      publishes a normal release with the same downloads:
+#   Push a tag like v1.2.0      publishes a release with the same downloads (v0.x and
+#                               tags with a dash, e.g. v1.2.0-beta, are marked pre-release):
 #                                 git tag v1.2.0 && git push origin v1.2.0
 name: Build app
 
@@ -96,7 +97,10 @@ jobs:
       - name: Publish the tagged release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          gh release create "$GITHUB_REF_NAME" downloads/* --title "HackerFab Stepper $GITHUB_REF_NAME" --generate-notes
+          # v0.x versions and tags with a dash (v1.2.0-beta) are published as pre-releases.
+          extra=""
+          case "$GITHUB_REF_NAME" in v0.*|*-*) extra="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" downloads/* --title "HackerFab Stepper $GITHUB_REF_NAME" --generate-notes $extra
       - name: Refresh the "Latest build" pre-release
         if: github.ref == 'refs/heads/main'
         run: |
