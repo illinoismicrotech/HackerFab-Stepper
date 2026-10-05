@@ -1,5 +1,6 @@
 """Isolated USB capture: a blocked driver never blocks Tk or application exit."""
 from collections import deque
+import math
 import multiprocessing as mp
 import os
 import platform
@@ -80,7 +81,8 @@ def _send(channel, kind, value):
 
 
 def _apply_exposure(cap, backend, value):
-    """Set a manual exposure (DirectShow units). Returns what the camera reports afterwards."""
+    """Set a manual exposure (DirectShow units). Returns what the camera reports afterwards,
+    converted to the same units so it can be compared with the requested value."""
     if value is None:
         return None
     try:
@@ -90,7 +92,8 @@ def _apply_exposure(cap, backend, value):
         elif backend == cv2.CAP_V4L2:
             cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # V4L2: 1 = manual
             cap.set(cv2.CAP_PROP_EXPOSURE, round(exposure_ms(value) * 10))  # units of 100 µs
-            return cap.get(cv2.CAP_PROP_EXPOSURE) / 10.0
+            reported = cap.get(cv2.CAP_PROP_EXPOSURE)  # 100 µs units
+            return math.log2(reported / 10000.0) if reported > 0 else None
         else:
             cap.set(cv2.CAP_PROP_EXPOSURE, value)
         return cap.get(cv2.CAP_PROP_EXPOSURE)
@@ -275,8 +278,9 @@ class Webcam(CameraModule):
                     if got is not None and abs(got - wanted) < 0.6:
                         self.status += f" · exposure {wanted} ({exposure_ms(wanted):g} ms)"
                     else:
-                        self.status += (f" · exposure {wanted} NOT applied (camera reports {got}). "
-                                        "Try the DirectShow backend.")
+                        hint = ("Try the DirectShow backend." if platform.system() == "Windows"
+                                else "The camera may not support manual exposure.")
+                        self.status += f" · exposure {wanted} NOT applied (camera reports {got}). {hint}"
                         self.diagnostics.append(self.status)
             elif kind == "fps":
                 self.measured_fps = value

@@ -111,3 +111,26 @@ class ExposureSettingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class LinuxExposureReadbackTests(unittest.TestCase):
+    """On Linux (V4L2) the camera reports exposure in 100 µs units; the app works in log2 seconds."""
+
+    class FakeV4l2Capture:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, prop, value):
+            self.values[prop] = value
+            return True
+
+        def get(self, prop):
+            return self.values.get(prop, 0)
+
+    def test_applied_exposure_reads_back_in_the_requested_units(self):
+        import cv2
+        from camera.webcam import _apply_exposure
+        cap = self.FakeV4l2Capture()
+        self.assertAlmostEqual(_apply_exposure(cap, cv2.CAP_V4L2, -5), -5, delta=0.01)
+        self.assertEqual(cap.values[cv2.CAP_PROP_AUTO_EXPOSURE], 1)        # V4L2 manual mode
+        self.assertEqual(cap.values[cv2.CAP_PROP_EXPOSURE], 312)           # 31.2 ms in 100 µs units

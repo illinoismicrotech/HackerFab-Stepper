@@ -82,8 +82,8 @@ class SettingsPage:
         exposure = manual_exposure(cam)
         self.field(7, 'Exposure', 'exposure', 'auto' if exposure is None else str(exposure), parent=camera_page)
         ttk.Label(camera_page, text='Longer exposures remove the coloured bands caused by the projector. '
-                  'Around −5 (31 ms) or −4 (62 ms) works with the Arducam; dim the red image on the Focus & align tab '
-                  'if the picture washes out. Applied with Connect camera; a set exposure uses DirectShow.',
+                  'Around −5 (31 ms) or −4 (62 ms) works with the Arducam; dim the red image on the 2 · Focus (red light) tab '
+                  'if the picture washes out. Applied with Connect camera' + ('; a set exposure uses DirectShow.' if platform.system() == 'Windows' else '.'),
                   wraplength=650, bootstyle='secondary').grid(row=8, column=0, columnspan=3, sticky='w', pady=(0, 20))
         ttk.Separator(camera_page).grid(row=9, column=0, columnspan=3, sticky='ew', pady=(0, 16))
         self.field(10, 'Camera driver', 'type', cam.get('type', 'webcam'), ['webcam', 'basler', 'flir', 'none'], camera_page)
