@@ -1,496 +1,282 @@
-# Hacker Fab - Stepper V2
+# HackerFab Stepper: station setup and development
 
-This repository contains the source code for The Hacker Fab's open source stepper software. It contains a user interface for pattern selection, stage alignment, timed ultraviolet exposure, and optionally a live camera preview.
+This folder holds The Hacker Fab's open source stepper software: pattern selection, stage
+alignment, timed exposure and a live camera preview. For the hardware and the Hacker Fab in
+general, see the [Gitbook](https://hacker-fab.gitbook.io/hacker-fab-space/fab-toolkit/patterning/lithography-stepper-v2-build-work-in-progress)
+and the [website](https://hackerfab.ece.cmu.edu/).
 
 ![stepper-gui](https://github.com/user-attachments/assets/3687a777-6f2b-4d9b-b7dc-8fc08cd7d4bf) ![stepper-assembly](https://github.com/user-attachments/assets/6211e7e7-3368-4a26-bbe2-425e88622b5c)
 
-For more information about software setup, hardware assembly, or the Hacker Fab in general, please visit our [Gitbook](https://hacker-fab.gitbook.io/hacker-fab-space/fab-toolkit/patterning/lithography-stepper-v2-build-work-in-progress) or our [website](https://hackerfab.ece.cmu.edu/).
+Operators: press **F1** in the app, or read the illustrated [how-to guide](docs/HOW-TO-GUIDE.html).
+This page is for whoever sets up a station or works on the code.
 
----
+- [Running the app](#running-the-app)
+- [Stage controller (GRBL)](#stage-controller-grbl)
+- [Cameras](#cameras)
+- [Projector](#projector)
+- [Configuration](#configuration)
+- [How it behaves](#how-it-behaves)
+- [Troubleshooting notes](#troubleshooting-notes)
+- [Development](#development)
 
-## Quick Start
+## Running the app
 
-### Requirements
+### Standalone app (no Python)
 
-- **Python 3.10–3.13** (Python 3.13 recommended). Install it from
-  [python.org](https://www.python.org/downloads/). Python 3.14 is not yet
-  supported because its Pillow wheel is unavailable.
-- **Linux / macOS:** Bash (pre-installed on most systems)
-- **Windows:** PowerShell 5.1+ (built in to Windows 10/11)
-- Internet connection for the first run
+Download it from the repository's **Releases** page (see the [top-level README](../README.md)).
+It includes everything, alignment-marker detection too.
 
-The launchers create a versioned project-local `.venv-*` environment and install dependencies with
-standard `pip`; no separate package manager is needed.
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| File | `HackerfabStepper-Windows.exe` | `HackerfabStepper-macOS-<arm64\|x86_64>.zip` | `HackerfabStepper-Linux-x86_64.tar.gz` |
+| First start | SmartScreen: **More info → Run anyway** | right-click the app → **Open** | `chmod +x HackerfabStepper` if needed; add your user to `video` and `dialout` (Arch: `uucp`) |
+| Settings, log, snapshots | the exe's folder (`%LOCALAPPDATA%\HackerfabStepper` if read-only) | `~/Documents/HackerfabStepper` | the program's folder (`~/.local/share/HackerfabStepper` if read-only) |
 
-### Windows
+`HACKERFAB_HOME=/some/folder` puts settings, log and snapshots somewhere else on any system.
 
-Double-click **`run.bat`**. It bypasses the per-user PowerShell execution policy for this launch only; you do not need to change that policy globally.
+### From source
 
-To validate installation without opening the GUI, open PowerShell in this directory and run:
+Python 3.10–3.13 (3.13 recommended; 3.14 is not supported yet because Pillow has no wheel for
+it). The launchers create a versioned `.venv-<python version>` here and install
+`requirements.txt` with plain `pip`:
 
-```powershell
-.\run.ps1 -SetupOnly
-```
+- **Windows:** double-click `run.bat` (it bypasses the PowerShell execution policy for this
+  launch only). `.\run.ps1 -SetupOnly` installs without starting the app.
+- **Linux / macOS:** `./run.sh` (`chmod +x run.sh` first if needed).
 
-### Standalone app (no Python needed): Windows, macOS, Linux
-
-Download the file for your computer from the repository's **Releases** page
-(**Latest build** is the newest `main`): `HackerfabStepper-Windows.exe`,
-`HackerfabStepper-macOS-arm64.zip` (Apple silicon) / `-x86_64.zip` (Intel), or
-`HackerfabStepper-Linux-x86_64.tar.gz`. It runs the same GUI without installing Python,
-including alignment-marker detection (`ckpts/best.onnx` runs on OpenCV, no PyTorch).
-
-- **Where it keeps its files** (`default.toml`, `config.toml`, `HackerfabStepper.log`,
-  snapshots): Windows / Linux, the folder the program is in (or `%LOCALAPPDATA%\HackerfabStepper`
-  / `~/.local/share/HackerfabStepper` if that is read-only); macOS, `~/Documents/HackerfabStepper`.
-  `HACKERFAB_HOME` chooses another folder.
-- **First start**: Windows SmartScreen → **More info → Run anyway**; macOS → right-click
-  the app → **Open**; Linux → `chmod +x HackerfabStepper` if needed, and add your user to
-  the `video` and `dialout` (Arch: `uucp`) groups.
-- **Help (F1)** opens the in-app Help page: a live “Right now” check of the camera, stage,
-  projector, LEDs, pattern and chip record with a fix button for each problem, and
-  searchable step-by-step answers for your operating system. Its first button opens the
-  illustrated `HOW-TO-GUIDE.html`.
-- **One screen to operate**: the Operate page shows the live camera, the stage pad, what the
-  projector is showing (badge, sentence and exact thumbnail) and the three steps of an
-  exposure (1 Pattern, 2 Focus, 3 Expose).
-- **Projector output** opens on the projector's display at launch (the projector must extend
-  the desktop, not mirror it), at that display's own resolution so patterns are projected
-  pixel for pixel. `[projector] window = "off"` disables the automatic opening.
-- **Camera**: the highest resolution at the lowest frame rate by default (Arducam B0477:
-  5472 × 3648 at 9 fps). Automatic exposure finds the exposure that removes the projector's
-  stripes, keeps the picture bright but not clipped by dimming the red light, and keeps white
-  balance fixed so red stays red. On Windows the camera is read through DirectShow, the only
-  method through which the Arducam accepts exposure changes.
-- **Projector LEDs over USB** (optional): connect the projector board's USB port and the app
-  switches the unused LEDs off (red only while focusing, blue for exposures, all off when
-  clear).
-- **Stage**: the position is read from the controller at connect; a USB dropout shows a
-  **Reconnect** button instead of failing every move; optional `[stage] x-limits` /
-  `y-limits` / `z-limits` refuse moves outside the stage's range.
-- Every push builds, smoke-tests and uploads the app for all three systems on GitHub
-  Actions; pushes to `main` refresh the **Latest build** release and `v*` tags publish a
-  release. Build it yourself on any of them with
-  `pip install -r packaging/requirements-build.txt` and `python packaging/build.py`
-  (output in `dist/release/`; on a headless Linux use `xvfb-run`).
-
-### Linux / macOS
+To do it by hand:
 
 ```bash
-./run.sh
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python src/gui.py
 ```
 
-If needed, make the launcher executable first:
+## Stage controller (GRBL)
 
-```bash
-chmod +x run.sh
-./run.sh
-```
+The app drives the stage through a board running [GRBL](https://github.com/gnea/grbl) or grblHAL
+(a BTT SKR Pico, or an Arduino) at 115200 baud, optionally with limit switches for homing.
 
----
+### Axes
 
-# GRBL Setup
+Axes are named from the **point of view of the projector/camera**. If a direction below is
+wrong, swap or reverse the stepper connections.
 
-This GUI is designed to be used with an Arduino running [GRBL](https://github.com/gnea/grbl) to move the stage,
-possibly coupled with homing sensors for absolute positioning.
+- X and Y pan the camera's view. Their polarity does not matter to the app; arrow directions can
+  be reversed in **Settings → Stage**.
+- Z focuses. +Z should bring the camera and the chip's surface closer together. The app reverses
+  Z by default (`invert-z = true`), in moves and in the position readout alike; change it in
+  **Settings → Stage → Reverse Z direction** (after restart). This does not change the
+  controller's own settings, so check the direction with a small jog before using saved
+  positions.
 
-## Axes
+### Firmware build (limit switches only)
 
-The X/Y/Z axes of the stage are labeled according to the **point of view of the projector/camera**.
-If any of the axis directions below are incorrect, swap and/or reverse the appropriate stepper connections.
-
-Movement on the X and Y axes should pan the camera's view,
-while movement on the Z axis should adjust focus.
-
-The polarity of the X/Y axes is not currently used by the GUI; any direction is acceptable.
-
-Movement in +Z should bring the camera and the chip's surface closer together.
-The Z axis should be used for focus adjustment (i.e. in/out).
-
-## Build Configuration (Sensors Only)
-
-If proximity sensors or limit switches are installed on each axis,
-some GRBL settings must be changed before flashing to the Arduino.
-Open your GRBL folder's `config.h` and make the following changes.
-
-Remove any existing defines for `HOMING_CYCLE_0` and `HOMING_CYCLE_1` and replace them
-with the defines listed below. This enables homing.
+If each axis has a limit switch or proximity sensor, edit GRBL's `config.h` before flashing.
+Replace any existing `HOMING_CYCLE_0` / `HOMING_CYCLE_1` defines with:
 
 ```c
 #define HOMING_CYCLE_0 ((1 << X_AXIS)|(1<<Y_AXIS))
 #define HOMING_CYCLE_1 (1 << Z_AXIS)
 ```
 
-Comment the `VARIABLE_SPINDLE` define.
-This allows the Z axis limit switch to be used.
+and comment out `VARIABLE_SPINDLE` so the Z limit switch can be used:
 
 ```c
 //#define VARIABLE_SPINDLE
 ```
 
-## Runtime Configuration
+### Controller settings
 
-Once GRBL is flashed to an Arduino, you can use the serial monitor in the Arduino IDE
-to adjust its configuration.
-More detail on these settings is available
-[on GRBL's wiki](https://github.com/gnea/grbl/wiki/Grbl-v1.1-Configuration).
+Set these from a serial terminal (e.g. the Arduino IDE's serial monitor). Details are on
+[GRBL's wiki](https://github.com/gnea/grbl/wiki/Grbl-v1.1-Configuration).
 
-Enable homing (if you have sensors).
+| Setting | Value (CMU's stage) | Meaning |
+|---|---|---|
+| `$22` | `1` | Homing on (only with limit switches) |
+| `$23` | `7` | Homing direction invert mask: bit 0/1/2 = X/Y/Z, set when the switch is reached moving negative |
+| `$24`, `$25` | `10`, `50` | Homing feed and seek rate |
+| `$27` | `0.5` | Homing pull-off in mm (raise it if the sensors have hysteresis) |
+| `$100`–`$102` | `3200` | Steps per mm: 8× microstepping × 200 steps/rev ÷ 0.5 mm/rev |
+| `$110`–`$112` | `120.000` | Max rate, mm/min (empirical) |
+| `$120`–`$122` | `5.000` | Max acceleration, mm/s² (empirical) |
+| `$130`–`$132` | `15.000` | Max travel in mm: measure it and back off 0.1 mm |
 
-```
-$22=1
-```
+With switches, `$H` should now home the stage. Then set `homing = true` under `[stage]` in the
+app's settings; the app homes at startup and shows a **Home** button.
 
-Adjust the homing direction invert mask (if you have sensors).
-Bits 0, 1, and 2 in this value correspond to the X, Y, and Z axes.
-For each axis, check if the limit switch is reached by moving in the positive direction or the negative direction.
-If the axis requires negative movement, set the corresponding bit.
-On CMU's setup, the limit switches are all reached by traveling in the negative direction,
-so we use a value of 7 (invert all axes).
+Every command the app sends is written to `HackerfabStepper.log` (e.g. `GRBL > G0 Y0.0100  ok`),
+which makes wiring and steps-per-mm problems easy to spot.
 
-```
-$23=7
-```
+## Cameras
 
-Adjust the homing feed and homing seek (if you have sensors).
+| Camera | `[camera] type` | Notes |
+|---|---|---|
+| Any USB (UVC) camera, e.g. Arducam B0477 | `"webcam"` | Default. `device = "auto"` prefers the Arducam. Windows reads it through DirectShow (the only method through which the Arducam accepts exposure changes), Linux through V4L2, macOS through AVFoundation. |
+| Basler | `"basler"` | Install [pylon](https://www.baslerweb.com/en-us/downloads/software/) (the "Software Suite"; restart when the installer asks, it continues afterwards) and `pip install pypylon`. Runs from source only. |
+| FLIR | `"flir"` | Ask in the Hacker Fab Discord for access to `flir-private`, then `git submodule update --init` (or clone it into `src/camera/flir`). Needs Python 3.10 or older. Runs from source only. |
+| None | `"none"` | No preview; everything else works. |
 
-```
-$24=10
-$25=50
-```
+By default the camera runs at its highest resolution and lowest frame rate (B0477: 5472 × 3648 at
+9 fps; on USB 2 only 1280 × 720 at 10 fps). The preview is reduced in the capture process; focus
+is measured on the full-resolution centre and snapshots are saved at full resolution. Capture runs
+in its own process with a watchdog, so a stuck driver cannot freeze the window.
 
-Adjust the homing pull-off (may need to be increased depending on your sensors' hysteresis).
+**Stripes.** A DLP projector flashes its colours, so a rolling-shutter camera sees bands unless
+each exposure spans whole colour cycles. While red light is on, the app tries 16, 31, 62.5 and
+125 ms, keeps the least striped one (remembered as `stripe-free-exposure`), keeps the picture
+bright but not clipped by dimming the red light first, then gain, then exposure, and fixes white
+balance at 4500 K so faint green/blue leakage does not become coloured bands.
 
-```
-$27=0.5
-```
+## Projector
 
-Adjust the steps per mm for the X, Y, and Z axes.
-For CMU's setup, there is 8x microstepping, 200 steps per revolution, and 0.5mm per revolution,
-so this value is 3200.
+The TI DLPDLCR471TPEVM is used as a second display over HDMI. The desktop must be **extended,
+not mirrored** (Windows: Win+P → Extend; macOS: System Settings → Displays, no mirroring; Linux:
+your desktop's display settings). The output window opens on it at startup, at its own
+resolution, so patterns are projected pixel for pixel.
 
-```
-$100=3200
-$101=3200
-$102=3200
-```
+**LED control over USB (optional, recommended).** With the projector board's USB port connected,
+the app switches its LEDs through the DLPC6540 command set: red only while focusing, red + blue
+for exposures and the blue focus mark, all off when idle and when the app closes. It refuses to
+start an exposure if the blue LED cannot be switched on. Check it once with **Settings →
+Projector → Test LEDs**. Close TI's DLP EVM GUI while the app runs.
 
-Adjust the max rate in mm per minute.
-These numbers are empirical; you may need lower (or may be able to use higher) ones on your stage.
+- **Windows:** the board normally installs as WinUSB by itself; if the app reports no usable
+  driver, install WinUSB for its Interface 0 with [Zadig](https://zadig.akeo.ie/).
+- **Linux:** allow your user to open it with a udev rule in
+  `/etc/udev/rules.d/70-hackerfab-dlp.rules`:
+  `SUBSYSTEM=="usb", ATTR{idVendor}=="0451", MODE="0666"`, then
+  `sudo udevadm control --reload` and replug the board.
+- **macOS:** nothing to install.
 
-```
-$110=120.000
-$111=120.000
-$112=120.000
-```
-
-Adjust the maximum acceleration in mm per sec^2.
-Same caveats apply as for the max rate.
-
-```
-$120=5.000
-$121=5.000
-$122=5.000
-```
-
-Adjust the maximum travel of each axis in mm.
-You should measure the travel and then back it off by 0.1mm,
-or you could just approximate it as 15mm and hope for the best.
-
-```
-$130=15.000
-$131=15.000
-$132=15.000
-```
-
-Once these steps are complete, you should be able to home your stage using the `$H` command (if you have sensors)
-and you are ready to use the GUI.
-
-**Set `homing=true` under `[stage]` in your config file to enable the use of sensors.**
-
-# Software Setup
-
-## Python Setup with venv
-
-The launchers perform these steps automatically. To run them yourself, use a
-[virtual environment](https://docs.python.org/3/library/venv.html) with Python
-3.10–3.13:
-
-```bash
-python -m venv venv       # name may change depending on system python
-source venv/bin/activate  # depending on your shell, see venv docs
-python --version          # ensure it is Python 3.10–3.13
-pip install -r requirements.txt
-```
-
-### Using a Basler (Pylon) camera
-
-To use a Basler camera with the GUI, you will need to install `pylon` from
-[Basler's website](https://www.baslerweb.com/en-us/downloads/software/).
-
-Select the "Software Suite" download under Pylon, as it contains useful tools for debugging the camera view.
-
-After a few steps, the installer will prompt you to **restart the computer**.
-Do not delay this restart as the Pylon installer has several more steps that are run only after restarting.
-
-### Using a FLIR camera
-
-If you are using the FLIR camera with your stage,
-ask in the Hacker Fab Discord for an invitation to the FLIR repository.
-
-Then, update the git submodules to add support for the FLIR:
-
-```bash
-git submodule init
-git submodule update
-```
-
-If the submodule update doesn't work, clone the `flir-private` repo as follows:
-
-```bash
-cd src/camera
-git clone git@github.com:hacker-fab/flir-private.git flir
-```
-
-In order to use the FLIR camera, you will need to use a version of Python **at or before 3.10.**
-Specify a version when creating your venv to make this work:
-
-```bash
-python3.10 -m venv venv   # name may change depending on system python
-```
-
-This restriction does not apply to other camera brands.
-
-> [!NOTE]
-> This software is in active development, and features are subject to change. Though each change to the main branch has been tested, there remains a chance that some bugs are undetected. To report a bug or to suggest additional features, please create an issue on this repository.
+`[projector] led-control = "off"` turns it off.
 
 ## Configuration
 
-The GUI uses a `config.toml` file (in the [TOML](https://toml.io/en/) format) for configuration.
-A sample configuration file with an explanation of the settings is shown below.
+Settings live in `config.toml` (written by the app: **Settings → Save settings**, and on exit;
+the previous five versions are kept as `.bak`). `default.toml` holds the factory defaults with a
+comment for every key; read it for the full list. A mistyped value never stops the app: at
+startup it lists what it could not use.
 
 ```toml
-# This section configures the camera used for the GUI's preview.
 [camera]
-# Available options are:
-# "webcam" (for a generic USB camera),
-# "basler" (for a Basler/Pylon camera)
-# "flir" (for a FLIR camera)
-# "none" (to disable camera)
-type = "webcam"
-# The index field is optional and is only used to select which of multiple webcams or basler/pylon cameras should be used,
-# e.g. on a laptop where there may be a builtin webcam in addition to an external USB camera.
-index = 1
-# The output from the camera is typically too large to show at full resolution.
-# This parameter adjusts the size of the camera feed before it is displayed in the GUI.
-gui-scale = 0.25
-# The following two values adjust the *camera* exposure in microseconds when viewing red or UV light.
-# Note that using values that are not a multiple of 4167 can lead to flickering.
-red-exposure = 4167.0
-uv-exposure = 25000.0
+type = "webcam"            # "basler", "flir", "none"
+device = "auto"            # or the camera's number
+mode = "max"               # or "manual" with width, height, fps
+exposure = "auto"          # stripe-free search; or a number in log2 seconds (-4 = 62.5 ms)
+white-balance = 4500
 
-# This section configures the motion stage
 [stage]
-# Set enabled to false to disable all motion.
 enabled = true
-# Set homing to false if your stage does not have limit sensors
-homing = true
-# Select the correct serial port for the device running GRBL.
-# The correct serial port can be checked with Device Manager on Windows.
-port = "COM6"
-# GRBL's baud rate is almost always 115200, do not change this value
-baud-rate = 115200
+port = "auto"              # or "COM5", "/dev/ttyACM0", "/dev/cu.usbmodem1101"
+homing = false             # true only with limit switches and GRBL homing set up
+invert-z = true
+# x-limits = [-15000, 0]   # optional travel limits in µm (also y-, z-)
 
-# This section configures alignment marker detection
+[projector]
+window = "auto"            # open the output window on the projector at startup
+resolution = "auto"        # the projector display's own resolution
+led-control = "auto"       # "off" leaves the LEDs alone
+
+[exposure]
+seconds = 8
+
 [alignment]
-# Enable or disable real-time detection of alignment markers
-enabled = false
-# Path to the YOLO model weights file
-model_path = "best.pt"
-# Alignment marker reference coordinates (in pixels)
-right_marker_x = 1634.0  # x-coordinate for markers on the right side
-top_marker_y = 117.5     # y-coordinate for markers on the top
-bottom_marker_y = 1001.5 # y-coordinate for markers on the bottom
-left_marker_x = 0.0      # x-coordinate for markers on the left side
-# Scaling factors for converting normalized differences to stage movements (in µm)
-x_scale_factor = -1040   # Scaling factor for x-axis movements
-y_scale_factor = -580    # Scaling factor for y-axis movements
+enabled = false            # show detected marks on the camera picture
+model_path = "ckpts/best.onnx"
+reference-width = 1920     # camera pixels the marker positions below were measured at
+reference-height = 1080
+right_marker_x = 1820.0
+left_marker_x = 280.0
+top_marker_y = 269.0
+bottom_marker_y = 1075.0
+x_scale_factor = -1100     # µm of stage movement per frame width
+y_scale_factor = 800
 ```
 
-## The window
+Calibrating the `[alignment]` values is explained in [docs/guide.md](docs/guide.md).
 
-The top bar switches between **Operate**, **Chip & map**, **Alignment** and
-**Settings**, shows the state of the camera, stage, projector output and
-projector LEDs (the projector dot reads **BLUE ON** whenever blue light is on), and has
-**Help (F1)** and a red **STOP** button (also **Esc**). STOP ends whatever is running
-(exposure, autofocus, homing, tiling) and leaves the projector off.
+## How it behaves
 
-The **Operate** page is everything you need for an exposure on one screen:
+- **Exposure.** The pattern is drawn first, then the blue LED switches on and the timer starts.
+  A separate timer switches the light off on time even if a dialog is open; the chip record shows
+  how long the light was really on. From **Start** until the end, the stage, projector output,
+  camera resolution, LEDs and a second Start are locked; Esc and **STOP** still work.
+- **STOP / Esc** ends any exposure, autofocus, homing or tiling and leaves the projector off.
+- **Stage position** is read from the controller when the app connects and after homing. Jogs
+  are relative moves (G91); absolute moves (Go to…, saved positions, the chip record) use the
+  coordinates the controller reports (G53 machine coordinates on a standard setup). If the USB
+  link drops, moves and exposures are refused and a **Reconnect** button appears.
+- **Homing** runs without freezing the window; STOP cancels it with a soft reset.
+- **Autofocus** never moves more than ±150 µm from where it started and returns there if it fails.
 
-- **Camera picture** (left). The top-left chip shows the resolution and frame
-  rate; the top-right bar is the focus meter (longest bar = sharpest). Double-click
-  for a real fullscreen window (Esc to return). The toolbar below has the
-  resolution list, crosshair, fullscreen, snapshot (full resolution, saved by the
-  capture process) and **Adjust…** (exposure, gain, white balance, stripe filter,
-  frame averaging and the automatic settings).
-- **Stage** (below the camera). Arrow pad and Z buttons that repeat while held
-  (only after the previous move has finished, so nothing queues up), X/Y and Z step
-  sizes, the position readout, **Go to…** with saved positions, and **Home** when
-  the stage has limit switches. Keyboard: arrows move X/Y, Page Up/Down focus,
-  Shift gives 10× steps.
-- **Projector** (top right). A badge (OFF, RED · SAFE, STARTING, EXPOSING, BLUE MARK), one
-  sentence saying exactly what is projected, a thumbnail of the exact output,
-  the LED state, and the output display.
-- **Steps** (right): **1 Pattern** (choose the image; preview of the exposure),
-  **2 Focus** (red light source and brightness, automatic camera settings,
-  autofocus) and **3 Expose** (time, optional blue focus mark and Z offset,
-  checklist; a one-line verdict and Start/Stop pinned at the bottom).
+## Troubleshooting notes
 
-## Safety behaviour
+The Help page (F1) and the [how-to guide](docs/HOW-TO-GUIDE.html) cover everyday problems. A few
+station-level notes:
 
-- **Exposure timing.** The pattern is drawn first, then the blue LED switches on and the
-  timer starts. A separate timer switches the light off on time even if a message box is
-  open; the record shows how long the light was really on.
-- **Locks.** From the moment you press Start until the exposure ends, the stage, the
-  projector output, the camera resolution, LED changes and a second Start are locked; STOP
-  and Esc still work (also while it waits for the stage to stop).
-- **Stage position.** The position is read from the controller when the app connects and
-  after homing. Jogs are relative moves (G91); absolute moves (Go to…, saved positions,
-  chip record) use the coordinates the controller reports (machine coordinates with G53 on
-  a standard GRBL setup, work coordinates if `$10` reports WPos).
-- **Homing** runs without freezing the window; STOP cancels it with a GRBL soft reset.
-- **Autofocus** never moves more than ±150 µm from where it started and returns there if it
-  fails or is stopped.
+- **Green or flickering video:** image data is being lost on the USB link or the decoder.
+  Close other camera programs; use a USB 3 port, the original cable and no hub. Frames that are
+  mostly solid green are skipped (turn that off only if the specimen really is green). See
+  [docs/arducam-usb2-diagnostics.md](docs/arducam-usb2-diagnostics.md) for a measured USB 2 case.
+- **Camera problems:** **Settings → Camera → Copy camera diagnostics** lists the device, the
+  cameras found and every capture attempt.
+- **Tiny text on Linux:** some standalone Python builds ship Tk without Xft, so every font
+  collapses to one small bitmap font. `./tools/build_tk.sh` builds a project-local Tcl/Tk 9.0.4
+  with Xft under `.runtime/` (git-ignored; needs a C compiler, make, curl, pkg-config and the
+  X11/Xft/fontconfig headers), which the app then uses automatically. **Settings → Appearance**
+  also has text sizes from 90 % to 130 %, and `HACKERFAB_UI_SCALE=1.6` scales everything.
 
-## Camera settings
+## Development
 
-On a fresh launch the camera uses `device = "auto"` (the Arducam if present) and
-`mode = "max"`: the highest resolution the camera reports, at its lowest frame rate.
-On Windows the modes are read through DirectShow; if they cannot be read, the known
-Arducam modes are tried in order (IMX283/B0477, IMX519, IMX477 and the USB 2
-fallback). Choose another resolution from the list under the camera picture or in
-**Settings → Camera**.
+### Code map
 
-The live picture is a preview (at most 1600 px wide) computed in the capture
-process; focus is measured on the full-resolution centre of each frame, and
-snapshots are written at full resolution by the capture process.
+| Path | Contents |
+|---|---|
+| `src/gui.py` | Main window, start window and `main()` |
+| `src/stepper_app.py` | Standalone app entry point: working folder per OS, log, `--smoke-test` |
+| `src/dispatcher.py` | State and actions: projection, LEDs, exposures, autofocus, stage, alignment maths |
+| `src/camera/` | Capture process (`webcam.py`), automatic exposure, image processing, camera modes |
+| `src/camera_view.py`, `stage_pad.py`, `projector_panel.py`, `steps_panel.py` | The Operate page |
+| `src/settings.py`, `alignment_page.py`, `chip_pages.py`, `help_page.py` | The other pages |
+| `src/alignment_detector.py` | Alignment-marker model on OpenCV DNN |
+| `src/projector_leds.py`, `projector_window.py` | LED control over USB, the output window |
+| `src/platform_text.py` | Wording and helpers that differ between Windows, macOS and Linux |
+| `src/ui_theme.py`, `ui_kit.py` | Colours, fonts, DPI awareness, shared widgets |
+| `packaging/` | PyInstaller spec, build script, build requirements |
+| `docs/guide_template.html`, `docs/guide_images/`, `tools/build_guide.py` | Source of the how-to guide |
 
-Automatic settings (on by default, while the projector shows red light):
-
-1. **Stripe-free exposure.** DLP projectors flash their colours; a rolling-shutter
-   camera sees stripes unless the exposure spans a whole number of flashes. The app
-   tries 16, 31, 62.5 and 125 ms, measures the stripes and keeps the best (the
-   result is remembered in `stripe-free-exposure`).
-2. **Brightness.** It keeps the brightest pixels high but below clipping by
-   dimming or brightening the red light (gamma-aware), then by camera gain, and only
-   as a last resort by changing exposure.
-3. **Fixed white balance** (4500 K) so red light stays red; automatic white
-   balance turns faint green/blue projector light into coloured bands.
-
-If the camera ignores exposure changes, the Focus step says so (close other camera
-programs and reconnect; the camera diagnostics show what the driver reported).
-
-Capture runs in an isolated process with a watchdog so a blocked driver cannot
-freeze the UI or hang shutdown. Basler and FLIR retain their vendor backends;
-their SDKs must be installed separately.
-
-## Projector LEDs (optional USB link)
-
-The DLPDLCR471TPEVM's controller (DLPC6540) accepts commands over its USB port
-(a generic USB bulk interface). With that cable connected, the app sets the LED
-enable mask: red only for focusing, red + blue for exposures and the UV mark, all
-off when the projector is clear and when the app closes. Use **Settings →
-Projector → Test LEDs** to check it. If Windows shows no driver for the interface,
-install WinUSB for it once with [Zadig](https://zadig.akeo.ie/). On Linux, allow your user
-to open it once with a udev rule (`SUBSYSTEM=="usb", ATTR{idVendor}=="0451", MODE="0666"`
-in `/etc/udev/rules.d/70-hackerfab-dlp.rules`); macOS needs nothing. Close TI's DLP EVM
-GUI while the app runs. `[projector] led-control = "off"` disables it.
-
-### Green or flickering video
-
-A green preview can indicate a capture-format/decoder problem or an unstable USB
-stream; the image alone cannot identify the cause. Close OBS and other camera
-clients before connecting in Stepper. Try Auto, or an advertised MJPEG mode at
-1280×720 / 30 fps or a lower supported resolution/frame rate. USB speed shown beside
-the device is the negotiated physical link speed, not a software setting. A bad
-cable, insufficient power, a hub, or a hardware/driver fault can still require a
-physical fix. Software cannot guarantee a perfect stream for those conditions.
-Disable green-frame rejection only when the actual specimen fills the view with
-green. Review pixel-based alignment calibration whenever capture resolution changes.
-
-Mode discovery follows the [V4L2 format enumeration API](https://docs.kernel.org/userspace-api/media/v4l/vidioc-enum-fmt.html).
-Requested properties may differ from driver results, as documented by
-[OpenCV's capture property API](https://docs.opencv.org/4.x/d4/d15/group__videoio__flags__base.html).
-
-Run the regression checks (183 tests) with:
+### Tests
 
 ```bash
-PYTHONPATH=src .venv-3.12/bin/python -m unittest discover -s tests -v
+./run_tests.sh                                   # Linux: GUI tests run on a virtual screen (Xvfb)
+PYTHONPATH=src python -m unittest discover -s tests
 ```
 
-Use the Python executable from your launcher-created virtual environment if its
-version differs.
+GUI tests need a display (they are skipped without one) and answer every dialog automatically.
 
-### Readable text on Linux
+### Building the standalone app
 
-The default dark theme uses a system sans-serif font. **Settings → Appearance**
-offers Light / Dark and a text size (90 %, 100 %, 115 %, 130 %) on top of the
-display scaling; both apply after a restart.
-
-Some standalone Python distributions ship Tk without Xft font rendering. On
-those runtimes every requested font can collapse to the same tiny bitmap font;
-changing the application's font size alone cannot fix it. This checkout has a
-project-local Tcl/Tk 9.0.4 build with Xft under `.runtime/tk-9.0.4`. The application
-loads it automatically for a compatible Linux Tcl 9 Python, without modifying
-system Python, desktop settings, or other applications.
-
-To reproduce that optional build on another Linux machine:
+GitHub Actions builds and smoke-tests all platforms on every push (`.github/workflows/build.yml`).
+To build locally, on the platform you want the app for:
 
 ```bash
-./tools/build_tk.sh
+python -m venv .venv-build
+.venv-build/bin/pip install -r packaging/requirements-build.txt    # Windows: .venv-build\Scripts\pip
+.venv-build/bin/python packaging/build.py
 ```
 
-It requires a C compiler, make, curl, pkg-config, and the X11/Xft/fontconfig
-development libraries. The script downloads checksum-pinned official Tcl/Tk
-sources and keeps all build/install files under `.runtime/` (git-ignored).
-Removing `.runtime/tk-9.0.4` restores the Python runtime's original Tk. Windows,
-macOS, and Python builds using Tcl 8 continue to use their bundled/system Tk.
+The result, smoke-tested, is in `dist/release/`. On a Linux machine without a screen, run the
+last command under `xvfb-run`.
 
-### Z-axis direction
+### Editing the how-to guide
 
-This setup defaults to `invert-z = true` under `[stage]`. The app reverses Z
-in both absolute and relative movement commands, and reverses Z position
-readback to keep displayed coordinates consistent. X and Y are unchanged.
-Use **Settings → Stage → Reverse Z direction**, then save and restart, to change
-this mapping. Autofocus and other app-driven Z moves use the same mapping.
-This is an application coordinate reversal; it does not change the controller's
-stored direction-polarity or homing settings. Verify direction on the stepper
-computer with a small jog before using saved absolute positions.
+Edit `docs/guide_template.html` (screenshots: `docs/guide_images/<name>.png`, referenced as
+`IMG:<name>|caption`), then run `python tools/build_guide.py` to rebuild `docs/HOW-TO-GUIDE.html`.
+The Help page's answers are plain lists at the top of `src/help_page.py`.
 
-If connection fails, **Settings → Camera → Copy camera diagnostics** includes
-the selected device, discovered cameras, and each failed capture attempt. The
-preview clears its connecting state on failure and disables snapshots until
-a live frame is available.
+### Reporting bugs
 
-### Fullscreen and previews
-
-- **Camera fullscreen** is its own window covering the screen the app is on
-  (double-click the picture or **⛶ Fullscreen**; Esc, double-click or the
-  **Exit** button returns). Stage keys work there too.
-- **Projector output** is a borderless window on the projector's display. Images
-  are prepared at that display's resolution (`[projector] resolution = "auto"`),
-  so they are shown pixel for pixel. If the computer shows only one display, an exposure
-  asks before filling this screen, and gives the screen back afterwards.
-- **Projector preview** (click the thumbnail or **Enlarge**) is a resizable window
-  that only mirrors the output; closing it never affects the projector.
-
-The app is DPI-aware on Windows, so text stays sharp at 125 % / 150 % scaling and
-the projector window is never stretched by Windows.
-
-### Running the tests
-
-```bash
-python -m unittest discover -s tests
-```
-
-(from the `stepper` folder; GUI tests need a display and are skipped without one).
+The software is in active development. Open an issue with what you did, what happened, and the
+**Help → Copy problem report** output.

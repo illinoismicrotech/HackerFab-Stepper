@@ -1,91 +1,74 @@
-# Stepper Software Guide
+# Alignment-marker detection and Auto-align
 
-This is a guide to the photolithography stepper software contained in this repository.
+Using the app (exposures, focus, tiling, settings) is covered by the Help page (F1) and the
+illustrated [how-to guide](HOW-TO-GUIDE.html). This page explains how alignment-marker detection
+works and how to calibrate it for a station.
 
-## Overview
+## The model
 
-TODO
+The app finds alignment marks with a small YOLO model (a fine-tuned 2.6M-parameter YOLOv11n).
+The repository has it twice:
 
-## Quick Start
-
-TODO
-
-## Configuration
-
-TODO
-
-## Tiling
-
-TODO
-
-## Autofocus
-
-TODO
-
-## Detection
-
-The GUI detects alignment markers with a YOLO model (a fine-tuned 2.6M-parameter YOLOv11n).
-The repository includes it twice:
-
-- `ckpts/best.onnx`: used by default. It runs on OpenCV's DNN module (`src/alignment_detector.py`),
-  so neither the standalone app nor `run.bat` / `run.sh` needs PyTorch.
+- `ckpts/best.onnx`: used by default. It runs on OpenCV's DNN module
+  (`src/alignment_detector.py`), so neither the standalone app nor `run.bat` / `run.sh` needs
+  PyTorch.
 - `ckpts/best.pt`: the original training checkpoint. It needs the `ultralytics` package. A `.pt`
-  path in the config also picks up a `.onnx` file with the same name next to it.
+  path in the settings also picks up a `.onnx` file with the same name next to it.
 
-To train a model on your own data, see [this guide](model.md); it ends with exporting the result to ONNX.
+To train a model on your own chips, see [model.md](model.md); it ends with exporting to ONNX.
+
+## Using it
+
+On the **Alignment** page:
+
+- **Show detected markers on the camera picture** draws a green box around every mark the model
+  finds (refreshed twice a second). `[alignment] enabled = true` turns this on at startup.
+- **Auto-align stage** moves the stage so the marks land on their calibrated positions, and
+  reports the move in the status line. Click it again to refine.
+
+During **tiling** (Chip & map page), every tile after the first is corrected with the marks on
+the edge it shares with the previous tile: left or right within a row (rows run in snake order),
+the top edge for the first tile of a new row. Corrections are always stage moves.
+
+## How the correction is computed
+
+1. The model finds the marks in the camera picture. Each mark's centre is taken as a fraction of
+   the frame (0 to 1), so the result does not depend on the camera resolution.
+2. A mark in the right half of the frame is compared with `right_marker_x`, one in the left half
+   with `left_marker_x`; likewise bottom/top with `bottom_marker_y` / `top_marker_y`. Those
+   positions are pixels at `reference-width` × `reference-height` and are scaled to fractions too.
+3. The difference times `x_scale_factor` / `y_scale_factor` is the stage move in µm. With several
+   marks, the moves are averaged.
 
 ```toml
 [alignment]
-# Start with real-time detection of alignment markers on
 enabled = false
-# The marker model
 model_path = "ckpts/best.onnx"
+reference-width = 1920     # camera resolution the positions below were measured at
+reference-height = 1080
+right_marker_x = 1820.0    # where marks on the right should be, in pixels
+left_marker_x = 280.0
+top_marker_y = 269.0
+bottom_marker_y = 1075.0
+x_scale_factor = -1100     # µm of stage movement for a mark moving one full frame width
+y_scale_factor = 800       # µm for one full frame height
 ```
 
-The **Detect alignment markers in real time** checkbox (Image alignment page) draws the detections
-on the camera preview, refreshed twice a second.
+## Calibrating
 
-## Alignment
+The values above were measured on one station's camera and optics. Check them on yours before
+relying on Auto-align or tiling.
 
-The alignment system allows for automatic positioning of chips on the stage for layered patterning. The system uses the YOLO model to detect alignment markers and calculates the necessary stage movements to align the patterns precisely.
-
-#### How Alignment Works
-
-1. The system detects alignment markers in the camera image using the model specified in the configuration.
-2. For each detected marker, the system calculates its position relative to predefined reference coordinates.
-3. Based on these differences, the system computes the necessary stage movements to align the chip correctly.
-
-#### Alignment Parameters
-
-```toml
-[alignment]
-# ...
-# Alignment marker reference coordinates (in pixels)
-right_marker_x = 1820.0  # x-coordinate for markers on the right side
-top_marker_y = 269.0     # y-coordinate for markers on the top
-bottom_marker_y = 1075.0 # y-coordinate for markers on the bottom
-left_marker_x = 280.0    # x-coordinate for markers on the left side
-# Scaling factors for converting normalized differences to stage movements (in µm)
-x_scale_factor = -1100   # Scaling factor for x-axis movements
-y_scale_factor = 800     # Scaling factor for y-axis movements
-```
-
-The marker coordinates are pixels at the camera resolution given by `reference-width` and
-`reference-height` (default 1920 × 1080). They are scaled automatically when the camera runs at a
-different resolution, so record the resolution you calibrate at.
-
-**Auto-align** moves the stage once and reports the move; click it again to refine. During **tiling**,
-each tile after the first is corrected using only the marks on the edge shared with the previous
-tile (left, right or top, following the snake order).
-
-#### Calibrating Alignment Parameters
-
-The coordinates represent the "ideal" positions where markers should be in the camera frame when the chip is perfectly aligned. To calibrate the alignment parameters, we can use our model to detect projected alignment markers on a clean area of a chip:
-
-1. **Reference Coordinates**: Place a chip on the stage. Move the stage so that an unpatterned area of the chip is on view and ensure the stepper is in red focus mode. Enable real-time detection. Then select and project a pattern that has the alignment markers in the desired position. The GUI should output detection positions in the terminal. Note the pixel coordinates and update the reference coordinate values in the config accordingly.
-
-2. **Scaling Factors**: These values depend on your camera's field of view and the mechanical properties of your stage. To calibrate:
-   - Move the stage by a known distance (e.g., 100 µm)
-   - Measure how many pixels the markers moved in the camera image
-   - Calculate the scaling factor as: `(stage movement in µm) / (marker movement in normalized coordinates)`
-   - Adjust the sign (positive or negative) based on the relative directions of stage movement and camera coordinates
+1. **Marker positions.** Put a chip on the stage with a clean area in view and focus in red.
+   Choose a pattern with alignment marks where you want them and click **Show it in red**
+   (1 Pattern). Turn on **Show detected markers** to check they are found, then click
+   **Snapshot**. Open the snapshot in an image viewer and read the pixel position of the centre
+   of each mark. Enter them as `left_marker_x`, `right_marker_x`, `top_marker_y` and
+   `bottom_marker_y`, and the snapshot's width and height as `reference-width` and
+   `reference-height`.
+2. **Scale factors.** Note a mark's position, move the stage by a known distance (for example
+   100 µm in X with the stage pad) and note the new position. Then
+   `x_scale_factor = stage move in µm ÷ (mark movement in pixels ÷ reference-width)`, and the same
+   for Y with `reference-height`. Flip the sign if Auto-align moves the wrong way.
+3. Save, restart, and click **Auto-align stage** a few times on a patterned chip: each click
+   should make a smaller move.

@@ -11,7 +11,7 @@ name: Build app
 
 on:
   push:
-    branches: [main, 'UI\+Packaging']  # '+' is a pattern symbol in branch filters, so it must be escaped
+    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:

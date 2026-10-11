@@ -1,59 +1,88 @@
 # HackerFab Stepper
 
-Desktop control software for the HackerFab photolithography stepper: pattern selection, stage alignment, timed UV exposure, and a live camera preview.
+Desktop control software for the HackerFab maskless photolithography stepper: a DLP projector
+shows the pattern in red light (safe for resist) to focus and align, then in blue light to expose
+it, while a USB microscope camera watches the chip and a GRBL stage moves it.
 
-## Download and run (easiest)
+It runs on **Windows, macOS and Linux**, either as a ready-made download or from source.
 
-No Python, no installing, no command line. Go to the **[Releases page](../../releases)** and download the one file for your computer:
+## Download and run
 
-| Computer | Download | Then |
+No Python, no installing, no command line. Open the **[Releases page](../../releases)** and download
+the file for your computer from **Latest build** (the newest version of `main`):
+
+| Computer | Download | First start |
 |---|---|---|
-| Windows 10/11 | `HackerfabStepper-Windows.exe` | Put it in its own folder (e.g. `C:\HackerfabStepper\`) and double-click it. If Windows says "Windows protected your PC", click **More info → Run anyway**. |
-| Mac, Apple silicon (M1–M4) | `HackerfabStepper-macOS-arm64.zip` | Double-click the zip, drag **HackerfabStepper.app** to Applications. First time: right-click it → **Open** → **Open** (or System Settings → Privacy & Security → **Open Anyway**). |
+| Windows 10/11 | `HackerfabStepper-Windows.exe` | Put it in its own folder (e.g. `C:\HackerfabStepper\`) and double-click it. "Windows protected your PC" → **More info → Run anyway**. |
+| Mac, Apple silicon (M1–M4) | `HackerfabStepper-macOS-arm64.zip` | Unzip, drag **HackerfabStepper.app** to Applications. First time: right-click it → **Open** → **Open**. |
 | Mac, Intel | `HackerfabStepper-macOS-x86_64.zip` | Same as above. |
-| Linux (64-bit) | `HackerfabStepper-Linux-x86_64.tar.gz` | `tar xzf HackerfabStepper-Linux-x86_64.tar.gz && ./HackerfabStepper`. Once: `sudo usermod -aG video,dialout $USER` (Arch: `uucp` instead of `dialout`), then log out and in. |
+| Linux (x86-64) | `HackerfabStepper-Linux-x86_64.tar.gz` | `tar xzf HackerfabStepper-Linux-x86_64.tar.gz && ./HackerfabStepper`. Once: `sudo usermod -aG video,dialout $USER` (Arch: `uucp` instead of `dialout`), then log out and in. |
 
-The newest build of `main` is always under **Latest build**; numbered versions (e.g. `v1.0.0`) are the stable releases. Versions marked **Pre-release** (`v0.x`, or names with a dash like `v1.1.0-beta`) are test builds.
+Numbered versions (`v1.0.0`) are stable releases; **Pre-release** versions (`v0.x`, or names with
+a dash such as `v1.1.0-beta`) are test builds.
 
-When it starts, pick the stage controller in the small setup window and click **Launch**. Help is built in: press **F1** (or **Help** in the top bar). The Help page shows what is not ready yet (camera, stage, projector, LEDs, pattern) with a button to fix each item, and searchable step-by-step answers written for your operating system; its first button opens the illustrated guide.
+When it starts, pick the stage controller (or **No stage**) in the setup window and click
+**Launch**.
 
-Everything is included, including the alignment-marker detector used by **Auto-align** and **tiling**.
+## Getting help
 
-## Run from source (developers)
+Press **F1** (or **Help** in the top bar). The Help page:
 
-Needs [Python 3.10–3.13](https://www.python.org/downloads/) (3.13 recommended). The launchers create a project-local environment and install everything on first run (about 150 MB).
+- checks the camera, stage, projector, LEDs, pattern and chip record **right now**, and gives a
+  one-click fix for anything that is not ready;
+- answers "how do I …" and "what's wrong?" questions as you type (try *stripes*, *focus*,
+  *won't move*, *LED*), with steps written for your operating system;
+- opens the illustrated **[how-to guide](stepper/docs/HOW-TO-GUIDE.html)**, the log and the settings
+  folder, and copies a problem report you can paste into a message.
+
+## What it does
+
+- **One screen to operate:** live camera with focus meter, stage pad, what the projector is
+  showing, and the three steps of an exposure (1 Pattern, 2 Focus, 3 Expose). Esc or **STOP**
+  ends anything that is running and turns the projector off.
+- **A clean camera picture:** automatic stripe-free exposure, brightness control and fixed white
+  balance remove the bands a DLP projector causes in a rolling-shutter camera.
+- **Projector LEDs over USB** (optional): red only while focusing, blue for exposures, all off
+  when idle.
+- **Alignment:** a small YOLO model (`stepper/ckpts/best.onnx`, run by OpenCV, no PyTorch) finds
+  the chip's alignment marks. **Auto-align stage** moves the stage onto them.
+- **Tiling:** patterns larger than one projector field are split into tiles and exposed one
+  after another, each aligned to the previous one.
+- **Chip record:** every exposure is logged with its time, position, duration and pattern.
+
+## Run from source
+
+Needs [Python 3.10–3.13](https://www.python.org/downloads/). The launchers create a project-local
+environment and install everything on the first run.
 
 ```bash
 git clone https://github.com/illinoismicrotech/Hackerfab-Stepper.git
 cd Hackerfab-Stepper/stepper
+./run.sh          # Linux / macOS
 ```
 
-- **Windows:** double-click `run.bat` (or `.\run.ps1 -SetupOnly` in PowerShell to only install).
-- **Linux / macOS:** `./run.sh` (run `chmod +x run.sh` first if needed).
+On Windows, double-click `stepper\run.bat`.
 
-See the [application guide](stepper/README.md) for GRBL setup, camera support, and configuration details.
+## Documentation
 
-## Before first use
-
-- Connect the USB camera and the GRBL stage controller (e.g. an SKR Pico, shown as an RP2040 board).
-- In the setup window, pick the stage controller, or **No stage** to try the software without hardware.
-- Settings live in `default.toml` / `config.toml` (next to the app; on macOS in `Documents/HackerfabStepper`). The **Settings** page in the app edits them for you.
-- If text is too small on a high-resolution display, start the app with the environment variable `HACKERFAB_UI_SCALE=1.6`.
-
-## Alignment and tiling
-
-- **Auto-align stage** (Alignment page) finds the alignment marks in the camera view and moves the stage so they line up with the calibrated positions under `[alignment]`. Turn on **Show detected markers on the camera picture** first to check the marks are found.
-- **Tiling** (Chip & map page) exposes a pattern bigger than one projector field: **1 Split the pattern into tiles**, then **2 Begin tiling**. Each tile after the first is corrected using the previous tile's marks. **Stop tiling** (or Esc) stops the run.
-- The marker positions in `default.toml` were calibrated on one station's camera. Check them on yours before relying on Auto-align or tiling: see [`stepper/docs/guide.md`](stepper/docs/guide.md#calibrating-alignment-parameters).
-- The detector is a small YOLO model, `stepper/ckpts/best.onnx`, run by OpenCV (no PyTorch). To retrain it, see [`stepper/docs/model.md`](stepper/docs/model.md).
+| Document | For |
+|---|---|
+| [`stepper/docs/HOW-TO-GUIDE.html`](stepper/docs/HOW-TO-GUIDE.html) | Operators: install, every part of the window, a full exposure, troubleshooting (also in the app). |
+| [`stepper/README.md`](stepper/README.md) | Setting up a station: stage controller (GRBL), cameras, projector LEDs, configuration, development. |
+| [`stepper/docs/guide.md`](stepper/docs/guide.md) | Alignment-marker detection and calibrating Auto-align. |
+| [`stepper/docs/model.md`](stepper/docs/model.md) | Training a new alignment-marker model. |
 
 ## How the downloads are made
 
-GitHub Actions ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs the tests, then builds and smoke-tests the app on Windows, macOS and Linux for every push. A push to `main` refreshes **Latest build** on the Releases page; pushing a tag publishes a numbered release:
+GitHub Actions ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs the tests, then
+builds and smoke-tests the app on Windows, macOS (Apple silicon and Intel) and Linux for every
+push and pull request. A push to `main` refreshes **Latest build**; a tag publishes a release:
 
 ```bash
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-To build it yourself, see [Standalone app](stepper/README.md#standalone-app-no-python-needed-windows-macos-linux) in the application guide.
+To build it yourself, see [Development](stepper/README.md#development).
+
+MIT License. Copyright (c) 2024 hacker-fab.

@@ -12,13 +12,13 @@ After selecting a collection of images, we need to annotate our data with labels
 
 ### Dataset Instructions
 
-First, navigate to [app.roboflow.com](app.roboflow.com) and create or sign in to an account.
+First, navigate to [app.roboflow.com](https://app.roboflow.com) and create or sign in to an account.
 
 Then you will be able to see all your projects. Create a new project.
 
 ![projects](../assets/model_guide1.png)
 
-If our data is not size (640, 640), we’ll eventually want to resize it to be since that’s the dimension of input that the YOLO model takes. Roboflow can do this for us, but we also have a script for to doing this ourselves, located [here](https://github.com/hacker-fab/stepper/blob/auto-align/litho/resize.py) on GitHub.
+If our data is not size (640, 640), we’ll eventually want to resize it to be since that’s the dimension of input that the YOLO model takes. Roboflow can do this for us, but we also have a script for doing this ourselves, located [here](https://github.com/hacker-fab/stepper/blob/auto-align/litho/resize.py) on GitHub.
 
 After creating a project, upload the image data that will be used for the dataset.
 
