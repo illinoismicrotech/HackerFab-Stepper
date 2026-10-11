@@ -34,17 +34,21 @@ To validate installation without opening the GUI, open PowerShell in this direct
 
 ### Windows standalone exe (no Python needed)
 
-`HackerfabStepper.exe` runs the same GUI without installing Python.
+`HackerfabStepper.exe` runs the same GUI without installing Python. It is about 50 MB
+(down from 72 MB): it leaves out everything the app never loads, such as OpenCV's 30 MB
+video-file codec. Most of what remains is OpenCV itself.
 
-- Put it in its own folder, e.g. `C:\HackerfabStepper\`. On first run it creates `default.toml`, `src\uvFocusImage\plus.png`, and `HackerfabStepper.log` next to itself; edit `default.toml` there. If that folder is read-only, it uses `%LOCALAPPDATA%\HackerfabStepper` instead.
+- Put it in its own folder, e.g. `C:\HackerfabStepper\`. On first run it creates `default.toml`, `src\uvFocusImage\plus.png`, and `HackerfabStepper.log` next to itself. Your choices are saved to `config.toml` (Settings → Save settings, and automatically when you close the app). If that folder is read-only, it uses `%LOCALAPPDATA%\HackerfabStepper` instead.
 - Windows SmartScreen may warn because the exe is unsigned: click **More info → Run anyway**.
 - Alignment marker detection (YOLO) is not included in the exe, because PyTorch would make it over 1 GB. Use `run.bat` when you need it.
-- A borderless projector window opens on the projector's display at launch (Windows must be set to Extend with Win+P). `[projector] window = "off"` disables it.
-- To remove the coloured bands the DLP causes in the Arducam image, set `[camera] exposure` to `-5` or `-4` (Settings → Camera → Exposure) and dim the red image with the **Red brightness** slider.
+- **One screen to operate**: the Operate page shows the live camera, the stage pad, what the projector is showing (badge, sentence and exact thumbnail) and the three steps of an exposure (1 Pattern, 2 Focus, 3 Expose). See `HOW-TO-GUIDE.html` (F1 in the app).
+- **Projector output** opens on the projector's display at launch (Windows must be set to Extend with Win+P), at that display's own resolution so patterns are projected pixel for pixel. `[projector] window = "off"` disables the automatic opening.
+- **Camera**: the highest resolution at the lowest frame rate by default (Arducam B0477: 5472 × 3648 at 9 fps). Automatic exposure finds the exposure that removes the projector's stripes, keeps the picture bright but not clipped by dimming the red light, and keeps white balance fixed so red stays red.
+- **Projector LEDs over USB** (optional): connect the projector board's USB port to the PC and the app switches the unused LEDs off (red only while focusing, blue for exposures, all off when clear). This removes the remaining coloured bands and keeps stray blue light off the resist.
 - Every push to `main` or `UI+Packaging` builds the exe on GitHub Actions (**Actions → Build Windows exe → Artifacts**).
-- To build it locally on Windows, run `.\packaging\build_exe.ps1` from this folder. The result is `dist\HackerfabStepper.exe`.
+- To build it locally on Windows, run `.\packaging\build_exe.ps1` from this folder. The result is `dist\HackerfabStepper.exe`. `.\packaging\build_exe.ps1 -SlimOpenCV` builds a 29 MB exe with the experimental slim OpenCV in `packaging\opencv-slim\` (a MinGW cross-build, `packaging/build_opencv_slim.sh`). It is not the default until it has been confirmed on the stepper's camera.
 
-The Windows camera backend defaults to Media Foundation (`backend = "auto"` in `[camera]`). With DirectShow, the Arducam B0477 streams a solid white image.
+On Windows the camera is read through DirectShow (`backend = "auto"` in `[camera]`): it is the only capture method through which the Arducam accepts exposure changes, and the only one in the slim OpenCV build.
 
 ### Linux / macOS
 
@@ -289,45 +293,92 @@ x_scale_factor = -1040   # Scaling factor for x-axis movements
 y_scale_factor = -580    # Scaling factor for y-axis movements
 ```
 
-## Camera and device settings
+## The window
 
-The sidebar separates **Operate**, **Alignment**, **Wafer & tiling**, and
-**Settings**. The workspaces scroll on smaller screens; camera previews fit their
-panel while snapshots and focus measurements retain the original image.
+The top bar switches between **Operate**, **Chip & map**, **Alignment** and
+**Settings**, shows the state of the camera, stage, projector output and
+projector LEDs (the projector dot reads **BLUE ON** whenever blue light is on), and has
+**Help (F1)** and a red **STOP** button (also **Esc**). STOP ends whatever is running
+(exposure, autofocus, homing, tiling) and leaves the projector off.
 
-On a fresh launch the camera uses `device = "auto"` and `mode = "auto"`. On Linux,
-Stepper enumerates capture nodes, uses stable `/dev/v4l/by-id` paths where available,
-and reads advertised resolution / format / frame-rate combinations with
-`v4l2-ctl` (optional, provided by `v4l-utils`). It prefers MJPEG at moderate
-resolution, tests multiple decoded frames, and rejects likely solid-green
-corruption. Metadata nodes are excluded; monochrome auxiliary streams require
-explicit selection in Auto device mode. Windows and macOS expose index candidates
-0–7, validated when opened, and use platform capture backends. Existing numeric
-`index` configurations still work.
+The **Operate** page is everything you need for an exposure on one screen:
 
-In **Settings**:
+- **Camera picture** (left). The top-left chip shows the resolution and frame
+  rate; the top-right bar is the focus meter (longest bar = sharpest). Double-click
+  for a real fullscreen window (Esc to return). The toolbar below has the
+  resolution list, crosshair, fullscreen, snapshot (full resolution, saved by the
+  capture process) and **Adjust…** (exposure, gain, white balance, stripe filter,
+  frame averaging and the automatic settings).
+- **Stage** (below the camera). Arrow pad and Z buttons that repeat while held
+  (only after the previous move has finished, so nothing queues up), X/Y and Z step
+  sizes, the position readout, **Go to…** with saved positions, and **Home** when
+  the stage has limit switches. Keyboard: arrows move X/Y, Page Up/Down focus,
+  Shift gives 10× steps.
+- **Projector** (top right). A badge (OFF, RED · SAFE, STARTING, EXPOSING, BLUE MARK), one
+  sentence saying exactly what is projected, a thumbnail of the exact output,
+  the LED state, and the output display.
+- **Steps** (right): **1 Pattern** (choose the image; preview of the exposure),
+  **2 Focus** (red light source and brightness, automatic camera settings,
+  autofocus) and **3 Expose** (time, optional blue focus mark and Z offset,
+  checklist; a one-line verdict and Start/Stop pinned at the bottom).
 
-1. Refresh devices and select the intended camera, or enter a device path/index.
-2. Leave capture configuration on **auto**, or read the advertised modes and
-   select one. Manual mode checks the driver's returned resolution, format and
-   frame rate rather than silently claiming the requested settings worked.
-3. **Connect camera** changes the active camera. The status shows its
-   actual mode, errors, and measured capture rate. Reconnection clears stale
-   images and is blocked during exposure or autofocus.
-4. **Save settings** persists selections. Starting from `default.toml` saves to
-   project-local `config.toml`, which the launcher dialog selects next time.
-   A custom configuration is saved back to its selected path. Existing files get
-   timestamped backups; unrelated configuration sections are preserved, although
-   TOML formatting/comments are rewritten. Stage port/enabled changes take effect
-   after saving and restarting. Appearance can be applied immediately.
+## Safety behaviour
+
+- **Exposure timing.** The pattern is drawn first, then the blue LED switches on and the
+  timer starts. A separate timer switches the light off on time even if a message box is
+  open; the record shows how long the light was really on.
+- **Locks.** From the moment you press Start until the exposure ends, the stage, the
+  projector output, the camera resolution, LED changes and a second Start are locked; STOP
+  and Esc still work (also while it waits for the stage to stop).
+- **Stage position.** The position is read from the controller when the app connects and
+  after homing. Jogs are relative moves (G91); absolute moves (Go to…, saved positions,
+  chip record) use the coordinates the controller reports (machine coordinates with G53 on
+  a standard GRBL setup, work coordinates if `$10` reports WPos).
+- **Homing** runs without freezing the window; STOP cancels it with a GRBL soft reset.
+- **Autofocus** never moves more than ±150 µm from where it started and returns there if it
+  fails or is stopped.
+
+## Camera settings
+
+On a fresh launch the camera uses `device = "auto"` (the Arducam if present) and
+`mode = "max"`: the highest resolution the camera reports, at its lowest frame rate.
+On Windows the modes are read through DirectShow; if they cannot be read, the known
+Arducam modes are tried in order (IMX283/B0477, IMX519, IMX477 and the USB 2
+fallback). Choose another resolution from the list under the camera picture or in
+**Settings → Camera**.
+
+The live picture is a preview (at most 1600 px wide) computed in the capture
+process; focus is measured on the full-resolution centre of each frame, and
+snapshots are written at full resolution by the capture process.
+
+Automatic settings (on by default, while the projector shows red light):
+
+1. **Stripe-free exposure.** DLP projectors flash their colours; a rolling-shutter
+   camera sees stripes unless the exposure spans a whole number of flashes. The app
+   tries 16, 31, 62.5 and 125 ms, measures the stripes and keeps the best (the
+   result is remembered in `stripe-free-exposure`).
+2. **Brightness.** It keeps the brightest pixels high but below clipping by
+   dimming or brightening the red light (gamma-aware), then by camera gain, and only
+   as a last resort by changing exposure.
+3. **Fixed white balance** (4500 K) so red light stays red; automatic white
+   balance turns faint green/blue projector light into coloured bands.
+
+If the camera ignores exposure changes, the Focus step says so (close other camera
+programs and reconnect; the camera diagnostics show what the driver reported).
 
 Capture runs in an isolated process with a watchdog so a blocked driver cannot
-freeze the UI or hang shutdown. A disconnected or stalled feed is cleared;
-reconnect from Settings after fixing the connection. Basler and FLIR retain their
-vendor backends; their SDKs must be installed separately. USB mode negotiation
-and green-frame screening apply to the generic webcam backend. Webcam exposure
-is left under driver control: the red/UV exposure values in microseconds are
-vendor-camera settings, not portable UVC exposure values.
+freeze the UI or hang shutdown. Basler and FLIR retain their vendor backends;
+their SDKs must be installed separately.
+
+## Projector LEDs (optional USB link)
+
+The DLPDLCR471TPEVM's controller (DLPC6540) accepts commands over its USB port
+(a generic WinUSB interface). With that cable connected, the app sets the LED
+enable mask: red only for focusing, red + blue for exposures and the UV mark, all
+off when the projector is clear and when the app closes. Use **Settings →
+Projector → Test LEDs** to check it. If Windows shows no driver for the interface,
+install WinUSB for it once with [Zadig](https://zadig.akeo.ie/). Close TI's DLP EVM
+GUI while the app runs. `[projector] led-control = "off"` disables it.
 
 ### Green or flickering video
 
@@ -345,7 +396,7 @@ Mode discovery follows the [V4L2 format enumeration API](https://docs.kernel.org
 Requested properties may differ from driver results, as documented by
 [OpenCV's capture property API](https://docs.opencv.org/4.x/d4/d15/group__videoio__flags__base.html).
 
-Run the camera/configuration regression checks with:
+Run the regression checks (156 tests) with:
 
 ```bash
 PYTHONPATH=src .venv-3.12/bin/python -m unittest discover -s tests -v
@@ -356,10 +407,9 @@ version differs.
 
 ### Readable text on Linux
 
-The default dark theme uses a system sans-serif font, larger controls, and padded
-camera dropdowns. **Settings → Appearance** offers Light / Dark and 100%, 125%,
-or 150% text size. Changing appearance does not reconnect devices. Motion uses
-explicit direction buttons with a single distance-per-click field.
+The default dark theme uses a system sans-serif font. **Settings → Appearance**
+offers Light / Dark and a text size (90 %, 100 %, 115 %, 130 %) on top of the
+display scaling; both apply after a restart.
 
 Some standalone Python distributions ship Tk without Xft font rendering. On
 those runtimes every requested font can collapse to the same tiny bitmap font;
@@ -396,12 +446,25 @@ the selected device, discovered cameras, and each failed capture attempt. The
 preview clears its connecting state on failure and disables snapshots until
 a live frame is available.
 
-### Fullscreen previews
+### Fullscreen and previews
 
-The app starts with one window. Click either the camera preview or projector
-preview to view it fullscreen in that same window. **Esc** or the **×** button
-returns to the workspace. Camera fullscreen remains live and preserves aspect
-ratio. Projector output uses the same view during an exposure; exiting that
-view stops the exposure and clears the pattern. To use the DLP, put the app on
-the DLP display before opening projector fullscreen. The projector's pattern
-canvas stays 1280×720 regardless of preview size.
+- **Camera fullscreen** is its own window covering the screen the app is on
+  (double-click the picture or **⛶ Fullscreen**; Esc, double-click or the
+  **Exit** button returns). Stage keys work there too.
+- **Projector output** is a borderless window on the projector's display. Images
+  are prepared at that display's resolution (`[projector] resolution = "auto"`),
+  so they are shown pixel for pixel. If Windows shows only one display, an exposure
+  asks before filling this screen, and gives the screen back afterwards.
+- **Projector preview** (click the thumbnail or **Enlarge**) is a resizable window
+  that only mirrors the output; closing it never affects the projector.
+
+The app is DPI-aware on Windows, so text stays sharp at 125 % / 150 % scaling and
+the projector window is never stretched by Windows.
+
+### Running the tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+(from the `stepper` folder; GUI tests need a display and are skipped without one).

@@ -1,4 +1,15 @@
-"""Isolated USB capture: a blocked driver never blocks Tk or application exit."""
+"""USB camera capture in an isolated process.
+
+The worker process opens the camera at its highest resolution (lowest frame rate), keeps the
+latest full-resolution frame, and sends the GUI a light preview (≤1600 px) with focus scores
+and brightness statistics. Full-resolution snapshots are written by the worker. Camera
+controls (exposure, gain, brightness, ...) change live through a command queue.
+
+A blocked camera driver can never freeze the window: the GUI only talks to queues and a
+watchdog kills a silent worker.
+"""
+from __future__ import annotations
+
 from collections import deque
 import multiprocessing as mp
 import os
@@ -6,23 +17,140 @@ import platform
 import queue
 import threading
 import time
+from pathlib import Path
 
 # Must be set before cameras are opened: Media Foundation's hardware transforms can make
-# opening a camera slower than the 12-second capture watchdog allows.
+# opening a camera slower than the capture watchdog allows.
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 
 import cv2
 import numpy as np
 
 from camera.camera_module import CameraModule
-from camera.discovery import candidate_modes, discover_devices
+from camera.discovery import discover_devices, parse_modes, v4l_info
+from camera.modes import (Mode, best_mode, dshow_modes, modes_from_v4l2, ordered_candidates,
+                          preset_modes, requested_mode)
+from camera.processing import (FrameAverager, center_crop, compute_focus_score, destripe, downscale,
+                               image_stats, stripe_strength)
+
+PREVIEW_MAX = (1600, 1200)      # preview frames sent to the GUI
+FOCUS_CROP = (1200, 1200)       # focus is measured at full resolution in the image centre
+DEFAULT_EXPOSURE = -4           # 62.5 ms = 15 periods of a 240 Hz DLP: no projector stripes
+DEFAULT_WHITE_BALANCE = 4500    # kelvin; fixed so a red-only picture stays red
+WATCHDOG_SECONDS = 15.0
+STARTUP_SECONDS = 45.0
+
+CONTROL_PROPS = {
+    "gain": cv2.CAP_PROP_GAIN,
+    "brightness": cv2.CAP_PROP_BRIGHTNESS,
+    "contrast": cv2.CAP_PROP_CONTRAST,
+    "saturation": cv2.CAP_PROP_SATURATION,
+}
+
+BACKENDS = {"msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW, "v4l2": cv2.CAP_V4L2,
+            "avfoundation": cv2.CAP_AVFOUNDATION, "any": cv2.CAP_ANY}
+
+
+# --------------------------------------------------------------------------- settings
+def exposure_ms(value) -> float:
+    """DirectShow exposure units are log2 seconds: -4 = 62.5 ms."""
+    return 1000.0 * 2.0 ** value
+
+
+def exposure_mode(settings: dict) -> str:
+    """'auto' (this app's anti-stripe auto exposure), 'camera' (camera's own auto) or 'manual'."""
+    value = str(settings.get("exposure", "auto")).strip().lower()
+    if value in ("", "auto", "app"):
+        return "auto"
+    if value in ("camera", "default", "camera-auto"):
+        return "camera"
+    try:
+        int(round(float(value)))
+        return "manual"
+    except ValueError:
+        return "auto"
+
+
+def manual_exposure(settings: dict):
+    """The fixed exposure the camera should start at, in DirectShow units, or None to leave it alone."""
+    mode = exposure_mode(settings)
+    if mode == "camera":
+        return None
+    if mode == "auto":
+        found = settings.get("stripe-free-exposure")
+        try:
+            return max(-13, min(-1, int(found))) if found is not None else DEFAULT_EXPOSURE
+        except (TypeError, ValueError):
+            return DEFAULT_EXPOSURE
+    return max(-13, min(-1, int(round(float(settings["exposure"])))))
+
+
+def initial_controls(settings: dict) -> dict:
+    """Control values to apply when the camera opens. Missing/'auto'/'default' means leave alone."""
+    controls = {}
+    exposure = manual_exposure(settings)
+    if exposure is not None:
+        controls["exposure"] = exposure
+    for name in CONTROL_PROPS:
+        value = settings.get(name.replace("_", "-"), settings.get(name))
+        if value is None or str(value).strip().lower() in ("", "auto", "default"):
+            continue
+        try:
+            controls[name] = int(round(float(value)))
+        except (TypeError, ValueError):
+            pass
+    # A fixed white balance by default: the camera's automatic white balance sees a red-only
+    # picture and boosts green and blue, which turns faint projector leakage into bold bands.
+    white_balance = str(settings.get("white-balance", DEFAULT_WHITE_BALANCE)).strip().lower()
+    if white_balance == "auto":
+        controls["white_balance_auto"] = True
+    elif white_balance not in ("camera", "default"):
+        try:
+            controls["white_balance"] = int(float(white_balance))
+        except (TypeError, ValueError):
+            controls["white_balance"] = DEFAULT_WHITE_BALANCE
+    return controls
+
+
+def capture_backend(settings: dict):
+    """[camera] backend = "auto" | "dshow" | "msmf" | "v4l2" | "any". On Windows "auto" is
+    DirectShow, the only API through which the Arducam accepts exposure changes."""
+    name = str(settings.get("backend", "auto")).strip().lower()
+    if name == "msmf":
+        # The Windows build of this app includes DirectShow only (the Arducam ignores exposure
+        # changes through Media Foundation anyway).
+        try:
+            if cv2.videoio_registry.hasBackend(cv2.CAP_MSMF):
+                return cv2.CAP_MSMF
+        except Exception:
+            pass
+        print("Media Foundation is not available in this build; using DirectShow.")
+        return cv2.CAP_DSHOW
+    if name in BACKENDS:
+        return BACKENDS[name]
+    return {"Linux": cv2.CAP_V4L2, "Windows": cv2.CAP_DSHOW,
+            "Darwin": cv2.CAP_AVFOUNDATION}.get(platform.system(), cv2.CAP_ANY)
+
+
+def setting_flag(settings: dict, key: str, default: bool) -> bool:
+    """true/false from the settings file, also when written as a string ("false", "no", "0")."""
+    value = settings.get(key, default)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "no", "off", "0", "")
+    return bool(value)
+
+
+def setting_int(settings: dict, key: str, default: int, low: int, high: int) -> int:
+    try:
+        return max(low, min(high, int(round(float(settings.get(key, default) or default)))))
+    except (TypeError, ValueError):
+        return default
 
 
 def frame_problem(frame, reject_green=True):
     if frame is None or frame.ndim != 3 or frame.shape[2] != 3 or not frame.size:
         return "No decoded color frame"
-    # Conservative heuristic for the solid green corruption seen on USB streams.
-    # Users can disable this for specimens that really fill the view with green.
+    # Conservative heuristic for the solid green corruption seen on unstable USB streams.
     sample = frame[::8, ::8].astype(np.int16)
     green = (sample[:, :, 1] > 70) & (sample[:, :, 0] < 25) & (sample[:, :, 2] < 25)
     if reject_green and green.mean() > .65:
@@ -30,48 +158,7 @@ def frame_problem(frame, reject_green=True):
     return ""
 
 
-BACKENDS = {"msmf": cv2.CAP_MSMF, "dshow": cv2.CAP_DSHOW, "v4l2": cv2.CAP_V4L2,
-            "avfoundation": cv2.CAP_AVFOUNDATION, "any": cv2.CAP_ANY}
-
-
-def manual_exposure(settings):
-    """[camera] exposure: None for "auto" (leave the camera alone), else an int in DirectShow
-    units: log2 of seconds, so -5 = 1/32 s = 31 ms, -11 = 0.5 ms."""
-    value = settings.get("exposure", "auto")
-    if value is None or str(value).strip().lower() in ("", "auto", "default"):
-        return None
-    try:
-        return max(-13, min(-1, int(round(float(value)))))
-    except (TypeError, ValueError):
-        return None
-
-
-def exposure_ms(value):
-    return 1000.0 * 2.0 ** value
-
-
-def capture_backend(settings):
-    """OpenCV capture API from [camera] backend = "auto" | "msmf" | "dshow" | "v4l2" | "any"."""
-    name = str(settings.get("backend", "auto")).strip().lower()
-    if name in BACKENDS:
-        return BACKENDS[name]
-    if platform.system() == "Windows" and manual_exposure(settings) is not None:
-        # Media Foundation resets/ignores exposure on the Arducam B0477; DirectShow applies it.
-        return cv2.CAP_DSHOW
-    # Windows defaults to Media Foundation: with DirectShow the Arducam B0477 streamed
-    # a solid white image regardless of exposure/gain, while MSMF showed a normal picture.
-    return {"Linux": cv2.CAP_V4L2, "Windows": cv2.CAP_MSMF,
-            "Darwin": cv2.CAP_AVFOUNDATION}.get(platform.system(), cv2.CAP_ANY)
-
-
-def _mode_label(mode, backend):
-    if mode is None:
-        return "driver defaults"
-    if backend == cv2.CAP_MSMF:
-        return f"{mode.width} × {mode.height} · {mode.fps:g} fps"
-    return mode.label()
-
-
+# --------------------------------------------------------------------------- worker side
 def _send(channel, kind, value):
     try:
         channel.put((kind, value), timeout=0 if kind == "frame" else 1)
@@ -79,130 +166,282 @@ def _send(channel, kind, value):
         pass
 
 
-def _apply_exposure(cap, backend, value):
-    """Set a manual exposure (DirectShow units). Returns what the camera reports afterwards."""
-    if value is None:
-        return None
+def apply_controls(cap, backend, controls: dict) -> dict:
+    """Apply control values; returns what the camera reports afterwards."""
+    readback = {}
+    for name, value in controls.items():
+        try:
+            if name == "exposure":
+                if backend == cv2.CAP_DSHOW:
+                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)   # DirectShow: 0 = manual, 1 = auto
+                    cap.set(cv2.CAP_PROP_EXPOSURE, value)
+                    readback["exposure"] = cap.get(cv2.CAP_PROP_EXPOSURE)
+                elif backend == cv2.CAP_V4L2:
+                    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # V4L2: 1 = manual
+                    cap.set(cv2.CAP_PROP_EXPOSURE, round(exposure_ms(value) * 10))  # units of 100 µs
+                    readback["exposure"] = cap.get(cv2.CAP_PROP_EXPOSURE) / 10.0
+                else:
+                    cap.set(cv2.CAP_PROP_EXPOSURE, value)
+                    readback["exposure"] = cap.get(cv2.CAP_PROP_EXPOSURE)
+            elif name == "camera_auto_exposure":
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1 if backend == cv2.CAP_DSHOW else 3)
+            elif name == "white_balance_auto":
+                cap.set(cv2.CAP_PROP_AUTO_WB, 1 if value else 0)
+            elif name == "white_balance":
+                cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+                cap.set(cv2.CAP_PROP_WB_TEMPERATURE, value)
+                readback["white_balance"] = cap.get(cv2.CAP_PROP_WB_TEMPERATURE)
+            elif name in CONTROL_PROPS:
+                cap.set(CONTROL_PROPS[name], value)
+                readback[name] = cap.get(CONTROL_PROPS[name])
+        except cv2.error:
+            pass
+    return readback
+
+
+def _read_ranges(device, backend) -> dict:
+    if backend != cv2.CAP_DSHOW or not str(device).isdecimal():
+        return {}
     try:
-        if backend == cv2.CAP_DSHOW:
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)   # DirectShow: 0 = manual, 1 = auto
-            cap.set(cv2.CAP_PROP_EXPOSURE, value)
+        from camera.dshow_controls import read_controls
+        return read_controls(int(device))
+    except Exception as exc:
+        print(f"Could not read camera control ranges: {exc}")
+        return {}
+
+
+def available_modes(device, backend, settings) -> tuple[list[Mode], str]:
+    """(modes to offer, where they came from). Highest resolution first."""
+    modes, source = [], "presets"
+    try:
+        if backend == cv2.CAP_DSHOW and str(device).isdecimal():
+            modes, source = dshow_modes(int(device)), "camera"
         elif backend == cv2.CAP_V4L2:
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)   # V4L2: 1 = manual
-            cap.set(cv2.CAP_PROP_EXPOSURE, round(exposure_ms(value) * 10))  # units of 100 µs
-            return cap.get(cv2.CAP_PROP_EXPOSURE) / 10.0
-        else:
-            cap.set(cv2.CAP_PROP_EXPOSURE, value)
-        return cap.get(cv2.CAP_PROP_EXPOSURE)
-    except cv2.error:
-        return None
+            modes, source = modes_from_v4l2(parse_modes(v4l_info(device, "--list-formats-ext"))), "camera"
+    except Exception as exc:
+        print(f"Could not list camera modes: {exc}")
+        modes = []
+    if not modes:
+        return preset_modes(), "presets"
+    return modes, source
 
 
-def _capture(settings, channel, stop):
+def _modes_to_try(device, backend, settings) -> tuple[list[Mode], list[Mode], str]:
+    offered, source = available_modes(device, backend, settings)
+    wanted = requested_mode(settings)
+    if wanted is not None:
+        return [wanted], offered, source
+    return ordered_candidates(offered), offered, source
+
+
+def _open(device, backend, mode: Mode, controls: dict):
+    cap = cv2.VideoCapture(int(device) if str(device).isdecimal() else device, backend)
+    if not cap.isOpened():
+        return cap, None
+    if backend == cv2.CAP_DSHOW:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUY2"))
+    elif backend == cv2.CAP_V4L2:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*("YUYV" if mode.fourcc in ("YUY2", "YUYV") else mode.fourcc)))
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, mode.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, mode.height)
+    cap.set(cv2.CAP_PROP_FPS, mode.fps)
+    return cap, apply_controls(cap, backend, controls)
+
+
+def _first_frames(cap, stop, reject_green, needed=3, attempts=14, max_misses=3):
+    """Read until `needed` good frames in a row. Gives up quickly when the camera sends nothing
+    (an unsupported mode), so trying several modes stays fast."""
+    good, misses, frame, problem = 0, 0, None, "No frames received"
+    for _ in range(attempts):
+        if stop.is_set():
+            return None, "stopped"
+        ok, frame = cap.read()
+        if not ok:
+            misses += 1
+            problem = "No frames received"
+            if misses >= max_misses and good == 0:
+                break
+            continue
+        problem = frame_problem(frame, reject_green)
+        good = good + 1 if not problem else 0
+        if good >= needed:
+            return frame, ""
+    return None, problem
+
+
+class _Snapshotter:
+    """Encodes full-resolution snapshots on a background thread so the preview keeps running."""
+
+    def __init__(self, channel):
+        self.channel = channel
+
+    def save(self, frame_bgr, path):
+        def work():
+            try:
+                target = Path(path)
+                if not target.suffix:
+                    target = target.with_suffix(".png")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                params = [cv2.IMWRITE_PNG_COMPRESSION, 1] if target.suffix.lower() == ".png" else []
+                ok, data = cv2.imencode(target.suffix, frame_bgr, params)
+                if not ok:
+                    raise OSError(f"cannot save '{target.suffix}' images; use .png, .jpg, .bmp or .tif")
+                target.write_bytes(data.tobytes())  # works with non-ASCII folders on Windows
+                _send(self.channel, "snapshot", {"ok": True, "path": str(target),
+                                                 "size": (frame_bgr.shape[1], frame_bgr.shape[0])})
+            except Exception as exc:
+                _send(self.channel, "snapshot", {"ok": False, "path": str(path), "error": str(exc)})
+        threading.Thread(target=work, daemon=True).start()
+
+
+def _process(frame_bgr, state, index, started):
+    """Build the message for one frame: preview, focus scores, statistics."""
+    preview = downscale(frame_bgr, *state["preview_max"])
+    # Exposure statistics and stripes are measured on this frame alone: averaging several
+    # frames would hide the stripes the automatic exposure is trying to find.
+    stats = image_stats(preview)
+    stats["stripes"] = stripe_strength(preview)
+    preview = state["averager"].add(preview)
+    if state["destripe"]:
+        preview = destripe(preview)
+    crop_rgb = cv2.cvtColor(center_crop(frame_bgr, *FOCUS_CROP), cv2.COLOR_BGR2RGB)
+    return {
+        "image": cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
+        "index": index,
+        "full_size": (frame_bgr.shape[1], frame_bgr.shape[0]),
+        "focus": (compute_focus_score(crop_rgb, False), compute_focus_score(crop_rgb, True)),
+        "stats": stats,
+        "time": time.monotonic() - started,
+    }
+
+
+def _capture(settings, channel, stop, commands=None):
+    commands = commands if commands is not None else queue.Queue()
     backend = capture_backend(settings)
     requested = str(settings.get("device", settings.get("index", "auto")))
-    # Camera names must follow the numbering of the capture API in use.
     api = {cv2.CAP_MSMF: "msmf", cv2.CAP_DSHOW: "dshow"}.get(backend)
     named = api is not None or platform.system() != "Windows"
-    devices = [d.device for d in discover_devices(named=named, api=api or "msmf")] if requested == "auto" else [requested]
+    if requested == "auto":
+        found = discover_devices(named=named, api=api or "dshow")
+        # When an Arducam is connected, use only it: if it is busy, say so instead of quietly
+        # switching to the laptop's own camera (autofocus would then measure the wrong picture).
+        preferred = [d for d in found if "arducam" in d.name.lower()]
+        devices = [d.device for d in (preferred or found)]
+    else:
+        devices = [requested]
     if not devices:
-        _send(channel, "error", "No camera found. Connect a camera, then Refresh devices and Reconnect.")
+        _send(channel, "error", "No camera found. Connect the camera, then click Reconnect camera.")
         return
-    failures_by_mode = []
+    reject_green = setting_flag(settings, "reject-green", True)
+    controls = initial_controls(settings)
+    state = {"destripe": setting_flag(settings, "stripe-filter", True),
+             "averager": FrameAverager(setting_int(settings, "average-frames", 1, 1, 16)),
+             "preview_max": PREVIEW_MAX, "snapshots": []}
+    failures = []
     for device in devices:
-        modes = candidate_modes(device, settings)
-        # Do not silently select an IR auxiliary stream when a color camera is busy.
-        if requested == "auto" and modes and all(m and m.fourcc in ("GREY", "Y16 ", "Y10 ") for m in modes):
-            _send(channel, "status", f"Skipping monochrome auxiliary stream {device}; select it explicitly if needed.")
-            continue
-        tried = set()
-        for mode in modes:
+        to_try, offered, source = _modes_to_try(device, backend, settings)
+        for mode in to_try:
             if stop.is_set():
                 return
-            if backend == cv2.CAP_MSMF and mode is not None:
-                # MSMF picks the camera's pixel format itself, so modes differing only by FOURCC are the same test.
-                if (mode.width, mode.height, mode.fps) in tried:
-                    continue
-                tried.add((mode.width, mode.height, mode.fps))
-            _send(channel, "status", f"Testing {device}: {_mode_label(mode, backend)}")
-            cap = cv2.VideoCapture(int(device) if device.isdecimal() else device, backend)
+            _send(channel, "status", f"Opening camera {device} at {mode.label()}…")
+            cap, readback = _open(device, backend, mode, controls)
             try:
-                if not cap.isOpened():
-                    failures_by_mode.append(f"{device}: could not open device (possibly busy, unavailable, or inaccessible)")
-                    _send(channel, "status", failures_by_mode[-1])
+                if readback is None:
+                    failures.append(f"{device}: could not open the camera (busy, unplugged or in use by another program)")
+                    _send(channel, "status", failures[-1])
                     break
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_CONVERT_RGB, 1)
-                if mode:
-                    # With MSMF, CAP_PROP_FOURCC selects OpenCV's *output* format (not the camera's);
-                    # requesting MJPG/YUYV there returns undecoded frames. Leave it on BGR.
-                    if backend != cv2.CAP_MSMF:
-                        fourcc = "YUY2" if backend == cv2.CAP_DSHOW and mode.fourcc == "YUYV" else mode.fourcc
-                        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, mode.width)
-                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, mode.height)
-                    cap.set(cv2.CAP_PROP_FPS, mode.fps)
-                exposure_readback = _apply_exposure(cap, backend, manual_exposure(settings))
-                good = 0
-                frame = None
-                for _ in range(12):
-                    if stop.is_set():
+                frame, problem = _first_frames(cap, stop, reject_green)
+                if frame is None:
+                    if problem == "stopped":
                         return
-                    ok, frame = cap.read()
-                    problem = frame_problem(frame, settings.get("reject-green", True)) if ok else "No frames received"
-                    good = good + 1 if not problem else 0
-                    if good >= 4:
-                        break
-                if good < 4:
-                    reason = f"{device} · {_mode_label(mode, backend)}: {problem}"
-                    failures_by_mode.append(reason)
-                    _send(channel, "status", f"Rejected {reason}")
+                    failures.append(f"{device} · {mode.label()}: {problem}")
+                    _send(channel, "status", f"Skipped {failures[-1]}")
                     continue
-                fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
-                actual = {"device": device, "width": frame.shape[1], "height": frame.shape[0],
-                          "fps": cap.get(cv2.CAP_PROP_FPS),
-                          "fourcc": ''.join(chr((fourcc >> (8*i)) & 255) for i in range(4)).strip('\x00'),
-                          "exposure": manual_exposure(settings), "exposure_readback": exposure_readback}
-                if settings.get("mode") == "manual" and mode and (
-                    actual["width"] != mode.width or actual["height"] != mode.height or
-                    (backend != cv2.CAP_MSMF and actual["fourcc"] not in (mode.fourcc, "YUY2" if mode.fourcc == "YUYV" else mode.fourcc)) or
-                    abs(actual["fps"] - mode.fps) > 1):
-                    _send(channel, "error", f"Driver did not accept requested mode. Returned: {actual}")
-                    return
-                _send(channel, "ready", actual)
-                failures = 0
-                started, count = time.monotonic(), 0
-                while not stop.is_set():
-                    ok, frame = cap.read()
-                    problem = frame_problem(frame, settings.get("reject-green", True)) if ok else "Camera disconnected or capture failed"
-                    if problem:
-                        failures += 1
-                        if failures >= 8:
-                            _send(channel, "error", problem + ". Reconnect or try a lower-bandwidth mode; check the USB cable and close OBS.")
-                            return
+                height, width = frame.shape[:2]
+                if (width, height) != (mode.width, mode.height):
+                    if requested_mode(settings) is not None:
+                        _send(channel, "error", f"The camera did not accept {mode.width} × {mode.height}; it sent "
+                                                f"{width} × {height}. Choose another resolution.")
+                        return
+                    if source == "presets" and mode is not to_try[-1]:
+                        # The driver substituted another size: this preset isn't supported. Try the next.
+                        failures.append(f"{device} · {mode.label()}: camera sent {width} × {height} instead")
+                        _send(channel, "status", f"Skipped {failures[-1]}")
                         continue
-                    failures = 0
-                    count += 1
-                    _send(channel, "frame", cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                    elapsed = time.monotonic() - started
-                    if elapsed >= 2:
-                        _send(channel, "fps", count / elapsed)
-                        started, count = time.monotonic(), 0
+                ranges = _read_ranges(device, backend)
+                _send(channel, "modes", {"modes": [m.__dict__ for m in offered], "source": source})
+                _send(channel, "ready", {"device": device, "width": width, "height": height,
+                                         "fps": float(cap.get(cv2.CAP_PROP_FPS) or mode.fps),
+                                         "backend": {cv2.CAP_DSHOW: "DirectShow", cv2.CAP_MSMF: "Media Foundation",
+                                                     cv2.CAP_V4L2: "V4L2"}.get(backend, str(backend)),
+                                         "controls": {**controls, **readback}, "requested": controls,
+                                         "readback": readback, "ranges": ranges})
+                _stream(cap, backend, channel, commands, stop, state, reject_green)
                 return
             finally:
                 cap.release()
-    detail = "\n".join(failures_by_mode[-3:]) or "Only auxiliary monochrome streams were found; select the intended device explicitly."
-    _send(channel, "error", "No usable camera mode.\n" + detail + "\nClose OBS/other camera apps before retrying. See Settings for camera diagnostics.")
+    detail = "\n".join(failures[-3:]) or "No usable camera mode."
+    _send(channel, "error", "The camera could not be started.\n" + detail +
+          "\nClose other camera programs (Zoom, Teams, the Camera app, the Arducam viewer), then Reconnect.")
 
 
-def _capture_worker(settings, channel, stop):
+def _stream(cap, backend, channel, commands, stop, state, reject_green):
+    snapshotter = _Snapshotter(channel)
+    started = time.monotonic()
+    index, failures, count, window_start = 0, 0, 0, time.monotonic()
+    fps = 0.0
+    last_good = None
+    while not stop.is_set():
+        try:
+            while True:
+                kind, value = commands.get_nowait()
+                if kind == "set":
+                    _send(channel, "controls", {"requested": value, "readback": apply_controls(cap, backend, value)})
+                elif kind == "process":
+                    if "destripe" in value:
+                        state["destripe"] = bool(value["destripe"])
+                    if "average" in value:
+                        state["averager"].set_count(int(value["average"]))
+                elif kind == "snapshot":
+                    if last_good is not None:
+                        snapshotter.save(last_good, value)   # the picture as it was when asked
+                    else:
+                        state["snapshots"].append(value)
+        except queue.Empty:
+            pass
+        ok, frame = cap.read()
+        problem = frame_problem(frame, reject_green) if ok else "Camera disconnected or capture failed"
+        if problem:
+            failures += 1
+            if failures >= 8:
+                _send(channel, "error", problem + ". Check the USB cable, close other camera programs, then Reconnect.")
+                return
+            continue
+        failures = 0
+        index += 1
+        count += 1
+        last_good = frame   # cap.read() returns a new array every time; nothing modifies it
+        while state["snapshots"]:
+            snapshotter.save(frame, state["snapshots"].pop(0))
+        info = _process(frame, state, index, started)
+        elapsed = time.monotonic() - window_start
+        if elapsed >= 2.0:
+            fps, count, window_start = count / elapsed, 0, time.monotonic()
+        info["fps"] = fps
+        _send(channel, "frame", info)
+
+
+def _capture_worker(settings, channel, stop, commands=None):
     try:
-        _capture(settings, channel, stop)
+        _capture(settings, channel, stop, commands)
     except Exception as exc:
-        _send(channel, "error", f"Capture failed: {exc}. Check the device and reconnect in Settings.")
+        _send(channel, "error", f"Capture failed: {exc}. Check the camera and click Reconnect camera.")
 
 
+# --------------------------------------------------------------------------- GUI side
 class Webcam(CameraModule):
+    """GUI-side handle for the capture process."""
+
     def __init__(self, index="auto", settings=None):
         self.settings = dict(settings or {})
         self.settings.setdefault("device", str(index))
@@ -210,20 +449,45 @@ class Webcam(CameraModule):
         self.state = "disconnected"
         self.diagnostics = deque(maxlen=80)
         self.actual = {}
+        self.modes: list[Mode] = []
+        self.modes_source = ""
+        self.ranges: dict = {}
+        self.controls: dict = {}
         self.measured_fps = 0.0
+        self.latest_info: dict = {}
         self.capture_thread = None
         self.process = None
+        self.commands = None
         self.should_stop = threading.Event()
         self.last_frame_at = 0.0
+        self.snapshot_listener = None
+        self.exposure_problem = ""
         self.__active__ = False
 
+    # ---- control API used by the GUI
+    def set_controls(self, values: dict):
+        self.controls.update(values)
+        self._command("set", dict(values))
+
+    def set_processing(self, **values):
+        self._command("process", values)
+
+    def snapshot(self, path):
+        self._command("snapshot", str(path))
+
+    def _command(self, kind, value):
+        if self.commands is not None:
+            try:
+                self.commands.put_nowait((kind, value))
+            except Exception:
+                pass
+
     def setExposureTime(self, value):
-        # Generic UVC exposure units vary by backend; never send microseconds
-        # as raw OpenCV exposure values. Vendor backends implement this API.
+        # Exposure is managed through set_controls (DirectShow units), not microseconds.
         return False
 
     def open(self):
-        self.status = "Searching for a usable camera…"
+        self.status = "Searching for the camera…"
         self.state = "connecting"
         return True  # The worker performs and reports the actual device open.
 
@@ -232,9 +496,11 @@ class Webcam(CameraModule):
             return False
         self.should_stop.clear()
         context = mp.get_context("spawn")
-        self.channel = context.Queue(maxsize=4)
+        self.channel = context.Queue(maxsize=3)
+        self.commands = context.Queue()
         self.stop = context.Event()
-        self.process = context.Process(target=_capture_worker, args=(self.settings, self.channel, self.stop), daemon=True)
+        self.process = context.Process(target=_capture_worker,
+                                       args=(self.settings, self.channel, self.stop, self.commands), daemon=True)
         self.process.start()
         self.capture_thread = threading.Thread(target=self._monitor, daemon=True)
         self.capture_thread.start()
@@ -242,64 +508,113 @@ class Webcam(CameraModule):
 
     def _monitor(self):
         last_message = time.monotonic()
+        heard = False   # the first message can take longer (process start, driver, camera search)
         while not self.should_stop.is_set():
             try:
                 kind, value = self.channel.get(timeout=.25)
             except queue.Empty:
                 if not self.process.is_alive():
                     if self.__active__ or self.process.exitcode not in (None, 0):
-                        self.status = "Camera stopped. Reconnect in Settings."
+                        self.status = "Camera stopped. Click Reconnect camera."
                     self.__active__ = False
                     self.state = "error"
                     return
-                if time.monotonic() - last_message > 12:
-                    self.status = "Camera timed out. Close other camera apps, check USB, then Reconnect."
+                if time.monotonic() - last_message > (WATCHDOG_SECONDS if heard else STARTUP_SECONDS):
+                    self.status = "Camera stopped responding. Close other camera apps, check USB, then Reconnect."
                     self.__active__ = False
                     self.state = "error"
                     self.diagnostics.append(self.status)
                     self.process.terminate()
                     return
                 continue
+            except (EOFError, OSError, ValueError):
+                return
             last_message = time.monotonic()
-            if kind == "frame":
-                self.last_frame_at = time.monotonic()
-                if self.__streamCaptureCallback__:
-                    self.__streamCaptureCallback__(value, (value.shape[1], value.shape[0]), "RGB888")
-            elif kind == "ready":
-                self.actual = value
-                self.state = "streaming"
-                self.__active__ = True
-                self.status = f"Connected · {value['width']} × {value['height']} · {value['fps']:g} fps · {value['fourcc']} · {value['device']}"
-                wanted, got = value.get("exposure"), value.get("exposure_readback")
-                if wanted is not None:
-                    if got is not None and abs(got - wanted) < 0.6:
-                        self.status += f" · exposure {wanted} ({exposure_ms(wanted):g} ms)"
-                    else:
-                        self.status += (f" · exposure {wanted} NOT applied (camera reports {got}). "
-                                        "Try the DirectShow backend.")
-                        self.diagnostics.append(self.status)
-            elif kind == "fps":
-                self.measured_fps = value
+            heard = True
+            self.handle_message(kind, value)
+
+    def handle_message(self, kind, value):
+        if kind == "frame":
+            self.last_frame_at = time.monotonic()
+            self.measured_fps = value.get("fps", self.measured_fps)
+            self.latest_info = value
+            image = value["image"]
+            if self.__streamCaptureCallback__:
+                self.__streamCaptureCallback__(image, (image.shape[1], image.shape[0]), "RGB888")
+        elif kind == "ready":
+            self.actual = value
+            self.ranges = value.get("ranges", {})
+            self.controls.update(value.get("controls", {}))
+            self.controls.update(value.get("requested", {}))  # what we asked for drives the auto settings
+            self._check_exposure(value.get("requested", {}), value.get("readback", {}))
+            self.state = "streaming"
+            self.__active__ = True
+            self.status = (f"Connected · {value['width']} × {value['height']} · {value['fps']:g} fps · "
+                           f"{value.get('backend', '')} · camera {value['device']}")
+        elif kind == "modes":
+            self.modes = [Mode(**m) for m in value.get("modes", [])]
+            self.modes_source = value.get("source", "")
+        elif kind == "controls":
+            if "requested" in value:
+                self._check_exposure(value["requested"], value.get("readback", {}))
             else:
-                self.status = value
-                self.diagnostics.append(value)
-                if kind == "error":
-                    self.state = "error"
-                    self.__active__ = False
+                self.controls.update(value)
+        elif kind == "snapshot":
+            if self.snapshot_listener:
+                self.snapshot_listener(value)
+        else:
+            self.status = value
+            self.diagnostics.append(value)
+            if kind == "error":
+                self.state = "error"
+                self.__active__ = False
+
+    def _check_exposure(self, requested: dict, readback: dict):
+        """Notice a camera that ignores exposure changes (e.g. the Arducam through Media Foundation)."""
+        if "exposure" not in requested or readback.get("exposure") is None:
+            return
+        try:
+            wanted, got = float(requested["exposure"]), float(readback["exposure"])
+        except (TypeError, ValueError):
+            return
+        if abs(wanted - got) > 0.5:
+            self.exposure_problem = (f"The camera did not accept exposure {wanted:g} (it reports {got:g}), so "
+                                     "automatic exposure cannot remove the stripes. Close other camera apps and "
+                                     "reconnect the camera.")
+        else:
+            self.exposure_problem = ""
 
     def close(self):
         self.should_stop.set()
         if self.process is not None:
             self.stop.set()
-            self.process.join(.5)
+            self.process.join(.8)
             if self.process.is_alive():
                 self.process.terminate()
                 self.process.join(1)
             if self.capture_thread:
                 self.capture_thread.join(1)
-            self.channel.close()
+            for q in (self.channel, self.commands):
+                try:
+                    q.close()
+                except Exception:
+                    pass
             self.process = None
         self.capture_thread = None
+        self.commands = None
         self.state = "disconnected"
         self.__active__ = False
         return True
+
+    def isOpen(self):
+        return self.__active__
+
+
+def describe_mode(info: dict) -> str:
+    if not info:
+        return ""
+    return f"{info.get('width')} × {info.get('height')} · {info.get('fps', 0):g} fps"
+
+
+def best_offered(modes: list[Mode]) -> Mode | None:
+    return best_mode(modes)

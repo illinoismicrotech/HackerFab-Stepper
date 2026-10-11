@@ -87,6 +87,7 @@ def _smoke_test() -> int:
     from camera.webcam import Webcam
     from stage_control.stage_controller import StageController
 
+    gui.enable_dpi_awareness()
     root = ttk.Window(themename="darkly")
     gui.configure_ui_scale(root)
     gui.configure_theme(root)
@@ -97,8 +98,17 @@ def _smoke_test() -> int:
     lithographer_config = gui.LithographerConfig(
         StageController(), None, 0.25, 4167, 25000,
         gui.AlignmentConfig(False, "", 1820, 280, 269, 1075, -1100, 800))
-    gui.LithographerGui(lithographer_config, root, config, str(Path.cwd() / "smoke-test-config.toml"))
+    app = gui.LithographerGui(lithographer_config, root, config, str(Path.cwd() / "smoke-test-config.toml"))
     root.update()
+    for page in ("chip", "alignment", "settings", "operate"):
+        app.show_page(page)
+        root.update()
+    try:  # the USB library for LED control must load from inside the exe
+        import usb.core  # noqa: F401
+        import libusb_package
+        print(f"libusb backend: {'found' if libusb_package.get_libusb1_backend() else 'MISSING'}")
+    except Exception as exc:
+        errors.append(f"USB support missing from the build: {exc}")
 
     # The camera runs in a separate process; in a frozen exe that only works when
     # multiprocessing.freeze_support() is wired up correctly. Ask for a camera index
@@ -118,7 +128,8 @@ def _smoke_test() -> int:
         print("UI callback errors:\n" + "\n".join(errors))
     # The worker must answer from its own process ("No usable camera mode" / "No camera found");
     # a timeout or a crashed worker means multiprocessing is broken in this build.
-    reported = any(text in worker_status for text in ("No usable camera mode", "No camera found"))
+    reported = any(text in worker_status for text in ("could not be started", "No usable camera mode",
+                                                      "No camera found"))
     ok = not errors and worker_state == "error" and reported
     print("SMOKE TEST " + ("PASSED" if ok else "FAILED"))
     return 0 if ok else 1
