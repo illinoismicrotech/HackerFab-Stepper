@@ -32,6 +32,20 @@ To validate installation without opening the GUI, open PowerShell in this direct
 .\run.ps1 -SetupOnly
 ```
 
+### Windows standalone exe (no Python needed)
+
+`HackerfabStepper.exe` runs the same GUI without installing Python.
+
+- Put it in its own folder, e.g. `C:\HackerfabStepper\`. On first run it creates `default.toml`, `src\uvFocusImage\plus.png`, and `HackerfabStepper.log` next to itself; edit `default.toml` there. If that folder is read-only, it uses `%LOCALAPPDATA%\HackerfabStepper` instead.
+- Windows SmartScreen may warn because the exe is unsigned: click **More info → Run anyway**.
+- Alignment marker detection (YOLO) is not included in the exe, because PyTorch would make it over 1 GB. Use `run.bat` when you need it.
+- A borderless projector window opens on the projector's display at launch (Windows must be set to Extend with Win+P). `[projector] window = "off"` disables it.
+- To remove the coloured bands the DLP causes in the Arducam image, set `[camera] exposure` to `-5` or `-4` (Settings → Camera → Exposure) and dim the red image with the **Red brightness** slider.
+- Every push to `main` or `UI+Packaging` builds the exe on GitHub Actions (**Actions → Build Windows exe → Artifacts**).
+- To build it locally on Windows, run `.\packaging\build_exe.ps1` from this folder. The result is `dist\HackerfabStepper.exe`.
+
+The Windows camera backend defaults to Media Foundation (`backend = "auto"` in `[camera]`). With DirectShow, the Arducam B0477 streams a solid white image.
+
 ### Linux / macOS
 
 ```bash

@@ -28,3 +28,8 @@ focusblue.png
 # Operating-system metadata
 .DS_Store
 Thumbs.db
+
+# Windows exe build output
+stepper/build/
+stepper/dist/
+.venv-build/

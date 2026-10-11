@@ -25,7 +25,11 @@ class FullscreenPreview:
     def open(self, kind, provider):
         if self.kind is None:
             self.previous_fullscreen = bool(self.root.attributes('-fullscreen'))
-            self.previous_focus = self.root.focus_get()
+            try:
+                self.previous_focus = self.root.focus_get()
+            except KeyError:
+                # Tkinter bug: focus inside a combobox dropdown ('popdown') has no Python widget.
+                self.previous_focus = None
         self.kind, self.provider = kind, provider
         self.frame.place(x=0, y=0, relwidth=1, relheight=1)
         self.frame.lift()

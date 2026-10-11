@@ -1,0 +1,10 @@
+# Dependencies bundled into HackerfabStepper.exe (Windows).
+# ultralytics/PyTorch are intentionally left out: alignment detection is disabled in the exe.
+opencv-python>=4.10,<5
+numpy>=2.0,<2.2
+pillow>=11.1,<12
+pyserial>=3.5,<4
+toml>=0.10,<0.11
+ttkbootstrap>=1.10,<2
+pygrabber>=0.2,<1   # DirectShow camera names (exposure control uses DirectShow)
+pyinstaller>=6.10,<7

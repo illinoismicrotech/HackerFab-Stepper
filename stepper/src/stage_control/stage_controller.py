@@ -18,6 +18,13 @@ class StageController:
     def has_homing(self):
         return False
 
+    def is_idle(self):
+        """True when the stage is not moving. The simulated stage is always idle."""
+        return True
+
+    def state_name(self):
+        return "Idle"
+
     def home(self):
         raise UnsupportedCommand()
 

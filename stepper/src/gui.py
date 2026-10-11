@@ -7,7 +7,9 @@ import queue
 import time
 import toml
 
+import re
 import tkinter
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
@@ -24,7 +26,12 @@ import numpy as np
 import serial
 import math
 from PIL import Image, ImageOps, ImageTk
-from ultralytics import YOLO
+try:
+    # Optional: alignment marker detection needs ultralytics + PyTorch (~1-2 GB).
+    # The standalone Windows exe ships without it; everything else still works.
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 from camera.camera_module import CameraModule
 from camera.webcam import Webcam
 from settings import SettingsPage
@@ -34,6 +41,7 @@ from lib.gui import IntEntry, Thumbnail, FloatEntry
 from lib.img import image_to_tk_image
 from projector import TkProjector
 from fullscreen_preview import FullscreenPreview
+from projector_window import ProjectorWindow, choose_projector_display, list_displays
 from stage_control.grbl_stage import GrblStage
 from stage_control.stage_controller import StageController
 
@@ -234,6 +242,135 @@ class Chip:
         return cls([ChipLayer.from_disk(layer) for layer in d["layers"]])
 
 
+_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def write_rgb_image(path, image_rgb) -> Path:
+    """Save an RGB array. Works with non-ASCII folders on Windows, where cv2.imwrite fails silently."""
+    path = Path(path)
+    if not path.suffix:
+        path = path.with_suffix(".png")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok, data = cv2.imencode(path.suffix, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
+    if not ok:
+        raise OSError(f"cannot save '{path.suffix}' images; use .png, .jpg, .bmp or .tif")
+    path.write_bytes(data.tobytes())
+    return path
+
+
+def load_pattern_image(path) -> Image.Image:
+    """Open a pattern as 8-bit RGB where bright means light.
+
+    Transparent pixels become black (no light): many editors store transparent pixels as
+    white, which a plain RGB conversion would turn into full exposure. 16-bit images are
+    scaled down instead of clipped to white.
+    """
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source)
+        image.load()
+    if image.mode.startswith("I;16") or image.mode in ("I", "F"):
+        values = np.asarray(image, dtype=np.float64)
+        peak = 65535.0 if image.mode.startswith("I;16") or values.max() > 255 else 255.0
+        image = Image.fromarray(np.clip(values * (255.0 / peak), 0, 255).astype(np.uint8), "L")
+    if image.mode == "P":
+        image = image.convert("RGBA")
+    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        image = Image.alpha_composite(Image.new("RGBA", rgba.size, (0, 0, 0, 255)), rgba)
+    return image.convert("RGB")
+
+
+GUIDE_NAME = "HOW-TO-GUIDE.html"
+GUIDE_URL = "https://github.com/illinoismicrotech/Hackerfab-Stepper"
+
+
+def find_guide() -> Optional[Path]:
+    for candidate in (Path(GUIDE_NAME), Path("docs") / GUIDE_NAME):
+        if candidate.exists():
+            return candidate.resolve()
+    return None
+
+
+def open_guide():
+    guide = find_guide()
+    if guide is not None:
+        webbrowser.open(guide.as_uri())
+    else:
+        messagebox.showinfo("Guide not found", f"{GUIDE_NAME} was not found next to the app.\n\n"
+                            f"Put it in the same folder as the app, or see {GUIDE_URL}")
+
+
+try:
+    from ttkbootstrap.widgets import ToolTip as _ToolTip
+except ImportError:  # older ttkbootstrap
+    from ttkbootstrap.tooltip import ToolTip as _ToolTip
+
+
+def add_tooltip(widget, text):
+    """Hover help. Never let a tooltip problem break the window."""
+    try:
+        _ToolTip(widget, text=text, wraplength=320, delay=400)
+    except Exception as exc:
+        print(f"Tooltip unavailable: {exc}")
+
+
+def confirm_stage_move(what: str, coords: dict) -> bool:
+    where = ", ".join(f"{axis.upper()} {value:,.0f}" for axis, value in coords.items())
+    return messagebox.askokcancel("Move the stage", f"Move to {what} ({where} µm)?\n\n"
+                                  "This moves several axes at once. Keep hands and tools clear of the stage.")
+
+
+class ConfigReader:
+    """Reads values from a loaded config, collecting friendly messages instead of crashing on typos."""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.problems: list[str] = []
+
+    def number(self, section, key, default, positive=False):
+        value = self.config.get(section, {}).get(key, default)
+        try:
+            result = float(value)
+            if positive and result <= 0:
+                raise ValueError
+            return result
+        except (TypeError, ValueError):
+            self.problems.append(f"[{section}] {key} = {value!r} is not a valid number; using {default}.")
+            return float(default)
+
+    def flag(self, section, key, default):
+        value = self.config.get(section, {}).get(key, default)
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "yes", "on", "1"):
+            return True
+        if text in ("false", "no", "off", "0"):
+            return False
+        self.problems.append(f"[{section}] {key} = {value!r} should be true or false; using {str(default).lower()}.")
+        return default
+
+
+class StageError(RuntimeError):
+    """A stage move failed; the user has already been told why."""
+
+
+def describe_stage_error(exc: Exception, state: str = "") -> str:
+    """Plain-language explanation of a stage failure, with what to do next."""
+    text = str(exc)
+    if "error:9" in text or state.startswith("Alarm"):
+        return ("The stage controller is locked in ALARM mode, so it refuses to move. This happens after a "
+                "limit switch is hit, or at power-up when homing is enabled.\n\n"
+                "Fix: turn on homing (homing = true in the config) and restart, or unlock the controller "
+                "with $X from a G-code terminal. Then restart this app.")
+    if "error:15" in text:
+        return "That move goes past the stage's travel limits. Choose a position inside the stage's range."
+    if isinstance(exc, (TimeoutError, OSError)) or "timeout" in text.lower():
+        return ("Lost contact with the stage controller. Check its USB cable and power, "
+                "close any other program using the port, then restart this app.")
+    return f"The stage controller reported: {text}"
+
+
 class EventDispatcher:
     hardware: Lithographer
     root: Tk
@@ -256,7 +393,6 @@ class EventDispatcher:
     patterning_busy: bool
     autofocus_on_mode_switch: bool
     realtime_detection: bool
-    first_autofocus: bool
     should_abort: bool
     exposure_time: int
     patterning_progress: float # ranges from 0.0 to 1.0
@@ -302,7 +438,10 @@ class EventDispatcher:
         self.image_adjust_position = (0.0, 0.0, 0.0)
         self.border_size = 0.0
         self.posterize_strength = None
-        self.red_focus_source = RedFocusSource.IMAGE
+        self.red_focus_source = RedFocusSource.SOLID  # visible from launch; IMAGE starts empty
+        self.red_brightness = 1.0  # 0.02-1.0: dims the red focus image so long camera exposures don't wash out
+        self._last_stage_error_at = 0.0
+        self.stage_idle_timeout = 20.0  # seconds to wait for the stage to stop before exposing
 
         # Stage control
         self.stage_setpoint = (0.0, 0.0, 0.0)
@@ -313,7 +452,6 @@ class EventDispatcher:
         self.patterning_busy = False
         self.autofocus_on_mode_switch = False
         self.realtime_detection = False
-        self.first_autofocus = True
         self.should_abort = False
 
         # Exposure settings and progress
@@ -366,7 +504,11 @@ class EventDispatcher:
             case ShownImage.CLEAR:
                 return None
             case ShownImage.RED_FOCUS:
-                return self.red_focus.processed()
+                image = self.red_focus.processed()
+                if self.red_brightness < 0.999:
+                    scale = self.red_brightness
+                    image = image.point(lambda v: int(v * scale + 0.5))
+                return image
             case ShownImage.UV_FOCUS:
                 return self.uv_focus.processed()
             case ShownImage.PATTERN:
@@ -399,6 +541,11 @@ class EventDispatcher:
         # Image adjust, resizing, and flatfield correction are performed *AFTER SLICING*
 
         self.on_event(Event.PATTERN_IMAGE_CHANGED)
+
+    def set_red_brightness(self, fraction: float):
+        self.red_brightness = max(0.02, min(1.0, float(fraction)))
+        if self.shown_image == ShownImage.RED_FOCUS:
+            self.on_event(Event.SHOWN_IMAGE_CHANGED)
 
     def set_red_focus_source(self, source: RedFocusSource):
         self.red_focus_source = source
@@ -469,8 +616,24 @@ class EventDispatcher:
         self.shown_image = shown_image
         self.on_event(Event.SHOWN_IMAGE_CHANGED)
 
+    def _stage_move_to(self, coords: dict[str, float]):
+        try:
+            self.hardware.stage.move_to(coords)
+        except Exception as exc:
+            state = ""
+            try:
+                state = self.hardware.stage.state_name()
+            except Exception:
+                pass
+            print(f"Stage move failed: {exc}")
+            # One dialog per burst: autofocus and tiling issue many moves in a row.
+            if time.monotonic() - self._last_stage_error_at > 3.0:
+                messagebox.showerror("Stage did not move", describe_stage_error(exc, state))
+            self._last_stage_error_at = time.monotonic()
+            raise StageError(str(exc)) from exc
+
     def move_absolute(self, coords: dict[str, float]):
-        self.hardware.stage.move_to(coords)
+        self._stage_move_to(coords)
         x = coords.get("x", self.stage_setpoint[0])
         y = coords.get("y", self.stage_setpoint[1])
         z = coords.get("z", self.stage_setpoint[2])
@@ -478,12 +641,23 @@ class EventDispatcher:
         self.on_event(Event.STAGE_POSITION_CHANGED)
 
     def move_relative(self, coords: dict[str, float]):
-        x = coords.get("x", 0) + self.stage_setpoint[0]
-        y = coords.get("y", 0) + self.stage_setpoint[1]
-        z = coords.get("z", 0) + self.stage_setpoint[2]
-        self.stage_setpoint = (x, y, z)
-        self.hardware.stage.move_to({k: self.stage_setpoint[i] for k, i in (("x", 0), ("y", 1), ("z", 2))})
+        target = (
+            coords.get("x", 0) + self.stage_setpoint[0],
+            coords.get("y", 0) + self.stage_setpoint[1],
+            coords.get("z", 0) + self.stage_setpoint[2],
+        )
+        self._stage_move_to({"x": target[0], "y": target[1], "z": target[2]})
+        self.stage_setpoint = target
         self.on_event(Event.STAGE_POSITION_CHANGED)
+
+    def wait_for_stage_idle(self, timeout: float = 20.0) -> bool:
+        """Wait (keeping the window responsive) until the stage reports it has stopped."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.hardware.stage.is_idle():
+                return True
+            self.non_blocking_delay(0.1)
+        return False
 
     def set_use_solid_red(self, use: bool):
         self.use_solid_red = use
@@ -528,13 +702,22 @@ class EventDispatcher:
         return self.shown_image in (ShownImage.PATTERN, ShownImage.UV_FOCUS)
 
     def home_stage(self):
-        self.hardware.stage.home()
-        self.non_blocking_delay(1.0)
-        while True:
+        try:
+            self.hardware.stage.home()
             self.non_blocking_delay(1.0)
-            idle, pos = self.hardware.stage._query_state()
-            if idle:
-                break
+            deadline = time.monotonic() + 120.0
+            while True:
+                self.non_blocking_delay(1.0)
+                idle, pos = self.hardware.stage._query_state()
+                if idle:
+                    break
+                if time.monotonic() > deadline:
+                    raise TimeoutError("homing did not finish within 2 minutes")
+        except Exception as exc:
+            print(f"Homing failed: {exc}")
+            messagebox.showerror("Homing failed", "The stage could not complete homing, so positions are not "
+                                 "referenced to the limit switches.\n\n" + describe_stage_error(exc))
+            return
 
         self.stage_setpoint = (pos[0] * 1000.0, pos[1] * 1000.0, pos[2] * 1000.0)
         print(f"Homed stage to {self.stage_setpoint}")
@@ -594,35 +777,57 @@ class EventDispatcher:
         # Note that flatfield correction and image adjustment should be applied *after* slicing
         img = self.pattern.processed()
 
+        # Motion commands return as soon as they are queued, so the stage can still be
+        # travelling here (e.g. right after "Move to position"). Exposing then smears the pattern.
+        try:
+            stage_ready = self.wait_for_stage_idle(self.stage_idle_timeout)
+        except Exception as exc:
+            messagebox.showerror("Exposure not started", describe_stage_error(exc))
+            return
+        if not stage_ready:
+            state = self.hardware.stage.state_name()
+            if state.startswith("Alarm"):
+                detail = describe_stage_error(RuntimeError(state), state)
+            else:
+                detail = (f"The controller still reports '{state}' after {self.stage_idle_timeout:g} seconds. Wait for the stage to "
+                          "settle and try again. If it stays like this, check the controller.")
+            messagebox.showerror("Exposure not started", "The stage has not stopped moving, so the exposure "
+                                 "was not started.\n\n" + detail)
+            return
+
         self.set_patterning_busy(True)
-        self.hardware.projector.show(img)
-        end_time = time.time() + duration / 1000.0
-        while time.time() < end_time:
-            progress = 1.0 - ((end_time - time.time()) * 1000 / duration)
-            self.set_progress(0.0, progress)
-            self.root.update()
+        try:
+            try:
+                self.hardware.projector.show(img)
+                end_time = time.time() + duration / 1000.0
+                while time.time() < end_time:
+                    progress = 1.0 - ((end_time - time.time()) * 1000 / duration)
+                    self.set_progress(0.0, progress)
+                    self.root.update()
+                    if self.should_abort:
+                        break
+            finally:
+                # Never leave the exposure light on if anything above fails.
+                self.set_shown_image(ShownImage.CLEAR)
+                self.root.update()  # Force image to stop being displayed ASAP
+            self.set_progress(1.0, 1.0)
+
+            log = ExposureLog(
+                datetime.now(),
+                self.pattern_image_path,
+                self.stage_setpoint,
+                duration,
+                self.should_abort,
+            )
+            self.exposure_history.append(log)
+            self.chip.layers[-1].exposures.append(log)
+            self.on_event(Event.CHIP_CHANGED)
+        finally:
+            # Whatever happens above, never leave the stage and exposure controls locked.
+            self.set_patterning_busy(False)
             if self.should_abort:
-                break
-        self.set_shown_image(ShownImage.CLEAR)
-        self.root.update()  # Force image to stop being displayed ASAP
-        self.set_progress(1.0, 1.0)
-
-        log = ExposureLog(
-            datetime.now(),
-            self.pattern_image_path,
-            self.stage_setpoint,
-            duration,
-            self.should_abort,
-        )
-        self.exposure_history.append(log)
-        self.chip.layers[-1].exposures.append(log)
-
-        self.on_event(Event.CHIP_CHANGED)
-        self.set_patterning_busy(False)
-
-        if self.should_abort:
-            print("Patterning aborted")
-            self.should_abort = False
+                print("Patterning aborted")
+                self.should_abort = False
 
     def non_blocking_delay(self, t: float):
         start = time.time()
@@ -664,28 +869,31 @@ class EventDispatcher:
 
         self.on_event(Event.MOVEMENT_LOCK_CHANGED)
 
-    def autofocus(self, blue_only, log=False):
+    def autofocus(self, blue_only, log=False, interactive=False):
+        """Find the sharpest Z near the current position and move there.
+
+        Samples the focus score at the start and 20 µm either side to pick a direction,
+        climbs in 10 µm steps until the score drops, scans ±8 µm around the best point in
+        2 µm steps, and finally moves to the best Z it measured. interactive=True (the
+        Autofocus button) explains failures in a dialog; automatic runs only log them.
+        """
+        def tell(message):
+            print(f"Autofocus: {message}")
+            if interactive:
+                messagebox.showinfo("Autofocus", message)
+
         if not self.camera or self.camera_image is None:
-            print("No live camera connected, skipping autofocus")
+            tell("Autofocus needs a live camera image. Connect the camera first.")
             return
-
-        if self.first_autofocus:
-            # TODO: Fix this spuriously triggering
-            self.first_autofocus = False
-            return
-
         if self.autofocus_busy:
             print("Skipping nested autofocus!")
             return
-
         if log:
-            try:
-                os.mkdir('aftest')
-            except FileExistsError:
-                pass
+            os.makedirs('aftest', exist_ok=True)
             log_file = open('aftest/log.csv', 'w')
-
         counter = 0
+        samples: dict[float, float] = {}
+
         def sample_focus():
             def do_thing():
                 self.non_blocking_delay(0.1)
@@ -695,99 +903,74 @@ class EventDispatcher:
             focus_score = sorted([do_thing() for _ in range(3)])[1]
             nonlocal counter
             if log:
-                log_file.write(f'{counter},{focus_score}\n')
+                log_file.write(f'{counter},{self.stage_setpoint[2]},{focus_score}\n')
                 cv2.imwrite(f'aftest/img{counter}.png', self.camera_image)
             counter += 1
+            samples[round(self.stage_setpoint[2], 3)] = focus_score
             return focus_score
 
+        def step(dz, settle=0.5):
+            self.move_relative({"z": dz})
+            self.non_blocking_delay(settle)
+            return sample_focus()
 
         print("Starting autofocus")
-
         self.set_autofocus_busy(True)
+        start_z = self.stage_setpoint[2]
         try:
             self.non_blocking_delay(1.0)
             mid_score = sample_focus()
+            neg_score = step(-20.0, 1.0)
+            pos_score = step(40.0, 1.0)
             self.move_relative({"z": -20.0})
             self.non_blocking_delay(1.0)
-            neg_score = sample_focus()
-            self.move_relative({"z": 40.0})
-            self.non_blocking_delay(1.0)
-            pos_score = sample_focus()
-            self.move_relative({"z": -20.0})
-            self.non_blocking_delay(1.0)
-
-            last_focus = mid_score
 
             if neg_score < mid_score < pos_score:
-                # Improved focus is in the +Z direction
-                for i in range(30):
-                    self.move_relative({"z": 10.0})
-                    self.non_blocking_delay(0.5)
-                    new_score = sample_focus()
-                    if last_focus > new_score:
-                        print(f"Successful +Z coarse autofocus {i}")
-                        last_focus = new_score
-                        break
-                    last_focus = new_score
-
-                for i in range(10):
-                    self.move_relative({"z": -2.0})
-                    self.non_blocking_delay(0.5)
-                    new_score = sample_focus()
-                    if last_focus > new_score:
-                        print(f"Successful -Z fine autofocus {i}")
-                        break
-                    last_focus = new_score
+                direction = 1.0    # sharper towards +Z
             elif neg_score > mid_score > pos_score:
-                # Improved focus is in the -Z direction
-                for i in range(30):
-                    self.move_relative({"z": -10.0})
-                    self.non_blocking_delay(0.5)
-                    new_score = sample_focus()
-                    if last_focus > new_score:
-                        print(f"Successful -Z coarse autofocus {i}")
-                        break
-                    last_focus = new_score
-
-                for i in range(10):
-                    self.move_relative({"z": 2.0})
-                    self.non_blocking_delay(0.5)
-                    new_score = sample_focus()
-                    if last_focus > new_score:
-                        print(f"Successful +Z fine autofocus {i}")
-                        break
-                    last_focus = new_score
+                direction = -1.0   # sharper towards -Z
             elif neg_score < mid_score and pos_score < mid_score:
-                # We are very close to already being in focus
-                print(f"Almost in focus! (neg {neg_score} mid {mid_score} pos {pos_score})")
-                self.move_relative({"z": -20.0})
-                self.non_blocking_delay(0.5)
-
-                for i in range(30):
-                    self.move_relative({"z": 2.0})
-                    self.non_blocking_delay(0.5)
-                    new_score = sample_focus()
-                    if last_focus > new_score:
-                        print(f"Successful +Z fine autofocus {i}")
-                        break
-                    last_focus = new_score
+                direction = 0.0    # already close to focus
             else:
-                print("Autofocus is confused!")
+                tell("Autofocus could not tell which way is sharper. Focus roughly by hand first, and "
+                     "project Solid Red or a pattern with sharp edges so the camera has detail to measure.")
+                return
 
+            if direction:
+                last = mid_score
+                for _ in range(30):  # coarse climb until the score drops
+                    score = step(10.0 * direction)
+                    if score < last:
+                        break
+                    last = score
 
+            # Fine scan ±8 µm around the best point so far, then go to the best measurement.
+            best_z = max(samples, key=samples.get)
+            self.move_relative({"z": best_z - 8.0 - self.stage_setpoint[2]})
+            self.non_blocking_delay(0.5)
+            sample_focus()
+            for _ in range(8):
+                step(2.0)
+            best_z = max(samples, key=samples.get)
+            self.move_relative({"z": best_z - self.stage_setpoint[2]})
+            self.non_blocking_delay(0.5)
+            print(f"Autofocus finished: Z {start_z:.1f} -> {best_z:.1f} µm (score {samples[best_z]:.3f})")
+        except StageError:
+            pass  # the stage error dialog has already explained what happened
         except RuntimeError as exc:
-            print(f"Autofocus stopped: {exc}")
+            tell(f"Autofocus stopped: {exc}")
         finally:
             self.set_autofocus_busy(False)
             if log:
                 log_file.close()
 
-        print("Finished autofocus")
-
     def initialize_alignment(self, config: LithographerConfig):
         self.config = config
         self.realtime_detection = config.alignment.enabled
         # Attempt loading the model even if detection is off by default
+        if YOLO is None:
+            print("Alignment detection unavailable: the 'ultralytics' package is not installed in this build.")
+            return
         try:
             print("loading model")
             model_path = config.alignment.model_path
@@ -807,6 +990,7 @@ class SnapshotFrame:
     """
 
     def __init__(self, parent, enable, event_dispatcher: EventDispatcher):
+        self.event_dispatcher = event_dispatcher
         self.frame = ttk.Frame(parent)
         self.frame.grid(row=1, column=0)
 
@@ -824,6 +1008,8 @@ class SnapshotFrame:
 
         self.name_preview = ttk.Label(self.frame, wraplength=480, bootstyle="secondary")
         self.name_preview.grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.last_saved = ttk.Label(self.frame, text="", wraplength=480, bootstyle="success")
+        self.last_saved.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 0))
 
         def on_snapshot_button():
             event_dispatcher.on_event(Event.SNAPSHOT, self._next_filename())
@@ -839,13 +1025,18 @@ class SnapshotFrame:
         counter_str = str(self.counter)
         time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
-        name = self.name_var.get()
+        name = self.name_var.get().strip() or "snapshot_%T.png"
         name = name.replace("%C", counter_str).replace("%c", counter_str)
         name = name.replace("%T", time_str).replace("%t", time_str)
-        return name
+        path = Path(name)
+        safe = _INVALID_FILENAME_CHARS.sub("-", path.name) or f"snapshot_{time_str}.png"
+        path = path.with_name(safe)
+        if not path.is_absolute():
+            path = self.event_dispatcher.snapshot_directory / path
+        return str(path)
 
     def _refresh_name_preview(self):
-        self.name_preview.configure(text=f"Output File: {self._next_filename()}")
+        self.name_preview.configure(text=f"Next file: {self._next_filename()}")
 
 
 class CameraFrame:
@@ -857,9 +1048,12 @@ class CameraFrame:
         self.status = ttk.Label(self.frame, text="Not connected", wraplength=620, bootstyle="secondary")
         self.status.grid(row=1, column=0, sticky="w", pady=(12, 4))
         self.focus_score_label = ttk.Label(self.frame, text="Focus · —", bootstyle="secondary")
-        self.focus_score_label.grid(row=2, column=0, sticky="w")
+        self.focus_score_label.grid(row=3, column=0, sticky="w")
+        self.reconnect_button = ttk.Button(self.frame, text="Reconnect camera", bootstyle="warning", command=self.reconnect)
+        add_tooltip(self.reconnect_button, "Try the camera again with the same settings. Close other camera apps "
+                    "(Zoom, Teams, OBS, the Windows Camera app) first.")
         self.snapshot = SnapshotFrame(self.frame, True, event_dispatcher)
-        self.snapshot.frame.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        self.snapshot.frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         self.event_dispatcher = event_dispatcher
         self.snapshots_pending = queue.Queue()
         event_dispatcher.add_event_listener(Event.SNAPSHOT, lambda filename: self.snapshots_pending.put(filename))
@@ -880,7 +1074,7 @@ class CameraFrame:
             self.focus_score_label.configure(text="Focus · unavailable")
         if getattr(self.camera, "state", "") != "error" and self.last_received and time.monotonic() - self.last_received > 2:
             self.event_dispatcher.camera_image = None
-            self.label.configure(image="", text="Camera feed interrupted · reconnect in Settings")
+            self.label.configure(image="", text="Camera feed interrupted · click Reconnect camera")
             self.focus_score_label.configure(text="Focus · unavailable")
         if packet is not None:
             image, dimensions, format = packet
@@ -890,17 +1084,25 @@ class CameraFrame:
             self.focus_score_label.configure(text=f"Focus · Red {red_score:.2f}   UV {blue_score:.2f}")
             try:
                 filename = self.snapshots_pending.get_nowait()
-                if not cv2.imwrite(filename, cv2.cvtColor(image, cv2.COLOR_RGB2BGR)):
-                    self.status.configure(text=f"Could not save snapshot: {filename}")
+                saved = write_rgb_image(filename, image)
+                self.snapshot.last_saved.configure(text=f"Saved {saved}")
+                print(f"Saved snapshot {saved}")
             except queue.Empty:
                 pass
             except (OSError, cv2.error) as exc:
-                self.status.configure(text=f"Snapshot failed: {exc}")
+                self.snapshot.last_saved.configure(text=f"Snapshot failed: {exc}")
+                print(f"Snapshot failed: {exc}")
             self.gui_camera_preview(image, dimensions)
         elif self.event_dispatcher.camera_image is None:
             while not self.snapshots_pending.empty():
                 self.snapshots_pending.get_nowait()
         self.snapshot.button.configure(state="normal" if self.event_dispatcher.camera_image is not None else "disabled")
+        needs_reconnect = isinstance(self.camera, Webcam) and (
+            getattr(self.camera, "state", "") == "error" or self.event_dispatcher.camera_image is None and self.last_received)
+        if needs_reconnect and not self.reconnect_button.winfo_ismapped():
+            self.reconnect_button.grid(row=2, column=0, sticky="w", pady=(4, 8))
+        elif not needs_reconnect and self.reconnect_button.winfo_ismapped():
+            self.reconnect_button.grid_remove()
         self.poll_id = self.frame.after(66, self._on_new_frame)
 
     def start(self):
@@ -917,6 +1119,14 @@ class CameraFrame:
                 self.status.configure(text=f"Camera failed: {exc}")
         if self.poll_id is None:
             self._on_new_frame()
+
+    def reconnect(self):
+        dispatcher = self.event_dispatcher
+        if dispatcher.patterning_busy or dispatcher.autofocus_busy:
+            messagebox.showinfo("Camera busy", "Wait for the exposure or autofocus to finish first.")
+            return
+        if isinstance(self.camera, Webcam):
+            self.replace(Webcam(settings=self.camera.settings))
 
     def replace(self, camera):
         self.generation += 1
@@ -1015,7 +1225,10 @@ class StagePositionFrame:
         shortcuts.grid(row=7, column=0, sticky="ew", pady=(20, 0))
         self.shortcuts = []
         for label, coords in [('Chip origin', {'x': -14500., 'y': -13500., 'z': -13844.}), ('Load / unload', {'x': -14500., 'y': -14500., 'z': -14500.})]:
-            button = ttk.Button(shortcuts, text=label, bootstyle="secondary-link", command=lambda c=coords: event_dispatcher.move_absolute(c))
+            def go(label=label, c=coords):
+                if confirm_stage_move(label, c):
+                    event_dispatcher.move_absolute(c)
+            button = ttk.Button(shortcuts, text=label, bootstyle="secondary-link", command=go)
             button.pack(side="left", padx=3)
             self.shortcuts.append(button)
         def on_lock_change():
@@ -1375,30 +1588,42 @@ class ChipFrame:
         ttk.Label(self.chip_select_frame, text="Current Chip: ").grid(row=0, column=0)
         ttk.Label(self.chip_select_frame, textvariable=self.path).grid(row=0, column=1)
 
+        chip_types = [("Chip records", "*.json"), ("All files", "*.*")]
+
         def on_open():
-            path = filedialog.askopenfilename(title="Open Chip")
+            path = filedialog.askopenfilename(title="Open Chip", filetypes=chip_types)
+            if not path:
+                return
+            try:
+                self.model.load_chip(path)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                messagebox.showerror("Could not open chip", f"{path}\n\n{exc}")
+                return
             self.path.set(path)
-            self.model.load_chip(path)
 
         def on_new():
-            path = filedialog.asksaveasfilename(title="Create Chip As")
+            if not self.offer_to_save("Start a new chip record"):
+                return
+            path = filedialog.asksaveasfilename(title="Create Chip As", defaultextension=".json", filetypes=chip_types)
+            if not path:
+                return
             self.path.set(path)
             self.model.new_chip()
+            self.model.save_chip(path)
 
         def on_save():
-            path = filedialog.asksaveasfilename(title="Save As")
-            if path != "":
-                self.path.set(path)
-                self.model.save_chip(self.path.get())
+            self.save_as()
 
         def on_finish_layer():
             print("Layer finished!")
             self.model.add_chip_layer()
-            self.model.save_chip(self.path.get())
+            if self.path.get():
+                self.model.save_chip(self.path.get())
 
         def on_delete_exposure():
             pair = self._selected_exposure()
-            assert pair is not None
+            if pair is None:
+                return
             yes = messagebox.askyesno(title="Delete Exposure", message="Are you sure you want to delete the selected exposure?")
             if yes:
                 self.model.delete_chip_exposure(pair[0], pair[1])
@@ -1417,9 +1642,12 @@ class ChipFrame:
 
         def on_double_click(cur):
             pair = self._selected_exposure()
-            assert pair is not None
+            if pair is None or self.model.movement_lock != MovementLock.UNLOCKED:
+                return  # nothing selected, or an exposure/autofocus is running
             x, y, z = self.model.chip.layers[pair[0]].exposures[pair[1]].coords
-            self.model.move_absolute({"x": x, "y": y, "z": z})
+            target = {"x": x, "y": y, "z": z}
+            if confirm_stage_move("where this exposure was made", target):
+                self.model.move_absolute(target)
 
         def on_chip_changed():
             if len(self.model.chip.layers) < 2:
@@ -1511,11 +1739,42 @@ class ChipFrame:
             return int(layer_idx), int(ex_idx)
         return None
 
+    def unsaved_exposures(self) -> int:
+        """Exposures that exist only in memory (no chip file chosen yet)."""
+        if self.path.get():
+            return 0
+        return sum(len(layer.exposures) for layer in self.model.chip.layers)
+
+    def save_as(self) -> bool:
+        path = filedialog.asksaveasfilename(title="Save chip record as", defaultextension=".json",
+                                            filetypes=[("Chip records", "*.json"), ("All files", "*.*")])
+        if not path:
+            return False
+        self.path.set(path)
+        self.model.save_chip(path)
+        return True
+
+    def offer_to_save(self, action: str) -> bool:
+        """Ask before discarding unsaved exposures. False means the user cancelled."""
+        count = self.unsaved_exposures()
+        if count == 0:
+            return True
+        answer = messagebox.askyesnocancel(action, f"The current chip record has {count} exposure(s) that are not "
+                                           "saved to a file. Save them first?")
+        if answer is None:
+            return False
+        return self.save_as() if answer else True
+
     def _get_thumbnail(self, path: str):
         try:
             return self.image_cache[path][1]
         except KeyError:
-            img = Image.open(path).resize((80, 45))
+            try:
+                with Image.open(path) as source:
+                    img = source.convert("RGB").resize((80, 45))
+            except (OSError, ValueError):
+                # Pattern file moved, deleted, or from another PC: show a grey placeholder.
+                img = Image.new("RGB", (80, 45), "#5a646c")
             photo = image_to_tk_image(img)
             self.image_cache[path] = (img, photo)
             return photo
@@ -1701,7 +1960,7 @@ class RedModeFrame:
         self.pattern_display.frame.grid(row=0, column=0)
 
         # Red focus image selection (left)
-        self.red_select_var = StringVar(value="focus")
+        self.red_select_var = StringVar(value=event_dispatcher.red_focus_source.value)
         self.red_focus_rb = ttk.Radiobutton(
             self.left_frame,
             variable=self.red_select_var,
@@ -1738,6 +1997,25 @@ class RedModeFrame:
             lambda t: event_dispatcher.set_red_focus_image(self.red_focus_image()),
         )
         self.red_focus_frame.frame.grid(row=5, column=0)
+
+        brightness = ttk.Frame(self.left_frame)
+        brightness.grid(row=6, column=0, sticky="ew", pady=(14, 0))
+        brightness.columnconfigure(0, weight=1)
+        ttk.Label(brightness, text="Red brightness").grid(row=0, column=0, sticky="w")
+        self.red_brightness_text = ttk.Label(brightness, text="100%", bootstyle="secondary")
+        self.red_brightness_text.grid(row=0, column=1, sticky="e")
+        self.red_brightness_var = tkinter.DoubleVar(value=round(event_dispatcher.red_brightness * 100))
+        self.red_brightness_scale = ttk.Scale(brightness, from_=2, to=100, variable=self.red_brightness_var)
+        self.red_brightness_scale.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.on_red_brightness = None  # set by the main window to remember the value
+        def on_brightness(*_):
+            percent = int(round(self.red_brightness_var.get()))
+            self.red_brightness_text.configure(text=f"{percent}%")
+            event_dispatcher.set_red_brightness(percent / 100)
+            if self.on_red_brightness:
+                self.on_red_brightness(percent)
+        self.red_brightness_var.trace_add("write", on_brightness)
+        on_brightness()
 
         def on_radiobutton(*_):
             print(f"red select var {self.red_select_var.get()}")
@@ -1790,9 +2068,54 @@ class UvModeFrame:
         self.exposure_frame.frame.grid(row=0, column=0)
         self.patterning_frame = PatterningFrame(self.right_frame, event_dispatcher)
         self.patterning_frame.frame.grid(row=1, column=0)
+        self.checklist = ExposeChecklist(self.right_frame, event_dispatcher)
+        self.checklist.frame.grid(row=2, column=0, sticky="w", pady=(14, 0))
+
+class ExposeChecklist:
+    """Live "ready to expose?" summary next to the Start button."""
+
+    def __init__(self, parent, event_dispatcher: EventDispatcher):
+        self.dispatcher = event_dispatcher
+        self.projector_status = None  # set by the main window: () -> (bootstyle, text)
+        self.frame = ttk.Frame(parent)
+        ttk.Label(self.frame, text="Before you expose", font="StepperSection").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self.lines = []
+        for row in range(1, 5):
+            label = ttk.Label(self.frame, text="", wraplength=330, justify="left")
+            label.grid(row=row, column=0, sticky="w", pady=1)
+            self.lines.append(label)
+        self.refresh()
+
+    def items(self):
+        d = self.dispatcher
+        ok, warn, info = "success", "danger", "secondary"
+        if d.pattern_image_path:
+            w, h = d.pattern_image.size
+            yield ok, f"✓ Pattern: {Path(d.pattern_image_path).name} ({w} × {h})"
+        else:
+            yield warn, "✗ No pattern chosen. Pick one on the Pattern tab."
+        if isinstance(d.exposure_time, int) and d.exposure_time > 0:
+            yield ok, f"✓ Exposure time: {d.exposure_time:,} ms = {d.exposure_time / 1000:.2f} s"
+        else:
+            yield warn, "✗ Enter an exposure time greater than 0 ms."
+        if isinstance(d.hardware.stage, GrblStage):
+            yield ok, "✓ Stage connected"
+        else:
+            yield info, "• Stage in simulation: it will not move"
+        if self.projector_status is not None:
+            yield self.projector_status()
+        else:
+            yield info, "• The pattern is shown on the display this window is on. Move it to the projector first."
+
+    def refresh(self):
+        for label, (style, text) in zip(self.lines, self.items()):
+            label.configure(text=text, bootstyle=style)
+        self.frame.after(700, self.refresh)
+
 
 class PatternUploadFrame:
     def __init__(self, parent, event_dispatcher: EventDispatcher):
+        self.last_folder = None
         self.frame = ttk.Frame(parent, padding=24)
         self.event_dispatcher = event_dispatcher
         details = ttk.Frame(self.frame)
@@ -1813,12 +2136,13 @@ class PatternUploadFrame:
     def choose_image(self):
         if self.event_dispatcher.patterning_busy:
             return
-        path = filedialog.askopenfilename(title="Choose a pattern image", filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(title="Choose a pattern image", initialdir=self.last_folder,
+                                          filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")])
         if not path:
             return
+        self.last_folder = str(Path(path).parent)
         try:
-            with Image.open(path) as source:
-                image = ImageOps.exif_transpose(source).convert('RGB')
+            image = load_pattern_image(path)
             self.event_dispatcher.set_pattern_image(image, path)
         except (OSError, ValueError) as exc:
             messagebox.showerror("Could not open image", str(exc))
@@ -1954,7 +2278,7 @@ class GlobalSettingsFrame:
 
         self.autofocus_button = ttk.Button(
             self.frame, text="Autofocus",
-            command=lambda: event_dispatcher.autofocus(blue_only=event_dispatcher.in_uv()),
+            command=lambda: event_dispatcher.autofocus(blue_only=event_dispatcher.in_uv(), interactive=True),
             bootstyle="secondary-outline",
             width=12,
         )
@@ -2267,7 +2591,7 @@ class TilingFrame:
             model.set_pattern_image(current_tile, image_path)
             #move to the next position if not the first tile
             #the first tile is exposed where the operator(user of the stepper) places it
-            if(~(x_idx == 0 & y_idx == 0)):
+            if not (x_idx == 0 and y_idx == 0):
                 self.model.move_absolute(
                     {
                         "x": x_start + x_dir * x_idx * x_offset,
@@ -2278,8 +2602,8 @@ class TilingFrame:
             self.model.autofocus(blue_only=False)
 
             #align to previous alignment marks if not first tile
-            if(~(x_idx == 0 & y_idx == 0)):
-                if(x_idx !=0 & x_idx!=x_idx_max):
+            if not (x_idx == 0 and y_idx == 0):
+                if x_idx != 0 and x_idx != x_idx_max:
                     if(y_idx % 2 == 0):
                         do_align_tiling('left')
                     else:
@@ -2803,15 +3127,21 @@ class LithographerGui:
             button = ttk.Button(sidebar, text=name, command=lambda n=name: self.show_page(n), bootstyle="secondary-link", width=20)
             button.pack(fill="x", pady=5)
             self.nav_buttons[name] = button
-        ttk.Label(sidebar, text="Connected equipment", bootstyle="secondary").pack(anchor="w", pady=(36, 12))
+        self.help_button = ttk.Button(sidebar, text="Help & guide  (F1)", command=open_guide, bootstyle="info-link", width=20)
+        self.help_button.pack(fill="x", pady=(14, 0))
+        root.bind("<F1>", lambda _event: open_guide())
+        ttk.Label(sidebar, text="Connected equipment", bootstyle="secondary").pack(anchor="w", pady=(28, 12))
         self.device_status = StringVar(value="Camera · connecting")
         ttk.Label(sidebar, textvariable=self.device_status, wraplength=195).pack(anchor="w")
         ttk.Label(sidebar, text="Stage · " + ("connected" if isinstance(config.stage, GrblStage) else "simulation"), bootstyle="secondary").pack(anchor="w", pady=8)
+        self.projector_sidebar = StringVar(value="Projector · in this window")
+        ttk.Label(sidebar, textvariable=self.projector_sidebar, bootstyle="secondary", wraplength=195).pack(anchor="w")
         def clear_projector():
             if self.event_dispatcher.patterning_busy:
                 self.event_dispatcher.abort_patterning()
             self.event_dispatcher.set_shown_image(ShownImage.CLEAR)
-        ttk.Button(sidebar, text="Clear projector", command=clear_projector, bootstyle="secondary-outline").pack(side="bottom", fill="x", pady=8)
+        self.clear_button = ttk.Button(sidebar, text="Clear projector", command=clear_projector, bootstyle="secondary-outline")
+        self.clear_button.pack(side="bottom", fill="x", pady=8)
         self.abort_button = ttk.Button(sidebar, text="Stop exposure", command=self.event_dispatcher.abort_patterning, bootstyle="danger", state="disabled")
         self.abort_button.pack(side="bottom", fill="x")
         self.event_dispatcher.add_event_listener(Event.PATTERNING_BUSY_CHANGED, lambda: self.abort_button.configure(state="normal" if self.event_dispatcher.patterning_busy else "disabled"))
@@ -2830,7 +3160,10 @@ class LithographerGui:
             if kind == "projector":
                 if self.event_dispatcher.patterning_busy:
                     self.event_dispatcher.abort_patterning()
-                self.event_dispatcher.set_shown_image(ShownImage.CLEAR)
+                if not self.projector_window.is_open:
+                    # This view *was* the projection, so leaving it clears the projector.
+                    # With a projector window it was only a preview.
+                    self.event_dispatcher.set_shown_image(ShownImage.CLEAR)
         self.fullscreen = FullscreenPreview(root, on_close=close_fullscreen)
         def camera_picture():
             image = self.event_dispatcher.camera_image
@@ -2840,10 +3173,15 @@ class LithographerGui:
         self.camera.label.configure(cursor="hand2")
         self.camera.label.bind("<Button-1>", lambda _: self.fullscreen.open("camera", camera_picture))
         self.projector_display.label.bind("<Button-1>", lambda _: self.fullscreen.open("projector", projector_picture))
+        self.projector_settings = (settings or {}).get("projector", {})
+        self.projector_window = ProjectorWindow(root, on_escape=self._escape_exposure, on_close=self._projector_window_changed)
+        root.bind("<Escape>", lambda _event: self._escape_exposure(), add="+")
         def projector_updated():
-            # Actual exposures use the same fullscreen view, never a hidden
-            # output window. The exposure timer starts after show() returns.
-            if self.event_dispatcher.patterning_busy and not self.event_dispatcher.should_abort and self.fullscreen.kind != "projector":
+            # With a projector window, every image goes there. Without one, exposures use the
+            # app's own fullscreen view. The exposure timer starts after show() returns.
+            if self.projector_window.is_open:
+                self.projector_window.show(projector_picture())
+            elif self.event_dispatcher.patterning_busy and not self.event_dispatcher.should_abort and self.fullscreen.kind != "projector":
                 self.fullscreen.open("projector", projector_picture)
             if self.fullscreen.kind == "projector":
                 self.fullscreen.refresh()
@@ -2854,11 +3192,22 @@ class LithographerGui:
             else:
                 self.projector_display.frame.grid(row=0, column=1, sticky="n", pady=0)
         self.top_panel.bind("<Configure>", arrange_preview)
-        ttk.Label(operation, text="Click either preview for fullscreen. Press Esc or × to return. For projection, place this app on the DLP display.", bootstyle="warning", wraplength=900).grid(row=3, column=0, sticky="w", pady=16)
+        ttk.Label(operation, text="Click either preview to see it full size (Esc or × to return). Exposures go to the projector window "
+                  "when it is open; otherwise they fill this window, which then has to be on the projector display.",
+                  bootstyle="warning", wraplength=900).grid(row=3, column=0, sticky="w", pady=16)
+        self._build_projector_controls()
         self.pattern_progress = ttk.Progressbar(operation, bootstyle="info")
         self.pattern_progress.grid(row=4, column=0, sticky="ew", pady=(0, 16))
         self.event_dispatcher.add_event_listener(Event.EXPOSURE_PATTERN_PROGRESS_CHANGED, lambda: self.pattern_progress.configure(value=self.event_dispatcher.patterning_progress * 100))
         self.mode_select_frame = ModeSelectFrame(operation, self.event_dispatcher)
+        self.mode_select_frame.uv_mode_frame.checklist.projector_status = self.projector_status_line
+        red = self.mode_select_frame.red_mode_frame
+        try:
+            red.red_brightness_var.set(max(2, min(100, float(self.projector_settings.get("red-brightness", 100)))))
+        except (TypeError, ValueError):
+            pass
+        red.on_red_brightness = lambda percent: self.settings_page.config.setdefault("projector", {}).__setitem__(
+            "red-brightness", percent) if hasattr(self, "settings_page") else None
         self.mode_select_frame.notebook.grid(row=5, column=0, sticky="nsew")
         alignment = self.pages["Alignment"].body
         ttk.Label(alignment, text="Alignment & image", font="StepperTitle").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 20))
@@ -2882,27 +3231,134 @@ class LithographerGui:
         def scroll_workspace(event):
             if event.widget.winfo_class() in ('Listbox', 'Treeview', 'Text', 'TCombobox'):
                 return
+            direction = -1 if getattr(event, 'num', 0) == 4 or getattr(event, 'delta', 0) > 0 else 1
             widget = event.widget
             while widget is not None:
                 for page in self.pages.values():
                     if widget == page.frame:
-                        direction = -1 if getattr(event, 'num', 0) == 4 or getattr(event, 'delta', 0) > 0 else 1
                         page.canvas.yview_scroll(direction * 3, 'units')
                         return 'break'
                 widget = getattr(widget, 'master', None)
+            # On Windows the wheel goes to the focused widget, which may be the main window
+            # itself (e.g. after the projector window opens). Scroll the page on screen.
+            if event.widget == root:
+                self.pages[self.current_page].canvas.yview_scroll(direction * 3, 'units')
+                return 'break'
         for sequence in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
             root.bind_all(sequence, scroll_workspace)
-        root.protocol("WM_DELETE_WINDOW", self.cleanup)
+        root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self._add_tooltips()
         self.show_page("Operate")
         def on_start():
             self.camera.start()
             self.event_dispatcher.enter_red_mode(mode_switch_autofocus=False)
+            self.auto_open_projector_window()
             if self.event_dispatcher.hardware.stage.has_homing():
                 self.event_dispatcher.home_stage()
             self.update_status()
         root.after(0, on_start)
 
+    # ── Projector window ─────────────────────────────────────────────────
+    MOVABLE_WINDOW = "Movable window (drag it to the projector)"
+
+    def _build_projector_controls(self):
+        box = ttk.Frame(self.projector_display.display_frame)
+        box.grid(row=3, column=0, sticky="ew", padx=5, pady=(4, 10))
+        box.columnconfigure(0, weight=1)
+        ttk.Label(box, text="Projector window", font="StepperSection").grid(row=0, column=0, sticky="w")
+        self.projector_choice = StringVar()
+        self.projector_combo = ttk.Combobox(box, textvariable=self.projector_choice, state="readonly", width=34,
+                                            postcommand=self._refresh_display_choices)
+        self.projector_combo.grid(row=1, column=0, sticky="ew", pady=(4, 4))
+        self.projector_combo.bind("<<ComboboxSelected>>", self._on_display_chosen)
+        self.projector_button = ttk.Button(box, text="Open projector window", bootstyle="success",
+                                           command=self.toggle_projector_window)
+        self.projector_button.grid(row=2, column=0, sticky="ew")
+        self.projector_note = ttk.Label(box, text="", wraplength=300, bootstyle="secondary", justify="left")
+        self.projector_note.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self._refresh_display_choices()
+        self._projector_window_changed()
+
+    def _refresh_display_choices(self):
+        self.displays = list_displays(self.root)
+        choices = [d.label for d in self.displays] + [self.MOVABLE_WINDOW]
+        self.projector_combo.configure(values=choices)
+        if self.projector_choice.get() not in choices:
+            target = choose_projector_display(self.displays, self.projector_settings.get("display", "auto"))
+            self.projector_choice.set(target.label if target else self.MOVABLE_WINDOW)
+
+    def _chosen_display(self):
+        return next((d for d in self.displays if d.label == self.projector_choice.get()), None)
+
+    def _on_display_chosen(self, _event=None):
+        display = self._chosen_display()
+        if display is not None and not display.primary:
+            # Remembered by Save settings on the Settings page.
+            self.settings_page.config.setdefault("projector", {})["display"] = display.number
+        if self.projector_window.is_open:
+            self.open_projector_window()
+
+    def open_projector_window(self):
+        display = self._chosen_display()
+        if display is not None and display.primary:
+            if not messagebox.askyesno("Projector window", "That is your main screen, so the projector window "
+                                       "would cover your controls.\n\nTo see the projector as its own display, press "
+                                       "Win+P and choose Extend.\n\nOpen it on the main screen anyway?"):
+                return
+        self.projector_window.open(display, getattr(self.event_dispatcher.hardware.projector, "current_image", None))
+        if self.fullscreen.kind == "projector":
+            self.fullscreen.close()
+        self._projector_window_changed()
+
+    def toggle_projector_window(self):
+        if self.projector_window.is_open:
+            if self.event_dispatcher.patterning_busy:
+                messagebox.showinfo("Projector window", "Stop the exposure before closing the projector window.")
+                return
+            self.projector_window.close()
+        else:
+            self.open_projector_window()
+
+    def auto_open_projector_window(self):
+        if str(self.projector_settings.get("window", "auto")).lower() != "auto":
+            return
+        target = choose_projector_display(self.displays, self.projector_settings.get("display", "auto"))
+        if target is not None:
+            self.projector_choice.set(target.label)
+            self.open_projector_window()
+
+    def _projector_window_changed(self):
+        window = self.projector_window
+        if window.is_open:
+            self.projector_button.configure(text="Close projector window", bootstyle="secondary-outline")
+            where = window.display.label if window.display else "a movable window"
+            self.projector_sidebar.set(f"Projector · {where}")
+            note = ("Showing on this display. The mouse pointer is hidden over it." if window.display
+                    else "Drag it onto the projector, then double-click it for fullscreen.")
+        else:
+            self.projector_button.configure(text="Open projector window", bootstyle="success")
+            self.projector_sidebar.set("Projector · in this window")
+            if len(self.displays) < 2:
+                note = ("Only one display found, so the projector is mirroring this screen. "
+                        "Press Win+P and choose Extend, then pick the projector here.")
+            else:
+                note = "Not open: exposures fill this window instead."
+        self.projector_note.configure(text=note)
+
+    def projector_status_line(self):
+        window = self.projector_window
+        if window.is_open and window.display is not None:
+            return "success", f"✓ Projector window on {window.display.label}"
+        if window.is_open:
+            return "warning", "• Projector window is movable: make sure it is fullscreen on the projector."
+        return "warning", "• No projector window: the pattern fills this window, so it must be on the projector display."
+
+    def _escape_exposure(self):
+        if self.event_dispatcher.patterning_busy:
+            self.event_dispatcher.abort_patterning()
+
     def show_page(self, name):
+        self.current_page = name
         self.pages[name].frame.tkraise()
         for label, button in self.nav_buttons.items():
             button.configure(bootstyle="primary" if label == name else "secondary-link")
@@ -2913,7 +3369,63 @@ class LithographerGui:
         self.device_status.set(f"Camera · {text}")
         self.root.after(500, self.update_status)
 
+    def request_close(self):
+        """Window close button: stop any exposure cleanly and offer to save the chip record."""
+        d = self.event_dispatcher
+        if d.patterning_busy:
+            d.abort_patterning()
+            self.root.after(200, self.request_close)  # let the exposure loop finish first
+            return
+        if d.autofocus_busy and not messagebox.askyesno("Autofocus running", "Autofocus is still moving the stage. Close anyway?"):
+            return
+        if not self.chip_frame.offer_to_save("Close HackerFab Stepper"):
+            return
+        self.cleanup()
+
+    def _add_tooltips(self):
+        tips = {
+            self.nav_buttons["Operate"]: "Everyday work: choose a pattern, focus in red, expose in UV.",
+            self.nav_buttons["Alignment"]: "Shift or rotate the projected image, run autofocus, snapshot options.",
+            self.nav_buttons["Wafer & tiling"]: "Map of exposures and the chip record (which pattern went where).",
+            self.nav_buttons["Settings"]: "Camera, stage and appearance. Save settings to keep changes.",
+            self.help_button: "Open the illustrated how-to guide in your web browser.",
+            self.abort_button: "Stop the running exposure immediately. Esc does the same.",
+            self.clear_button: "Blank the projector. Also stops an exposure if one is running.",
+            self.camera.label: "Click for a fullscreen camera view. Press Esc to return.",
+            self.projector_display.label: "Click to show this image fullscreen. The projector only gets the image "
+                                          "when this window is on the projector display and fullscreen is open.",
+            self.camera.snapshot.name_entry: "Snapshot file name. %T becomes the date and time, %C a counter. "
+                                             "Files go to the snapshot folder (see Alignment page).",
+        }
+        red = self.mode_select_frame.red_mode_frame
+        uv = self.mode_select_frame.uv_mode_frame
+        tips.update({
+            red.red_brightness_scale: "Dims the red image. Lower it when a long camera exposure (needed to remove the "
+                                      "projector's colour bands) makes the preview wash out. Red light does not expose resist.",
+            self.projector_combo: "Which display the projector window goes on. Pick the projector; Win+P must be set to Extend.",
+            self.projector_button: "Open or close the borderless projector window on the chosen display.",
+            red.solid_red_rb: "Even red light over the whole field. Best for finding the chip and focusing.",
+            red.pattern_rb: "Your pattern drawn in red, to see exactly where it will land. Red does not expose resist.",
+            red.inv_pattern_rb: "The pattern with light and dark swapped, in red.",
+            red.red_focus_rb: "Your own focusing image. Click the thumbnail below to load one.",
+            uv.exposure_frame.exposure_time_entry.widget: "How long the pattern is shown, in milliseconds. 8000 ms = 8 s.",
+            uv.exposure_frame.posterize_checkbutton: "Turn the pattern into pure black and white at this brightness cutoff.",
+            uv.patterning_frame.begin_patterning_button: "Project the pattern in UV for the exposure time. Waits for the "
+                                                         "stage to stop first. Esc or Stop exposure aborts.",
+            self.global_settings_frame.autofocus_button: "Find the sharpest focus near the current Z automatically. "
+                                                         "Needs a live camera; focus roughly by hand first.",
+        })
+        for frame in (red.stage_position_frame, uv.stage_position_frame):
+            for widget in frame.z_widgets:
+                tips[widget] = "Move focus by the distance per click. +Z brings the camera and chip closer."
+            tips[frame.set_position_button] = "Move the stage to the X, Y and Z typed above (in µm)."
+            for widget in frame.shortcuts:
+                tips[widget] = "Moves all three axes to a fixed position. Needs homing. Asks first."
+        for widget, text in tips.items():
+            add_tooltip(widget, text)
+
     def cleanup(self):
+        self.projector_window.close(notify=False)
         self.fullscreen.cleanup()
         self.camera.cleanup()
         self.event_dispatcher.hardware.stage.close()
@@ -3131,18 +3643,22 @@ def main():
     if theme in ttk.Style().theme_names():
         ttk.Style().theme_use(theme)
 
+    # A typo in the config file should produce a clear warning, not a crash.
+    reader = ConfigReader(config)
+    number, flag, problems = reader.number, reader.flag, reader.problems
+
     # ── Stage ────────────────────────────────────────────────────────────
-    stage_cfg = config.get("stage", {})
     port = dialog.selected_port
-    if stage_cfg.get("enabled", True) and port and port != "none":
+    stage = StageController()
+    if flag("stage", "enabled", True) and port and port != "none":
         try:
-            sp    = serial.Serial(port, stage_cfg.get("baud-rate", 115200))
-            stage = GrblStage(sp, stage_cfg.get("homing", False), invert_z=stage_cfg.get("invert-z", True))
+            sp    = serial.Serial(port, int(number("stage", "baud-rate", 115200, positive=True)))
+            stage = GrblStage(sp, flag("stage", "homing", False), invert_z=flag("stage", "invert-z", True))
         except Exception as e:
             print(f"Stage connection failed ({port}): {e}")
-            stage = StageController()
-    else:
-        stage = StageController()
+            problems.append(f"Could not connect to the stage on {port}: {e}\n"
+                            "  The app is running in simulation, so the stage will not move. Close other "
+                            "programs using that port, check the cable and power, then restart.")
 
     # ── Camera ───────────────────────────────────────────────────────────
     cam_cfg  = config.get("camera", {})
@@ -3159,28 +3675,33 @@ def main():
         elif cam_type == "none":
             camera = None
         else:
-            print(f"Unknown camera type '{cam_type}' – camera disabled")
+            problems.append(f"[camera] type = {cam_type!r} is not recognized; the camera is disabled. "
+                            "Use \"webcam\" for USB cameras.")
             camera = None
     except Exception as exc:
         print(f"Camera initialization failed: {exc}. Choose a camera in Settings.")
+        problems.append(f"The camera could not be started ({exc}). Choose a camera in Settings.")
         camera = None
 
-    camera_scale = float(cam_cfg.get("gui-scale",    1.0))
-    red_exposure = float(cam_cfg.get("red-exposure",  DEFAULT_RED_EXPOSURE))
-    uv_exposure  = float(cam_cfg.get("uv-exposure",   DEFAULT_UV_EXPOSURE))
+    camera_scale = number("camera", "gui-scale", 1.0, positive=True)
+    red_exposure = number("camera", "red-exposure", DEFAULT_RED_EXPOSURE, positive=True)
+    uv_exposure  = number("camera", "uv-exposure", DEFAULT_UV_EXPOSURE, positive=True)
 
     # ── Alignment ────────────────────────────────────────────────────────
     ac = config.get("alignment", {})
     alignment_config = AlignmentConfig(
-        enabled         = ac.get("enabled",         False),
+        enabled         = flag("alignment", "enabled", False),
         model_path      = ac.get("model_path",      "ckpts/best.pt"),
-        right_marker_x  = float(ac.get("right_marker_x",  1820.0)),
-        left_marker_x   = float(ac.get("left_marker_x",    280.0)),
-        top_marker_y    = float(ac.get("top_marker_y",     269.0)),
-        bottom_marker_y = float(ac.get("bottom_marker_y", 1075.0)),
-        x_scale_factor  = float(ac.get("x_scale_factor",  -1100)),
-        y_scale_factor  = float(ac.get("y_scale_factor",    800)),
+        right_marker_x  = number("alignment", "right_marker_x",  1820.0),
+        left_marker_x   = number("alignment", "left_marker_x",    280.0),
+        top_marker_y    = number("alignment", "top_marker_y",     269.0),
+        bottom_marker_y = number("alignment", "bottom_marker_y", 1075.0),
+        x_scale_factor  = number("alignment", "x_scale_factor",  -1100),
+        y_scale_factor  = number("alignment", "y_scale_factor",    800),
     )
+
+    if problems:
+        messagebox.showwarning("Check your settings", "\n\n".join(problems))
 
     lithographer = LithographerGui(LithographerConfig(
         stage, camera, camera_scale, red_exposure, uv_exposure, alignment_config,
