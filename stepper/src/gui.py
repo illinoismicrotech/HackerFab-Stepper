@@ -1,345 +1,67 @@
-from tk_runtime import enable_font_support
+from tk_runtime import enable_font_support, safe_console
 enable_font_support()
+safe_console()
 
-import json
-import sys
 import os
 import queue
+import threading
 import time
-import toml
-import traceback
-
-import re
 import tkinter
+import traceback
 import webbrowser
-from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum, auto
-from functools import partial
 from pathlib import Path
-from tkinter import BooleanVar, IntVar, StringVar, Tk, filedialog, messagebox
-from typing import Callable, List, Optional
-
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
+from tkinter import StringVar, filedialog, messagebox
+from typing import Optional
 
 import cv2
 import numpy as np
 import serial
-import math
-from PIL import Image, ImageOps, ImageTk
-from alignment_detector import load_marker_detector, marker_centers
+import toml
+import ttkbootstrap as ttk
+from PIL import Image
+
+from alignment_page import AlignmentPage
 from camera.camera_module import CameraModule
-from camera.webcam import Webcam
-from settings import SettingsPage
-from ui_theme import configure_theme, prepare_dropdowns
-from hardware import ImageProcessSettings, Lithographer, ProcessedImage
-from lib.gui import IntEntry, Thumbnail, FloatEntry
-from lib.img import image_to_tk_image
+from camera.processing import compute_focus_score
+from camera.webcam import Webcam, setting_flag
+from camera_view import CameraAdjustDialog, CameraBar, CameraFullscreen, CameraView, FocusTracker
+from chip_pages import ChipFrame, MapFrame, TilingFrame, confirm_stage_move
+from help_page import HelpPage
+from dispatcher import (AlignmentConfig, AutofocusStopped, Chip, ChipLayer, ConfigReader, Event,
+                        EventDispatcher, ExposureLog, LED_FOCUS, LithographerConfig, MovementLock, RedFocusSource,
+                        ShownImage, StageError, describe_stage_error, detect_alignment_markers, load_pattern_image,
+                        read_stage_limits, write_rgb_image)
 from projector import TkProjector
-from fullscreen_preview import FullscreenPreview
+from projector_leds import ALL, LedController
+from projector_panel import ProjectorPanel, ProjectorPreviewWindow
+from platform_text import EXTEND_DISPLAYS, OS_NAME
 from projector_window import ProjectorWindow, choose_projector_display, list_displays
+from settings import SettingsPage
 from stage_control.grbl_stage import GrblStage
 from stage_control.stage_controller import StageController
+from stage_pad import StagePanel
+from ui_kit import Card, ScrollFrame, Segmented, StatusDot, Toast, add_tooltip, install_wheel_router
+from ui_theme import configure_theme, enable_dpi_awareness, palette, prepare_dropdowns, px
+from steps_panel import WorkflowPanel
 
-
-
-# TODO: Don't hardcode
-THUMBNAIL_SIZE: tuple[int, int] = (160, 90)
-#The values set here are not used and instead come from the config file
+# The values set here are defaults; the config file overrides them
 DEFAULT_RED_EXPOSURE: float = 4167.0
 DEFAULT_UV_EXPOSURE: float = 25000.0
-DEFAULT_UI_SCALE: float = 1.6
+GUIDE_NAME = "HOW-TO-GUIDE.html"
+GUIDE_URL = "https://github.com/illinoismicrotech/Hackerfab-Stepper"
+PAGES = (("operate", "Operate"), ("chip", "Chip & map"), ("alignment", "Alignment"), ("settings", "Settings"),
+         ("help", "Help"))
 
 
 def configure_ui_scale(root: tkinter.Tk) -> None:
-    """Keep the desktop UI readable on high-resolution displays.
-
-    Set HACKERFAB_UI_SCALE (for example, to 1.6) to request a larger scale.
-    Existing system scaling is never reduced.
-    """
+    """Optional extra scaling: set HACKERFAB_UI_SCALE (e.g. 1.6) to make everything larger.
+    Normally the app follows the system's display scaling (it runs DPI-aware on Windows)."""
     try:
-        requested_scale = float(os.environ.get("HACKERFAB_UI_SCALE", DEFAULT_UI_SCALE))
+        requested = float(os.environ.get("HACKERFAB_UI_SCALE", "0"))
     except ValueError:
-        requested_scale = DEFAULT_UI_SCALE
-
-    current_scale = float(root.tk.call("tk", "scaling"))
-    root.tk.call("tk", "scaling", max(current_scale, requested_scale))
-
-def compute_focus_score(camera_image, blue_only, save=False):
-    camera_image = camera_image.copy()
-    camera_image[:, :, 1] = 0  # green should never be used for focus
-    if blue_only:
-      camera_image[:, :, 0] = 0  # disable red
-    img = cv2.cvtColor(camera_image, cv2.COLOR_RGB2GRAY)
-    img = cv2.resize(img, (0, 0), fx=0.5, fy=0.5)
-    mean = float(np.mean(img))
-    if mean <= 0:
-        return 0.0
-    img_lapl = (np.abs(cv2.Sobel(img, cv2.CV_64F, 1, 0, ksize=1)) + np.abs(cv2.Sobel(img, cv2.CV_64F, 0, 1, ksize=1))) / mean
-    if save:
-        print('saved focus: ', np.min(img_lapl), np.max(img_lapl))
-        cv2.imwrite(save, img_lapl * 255.0 / 5.0)
-    return img_lapl.var() / mean
-
-
-def detect_alignment_markers(model, image, draw_rectangle=False):
-    """Find alignment marks in an RGB camera frame. Returns ([((x0, y0), (x1, y1)), ...], annotated copy)."""
-    detections = []
-    display_image = image.copy() if draw_rectangle else image
-    try:
-        for (corner0, corner1), score in model.detect(image):
-            detections.append((corner0, corner1))
-            if draw_rectangle:
-                cv2.rectangle(display_image, corner0, corner1, (0, 255, 0), max(2, image.shape[1] // 400))
-    except Exception as e:
-        print(f"Detection failed: {e}")
-    return detections, display_image
-
-
-def alignment_correction(centers, alignment, tiling=False):
-    """Stage move (µm) that brings detected marks onto their calibrated positions.
-
-    centers are mark centres as fractions of the frame. The calibrated positions are in
-    pixels of a reference camera resolution, so they stay valid at any capture resolution.
-    For tiling only marks near the top give a Y correction, because the previous row's
-    marks are the only ones that exist yet. Returns (dx, dy, marks used for x, for y).
-    """
-    left = alignment.left_marker_x / alignment.reference_width
-    right = alignment.right_marker_x / alignment.reference_width
-    top = alignment.top_marker_y / alignment.reference_height
-    bottom = alignment.bottom_marker_y / alignment.reference_height
-    xs, ys = [], []
-    for x, y in centers:
-        xs.append(alignment.x_scale_factor * ((right if x > 0.5 else left) - x))
-        if tiling:
-            if y < 0.3:
-                ys.append(alignment.y_scale_factor * (top - y))
-        else:
-            ys.append(alignment.y_scale_factor * ((bottom if y > 0.5 else top) - y))
-    dx = sum(xs) / len(xs) if xs else 0.0
-    dy = sum(ys) / len(ys) if ys else 0.0
-    return dx, dy, len(xs), len(ys)
-
-
-def filter_edge(centers, edge, edge_fraction=0.25):
-    """Keep only marks near one edge of the frame ('left', 'right' or 'top')."""
-    if edge == "left":
-        return [c for c in centers if c[0] <= edge_fraction]
-    if edge == "right":
-        return [c for c in centers if c[0] >= 1 - edge_fraction]
-    if edge == "top":
-        return [c for c in centers if c[1] <= edge_fraction]
-    return list(centers)
-
-
-def tiling_alignment_edge(x_idx, y_idx, x_count):
-    """Which edge of the camera view shows the previous tile's marks, for a snake-order run:
-    rows go left-to-right on even rows and right-to-left on odd rows."""
-    first_in_row = x_idx == (0 if y_idx % 2 == 0 else x_count - 1)
-    if first_in_row:
-        return None if y_idx == 0 else "top"
-    return "left" if y_idx % 2 == 0 else "right"
-
-
-def tile_positions(length, tile, overlap):
-    """Top-left offsets of tiles along one axis. The grid is evenly spaced (constant stage
-    step); the last tile may extend past the image and is padded with black."""
-    stride = tile - overlap
-    count = max(1, math.ceil(max(0, length - overlap) / stride))
-    return [i * stride for i in range(count)] 
-
-
-class StrAutoEnum(str, Enum):
-    """Base class for string-valued enums that use auto()"""
-
-    def _generate_next_value_(name, *_):
-        return name.lower()
-
-
-class ShownImage(StrAutoEnum):
-    """The type of image currently being displayed by the projector"""
-
-    CLEAR = auto()
-    PATTERN = auto()
-    FLATFIELD = auto()
-    RED_FOCUS = auto()
-    UV_FOCUS = auto()
-
-
-class PatterningStatus(StrAutoEnum):
-    """The current state of the patterning process"""
-
-    IDLE = auto()
-    PATTERNING = auto()
-    ABORTING = auto()
-
-
-class Event(StrAutoEnum):
-    """Events that can be dispatched to listeners"""
-
-    SNAPSHOT = auto()
-    SHOWN_IMAGE_CHANGED = auto()
-    STAGE_POSITION_CHANGED = auto()
-    IMAGE_ADJUST_CHANGED = auto()
-    PATTERN_IMAGE_CHANGED = auto()
-    MOVEMENT_LOCK_CHANGED = auto()
-    EXPOSURE_PATTERN_PROGRESS_CHANGED = auto()
-    PATTERNING_BUSY_CHANGED = auto()
-    PATTERNING_FINISHED = auto()
-    CHIP_CHANGED = auto()
-    STAGE_CONNECTION_CHANGED = auto()
-
-
-class MovementLock(StrAutoEnum):
-    """Controls whether stage position can be manually adjusted"""
-
-    UNLOCKED = auto()  # X, Y, and Z are free to move
-    XY_LOCKED = auto() # Only Z (focus) is free to move to avoid smearing UV focus pattern
-    LOCKED = auto()  # No positions can move to avoid disrupting patterning
-
-
-class RedFocusSource(StrAutoEnum):
-    """The source image to use for red focus mode"""
-
-    IMAGE = auto()  # Uses the dedicated red focus image
-    SOLID = auto()  # Shows a solid red screen
-    PATTERN = auto()  # Uses the blue channel from the pattern image
-    INV_PATTERN = auto()  # Uses the inverse of the blue channel from the pattern image
-
-
-@dataclass
-class AlignmentConfig:
-    enabled: bool
-    model_path: str
-    right_marker_x: float
-    left_marker_x: float
-    top_marker_y: float
-    bottom_marker_y: float
-    x_scale_factor: float
-    y_scale_factor: float
-    reference_width: float = 1920.0   # camera resolution the marker positions were measured at
-    reference_height: float = 1080.0
-
-
-@dataclass
-class LithographerConfig:
-    stage: StageController
-    camera: CameraModule
-    camera_scale: float
-    red_exposure: float
-    uv_exposure: float
-    alignment: AlignmentConfig
-    stage_limits: Optional[dict] = None  # axis -> (min, max) in µm
-
-
-@dataclass
-class ExposureLog:
-    time: datetime
-    path: str
-    coords: tuple[float, float, float]
-    duration: float # ms
-    aborted: bool
-
-    def to_disk(self):
-        return {
-            "time": str(self.time),
-            "path": self.path,
-            "coords": self.coords,
-            "duration": self.duration,
-            "aborted": self.aborted,
-        }
-
-    @classmethod
-    def from_disk(cls, d):
-        return cls(
-            datetime.fromisoformat(d["time"]),
-            d["path"],
-            d["coords"],
-            d["duration"],
-            d["aborted"],
-        )
-
-
-@dataclass
-class ChipLayer:
-    exposures: List[ExposureLog]
-
-    def to_disk(self):
-        return {"exposures": [ex.to_disk() for ex in self.exposures]}
-
-    @classmethod
-    def from_disk(cls, d):
-        return cls([ExposureLog.from_disk(ex) for ex in d["exposures"]])
-
-
-@dataclass
-class Chip:
-    layers: List[ChipLayer]
-
-    def to_disk(self):
-        return {"layers": [layer.to_disk() for layer in self.layers]}
-
-    @classmethod
-    def from_disk(cls, d):
-        return cls([ChipLayer.from_disk(layer) for layer in d["layers"]])
-
-
-_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-
-def write_rgb_image(path, image_rgb) -> Path:
-    """Save an RGB array. Works with non-ASCII folders on Windows, where cv2.imwrite fails silently."""
-    path = Path(path)
-    if not path.suffix:
-        path = path.with_suffix(".png")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    ok, data = cv2.imencode(path.suffix, cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
-    if not ok:
-        raise OSError(f"cannot save '{path.suffix}' images; use .png, .jpg, .bmp or .tif")
-    path.write_bytes(data.tobytes())
-    return path
-
-
-def load_pattern_image(path) -> Image.Image:
-    """Open a pattern as 8-bit RGB where bright means light.
-
-    Transparent pixels become black (no light): many editors store transparent pixels as
-    white, which a plain RGB conversion would turn into full exposure. 16-bit images are
-    scaled down instead of clipped to white.
-    """
-    with Image.open(path) as source:
-        image = ImageOps.exif_transpose(source)
-        image.load()
-    if image.mode.startswith("I;16") or image.mode in ("I", "F"):
-        values = np.asarray(image, dtype=np.float64)
-        peak = 65535.0 if image.mode.startswith("I;16") or values.max() > 255 else 255.0
-        image = Image.fromarray(np.clip(values * (255.0 / peak), 0, 255).astype(np.uint8), "L")
-    if image.mode == "P":
-        image = image.convert("RGBA")
-    if image.mode in ("RGBA", "LA", "PA") or "transparency" in image.info:
-        rgba = image.convert("RGBA")
-        image = Image.alpha_composite(Image.new("RGBA", rgba.size, (0, 0, 0, 255)), rgba)
-    return image.convert("RGB")
-
-
-if sys.platform == "darwin":
-    EXTEND_DISPLAYS = "open System Settings → Displays and turn off mirroring"
-elif sys.platform == "win32":
-    EXTEND_DISPLAYS = "press Win+P and choose Extend"
-else:
-    EXTEND_DISPLAYS = "set your display settings to extend (not mirror) the desktop"
-
-
-PAGE_LABELS = {
-    "Operate": "Main screen",
-    "Alignment": "Image alignment",
-    "Wafer & tiling": "Chip records & tiling",
-    "Settings": "Settings",
-}
-
-GUIDE_NAME = "HOW-TO-GUIDE.html"
-GUIDE_URL = "https://github.com/illinoismicrotech/Hackerfab-Stepper"
+        return
+    if requested > 0:
+        root.tk.call("tk", "scaling", requested)
 
 
 def find_guide() -> Optional[Path]:
@@ -358,18 +80,13 @@ def open_guide():
                             f"Put it in the same folder as the app, or see {GUIDE_URL}")
 
 
-try:
-    from ttkbootstrap.widgets import ToolTip as _ToolTip
-except ImportError:  # older ttkbootstrap
-    from ttkbootstrap.tooltip import ToolTip as _ToolTip
-
-
-def add_tooltip(widget, text):
-    """Hover help. Never let a tooltip problem break the window."""
+def parse_size(text) -> Optional[tuple[int, int]]:
     try:
-        _ToolTip(widget, text=text, wraplength=320, delay=400)
-    except Exception as exc:
-        print(f"Tooltip unavailable: {exc}")
+        w, h = str(text).lower().replace("×", "x").split("x")
+        size = (int(w), int(h))
+        return size if size[0] > 0 and size[1] > 0 else None
+    except (ValueError, AttributeError):
+        return None
 
 
 _last_unexpected_error_at = 0.0
@@ -378,3169 +95,940 @@ _last_unexpected_error_at = 0.0
 def report_unexpected_error(exc_type, exc, tb):
     """Log a button/callback error and tell the user, instead of failing silently."""
     global _last_unexpected_error_at
+    if isinstance(exc, StageError):
+        return  # the stage error dialog has already explained what happened
     traceback.print_exception(exc_type, exc, tb)
     if time.monotonic() - _last_unexpected_error_at > 5.0:
         _last_unexpected_error_at = time.monotonic()
         messagebox.showerror("Something went wrong", f"That action failed:\n\n{exc_type.__name__}: {exc}\n\n"
                              "The app is still running. Details were written to the log "
-                             "(HackerfabStepper.log or the terminal).")
-
-
-def confirm_stage_move(what: str, coords: dict) -> bool:
-    where = ", ".join(f"{axis.upper()} {value:,.0f}" for axis, value in coords.items())
-    return messagebox.askokcancel("Move the stage", f"Move to {what} ({where} µm)?\n\n"
-                                  "This moves several axes at once. Keep hands and tools clear of the stage.")
-
-
-class ConfigReader:
-    """Reads values from a loaded config, collecting friendly messages instead of crashing on typos."""
-
-    def __init__(self, config: dict):
-        self.config = config
-        self.problems: list[str] = []
-
-    def number(self, section, key, default, positive=False):
-        value = self.config.get(section, {}).get(key, default)
-        try:
-            result = float(value)
-            if positive and result <= 0:
-                raise ValueError
-            return result
-        except (TypeError, ValueError):
-            self.problems.append(f"[{section}] {key} = {value!r} is not a valid number; using {default}.")
-            return float(default)
-
-    def limits(self, section, key):
-        """An optional [min, max] pair in µm; None when unset or invalid."""
-        value = self.config.get(section, {}).get(key)
-        if value is None:
-            return None
-        try:
-            low, high = (float(v) for v in value)
-            if math.isfinite(low) and math.isfinite(high) and low < high:
-                return (low, high)
-        except (TypeError, ValueError):
-            pass
-        self.problems.append(f"[{section}] {key} = {value!r} should be [lowest, highest] in µm, e.g. [-15000, 0]; "
-                             "this limit is ignored.")
-        return None
-
-    def flag(self, section, key, default):
-        value = self.config.get(section, {}).get(key, default)
-        if isinstance(value, bool):
-            return value
-        text = str(value).strip().lower()
-        if text in ("true", "yes", "on", "1"):
-            return True
-        if text in ("false", "no", "off", "0"):
-            return False
-        self.problems.append(f"[{section}] {key} = {value!r} should be true or false; using {str(default).lower()}.")
-        return default
-
-
-class StageError(RuntimeError):
-    """A stage move failed; the user has already been told why."""
-
-
-def is_disconnect(exc: Exception) -> bool:
-    """True when the serial link itself failed (cable pulled, controller reset), not a GRBL reply."""
-    return isinstance(exc, (serial.SerialException, OSError)) and not isinstance(exc, TimeoutError)
-
-
-AXES = ("x", "y", "z")
-LARGE_MOVE_UM = 2000.0  # moves bigger than this (2 mm) from the controls ask for confirmation
-
-
-def confirm_large_move(distance_um: float) -> bool:
-    if abs(distance_um) <= LARGE_MOVE_UM:
-        return True
-    return messagebox.askokcancel("Large move", f"This moves the stage {abs(distance_um) / 1000:,.2f} mm.\n\n"
-                                  "That is a long way for this stage. Continue?")
-
-
-def describe_stage_error(exc: Exception, state: str = "") -> str:
-    """Plain-language explanation of a stage failure, with what to do next."""
-    text = str(exc)
-    if "error:9" in text or state.startswith("Alarm"):
-        return ("The stage controller is locked in ALARM mode, so it refuses to move. This happens after a "
-                "limit switch is hit, or at power-up when homing is enabled.\n\n"
-                "Fix: turn on homing (homing = true in the config) and restart, or unlock the controller "
-                "with $X from a G-code terminal. Then restart this app.")
-    if "error:15" in text:
-        return "That move goes past the stage's travel limits. Choose a position inside the stage's range."
-    if is_disconnect(exc):
-        return ("The stage controller disconnected (its USB link dropped).\n\n"
-                "Check the USB cable and the controller's power, then click Reconnect stage in the "
-                "left sidebar. If it keeps happening while the motors move, try a shorter cable, "
-                "a different USB port, or a powered USB hub.")
-    if isinstance(exc, TimeoutError) or "timeout" in text.lower():
-        return ("The stage controller stopped answering. Check its USB cable and power, "
-                "close any other program using the port, then click Reconnect stage.")
-    return f"The stage controller reported: {text}"
-
-
-class EventDispatcher:
-    hardware: Lithographer
-    root: Tk
-    model: Optional[object]  # alignment-marker detector, see alignment_detector.py
-    camera: Optional[CameraModule]
-    red_focus: ProcessedImage
-    uv_focus: ProcessedImage
-    pattern: ProcessedImage
-    pattern_image: Image.Image
-    red_focus_image: Image.Image
-    uv_focus_image: Image.Image
-    solid_red_image: Image.Image
-    image_adjust_position: tuple[float, float, float]
-    border_size: float
-    posterize_strength: Optional[int]
-    red_focus_source: RedFocusSource
-    stage_setpoint: tuple[float, float, float]
-    shown_image: ShownImage
-    autofocus_busy: bool
-    patterning_busy: bool
-    autofocus_on_mode_switch: bool
-    realtime_detection: bool
-    should_abort: bool
-    exposure_time: int
-    patterning_progress: float # ranges from 0.0 to 1.0
-    red_exposure_time: float
-    uv_exposure_time: float
-    exposure_history: List[ExposureLog]
-    chip: Chip
-    auto_snapshot_on_uv: bool
-    snapshot_directory: Path
-    listeners: dict[Event, List[Callable]]
-
-    def __init__(
-        self, 
-        stage: StageController,
-        proj: TkProjector,
-        root: Tk,
-        camera: Optional[CameraModule],
-        red_exposure: float,
-        uv_exposure: float,
-    ):
-        # Hardware components
-        self.hardware = Lithographer(stage, proj)
-        self.camera = camera
-        self.camera_image = None
-        self.root = root
-
-        # Detection model
-        self.model = None
-
-        # Image processing objects
-        self.red_focus = ProcessedImage()
-        self.uv_focus = ProcessedImage()
-        self.pattern = ProcessedImage()
-
-        # Source images
-        self.pattern_image = Image.new("RGB", (1, 1), "black")
-        self.pattern_image_path = ""
-        self.red_focus_image = Image.new("RGB", (1, 1), "black")
-        self.uv_focus_image = Image.new("RGB", (1, 1), "black")
-        self.solid_red_image = Image.new("RGB", (1, 1), "red")
-
-        # Image settings
-        self.image_adjust_position = (0.0, 0.0, 0.0)
-        self.border_size = 0.0
-        self.posterize_strength = None
-        self.red_focus_source = RedFocusSource.SOLID  # visible from launch; IMAGE starts empty
-        self.red_brightness = 1.0  # 0.02-1.0: dims the red focus image so long camera exposures don't wash out
-        self._last_stage_error_at = 0.0
-        self.stage_connected = True
-        self.stage_limits: dict[str, tuple[float, float]] = {}  # axis -> (min, max) in µm; empty = no limits
-        self.stage_idle_timeout = 20.0  # seconds to wait for the stage to stop before exposing
-
-        # Stage control
-        self.stage_setpoint = (0.0, 0.0, 0.0)
-
-        # Status flags
-        self.shown_image = ShownImage.CLEAR
-        self.autofocus_busy = False
-        self.patterning_busy = False
-        self.autofocus_on_mode_switch = False
-        self.realtime_detection = False
-        self.should_abort = False
-
-        # Exposure settings and progress
-        self.exposure_time = 8000
-        self.patterning_progress = 0.0
-        self.red_exposure_time = red_exposure
-        self.uv_exposure_time = uv_exposure
-
-        # History and logging
-        self.exposure_history = []
-        self.chip = Chip([ChipLayer([])])
-
-        # Snapshot settings
-        self.auto_snapshot_on_uv = True
-        self.snapshot_directory = Path("stepper_captures")
-        self.snapshot_directory.mkdir(exist_ok=True)
-
-        # Event handling
-        self.listeners = dict()
-        self.add_event_listener(Event.SHOWN_IMAGE_CHANGED, lambda: self._update_projector())
-
-    def load_chip(self, path: str):
-        print(f"Loading chip at {path!r}")
-        with open(path, "r") as f:
-            d = json.load(f)
-        self.chip = Chip.from_disk(d)
-        self.on_event(Event.CHIP_CHANGED)
-
-    def new_chip(self):
-        # TODO: Prompt user to save old chip??
-        self.chip = Chip([ChipLayer([])])
-        self.on_event(Event.CHIP_CHANGED)
-
-    def add_chip_layer(self):
-        self.chip.layers.append(ChipLayer([]))
-        self.on_event(Event.CHIP_CHANGED)
-
-    def save_chip(self, path: str):
-        with open(path, "w") as f:
-            json.dump(self.chip.to_disk(), f)
-
-    def delete_chip_exposure(self, layer: int, ex: int):
-        self.chip.layers[layer].exposures.pop(ex)
-        print(f"Deleted exposure {layer} {ex}")
-        self.on_event(Event.CHIP_CHANGED)
-
-    @property
-    def current_image(self) -> Optional[Image.Image]:
-        match self.shown_image:
-            case ShownImage.CLEAR:
-                return None
-            case ShownImage.RED_FOCUS:
-                image = self.red_focus.processed()
-                if self.red_brightness < 0.999:
-                    scale = self.red_brightness
-                    image = image.point(lambda v: int(v * scale + 0.5))
-                return image
-            case ShownImage.UV_FOCUS:
-                return self.uv_focus.processed()
-            case ShownImage.PATTERN:
-                return self.pattern.processed()
-
-    def _update_projector(self):
-        img = self.current_image
-        if img is None:
-            self.hardware.projector.clear()
-        else:
-            self.hardware.projector.show(img)
-
-    def _refresh_pattern(self):
-        self.pattern.update(
-            image=self.pattern_image,
-            settings=ImageProcessSettings(
-                posterization=self.posterize_strength,
-                color_channels=(False, False, True),
-                flatfield=None,
-                size=self.hardware.projector.size(),
-                image_adjust=self.image_adjust_position,
-                border_size=self.border_size,
-            ),
-        )
-
-        if self.red_focus_source in (RedFocusSource.PATTERN, RedFocusSource.INV_PATTERN):
-            self._refresh_red_focus()
-
-        # TODO:
-        # Image adjust, resizing, and flatfield correction are performed *AFTER SLICING*
-
-        self.on_event(Event.PATTERN_IMAGE_CHANGED)
-
-    def set_red_brightness(self, fraction: float):
-        self.red_brightness = max(0.02, min(1.0, float(fraction)))
-        if self.shown_image == ShownImage.RED_FOCUS:
-            self.on_event(Event.SHOWN_IMAGE_CHANGED)
-
-    def set_red_focus_source(self, source: RedFocusSource):
-        self.red_focus_source = source
-        self._refresh_red_focus()
-
-    def _red_focus_source(self) -> Image.Image:
-        match self.red_focus_source:
-            case RedFocusSource.IMAGE:
-                return self.red_focus_image
-            case RedFocusSource.SOLID:
-                return self.solid_red_image
-            case RedFocusSource.PATTERN:
-                return self.pattern_image.getchannel("B").convert("RGBA")
-            case RedFocusSource.INV_PATTERN:
-                return ImageOps.invert(self.pattern_image.getchannel("B")).convert("RGBA")
-
-    def _refresh_red_focus(self):
-        if self.hardware.projector.size() != self.solid_red_image.size:
-            self.solid_red_image = Image.new("RGB", self.hardware.projector.size(), "red")
-
-        img = self._red_focus_source()
-
-        self.red_focus.update(
-            image=img,
-            settings=ImageProcessSettings(
-                posterization=self.posterize_strength,
-                flatfield=None,
-                color_channels=(True, False, False),
-                size=self.hardware.projector.size(),
-                image_adjust=self.image_adjust_position,
-                border_size=self.border_size,
-            ),
-        )
-
-        if self.shown_image == ShownImage.RED_FOCUS:
-            self.on_event(Event.SHOWN_IMAGE_CHANGED)
-
-    def _refresh_uv_focus(self):
-        self.uv_focus.update(
-            image=self.uv_focus_image,
-            settings=ImageProcessSettings(
-                posterization=self.posterize_strength,
-                flatfield=None,
-                color_channels=(False, False, True),
-                size=self.hardware.projector.size(),
-                image_adjust=self.image_adjust_position,
-                border_size=0.0,
-            ),
-        )
-
-        if self.shown_image == ShownImage.UV_FOCUS:
-            self.on_event(Event.SHOWN_IMAGE_CHANGED)
-
-    def set_posterize_strength(self, strength: Optional[int]):
-        self.posterize_strength = strength
-        self._refresh_red_focus()
-        self._refresh_uv_focus()
-        self._refresh_pattern()
-
-    def set_border_size(self, border_size: float):
-        self.border_size = border_size
-        self._refresh_red_focus()
-        self._refresh_uv_focus()
-        self._refresh_pattern()
-
-    def set_shown_image(self, shown_image: ShownImage):
-        print(f"set_shown_image({shown_image})")
-        self.shown_image = shown_image
-        self.on_event(Event.SHOWN_IMAGE_CHANGED)
-
-    def _tell_stage_problem(self, title: str, text: str):
-        # One dialog per burst: autofocus, tiling and repeated clicks issue many moves in a row.
-        if time.monotonic() - self._last_stage_error_at > 3.0:
-            messagebox.showerror(title, text)
-        self._last_stage_error_at = time.monotonic()
-
-    def _stage_move_to(self, coords: dict[str, float]):
-        if not self.stage_connected:
-            self._tell_stage_problem("Stage disconnected", "The stage is disconnected, so it cannot move.\n\n"
-                                     "Check its USB cable and power, then click Reconnect stage in the left sidebar.")
-            raise StageError("stage disconnected")
-        for axis, value in coords.items():
-            low, high = self.stage_limits.get(axis, (-math.inf, math.inf))
-            if not low <= value <= high:
-                self._tell_stage_problem("Outside the stage's range",
-                                         f"{axis.upper()} {value:,.0f} µm is outside the allowed range "
-                                         f"{low:,.0f} to {high:,.0f} µm, so the stage was not moved.\n\n"
-                                         f"The range is set by {axis}-limits under [stage] in the config file.")
-                raise StageError(f"{axis} outside limits")
-        try:
-            self.hardware.stage.move_to(coords)
-        except Exception as exc:
-            state = ""
-            try:
-                state = self.hardware.stage.state_name()
-            except Exception:
-                pass
-            print(f"Stage move failed: {exc}")
-            if is_disconnect(exc):
-                self.set_stage_connected(False)
-            self._tell_stage_problem("Stage did not move", describe_stage_error(exc, state))
-            raise StageError(str(exc)) from exc
-
-    def set_stage_connected(self, connected: bool):
-        if connected != self.stage_connected:
-            self.stage_connected = connected
-            self.on_event(Event.STAGE_CONNECTION_CHANGED)
-            self.on_event(Event.MOVEMENT_LOCK_CHANGED)
-
-    def sync_stage_position(self):
-        """Take the displayed position from the controller (it may not have started at 0, 0, 0)."""
-        try:
-            position = self.hardware.stage.position_um()
-        except Exception as exc:
-            print(f"Could not read stage position: {exc}")
-            return
-        if position is not None:
-            self.stage_setpoint = tuple(float(v) for v in position)
-            self.on_event(Event.STAGE_POSITION_CHANGED)
-
-    def reconnect_stage(self) -> bool:
-        if self.patterning_busy or self.autofocus_busy:
-            messagebox.showinfo("Stage busy", "Wait for the exposure or autofocus to finish first.")
-            return False
-        try:
-            self.hardware.stage.reconnect()
-        except Exception as exc:
-            print(f"Stage reconnect failed: {exc}")
-            messagebox.showerror("Stage still disconnected",
-                                 f"Could not reconnect to the stage controller:\n{exc}\n\n"
-                                 "Check the USB cable and power. If the controller now shows up on a "
-                                 "different port, restart the app and pick it in the setup window.")
-            return False
-        self.set_stage_connected(True)
-        self.sync_stage_position()
-        return True
-
-    def move_absolute(self, coords: dict[str, float]):
-        self._stage_move_to(coords)
-        x = coords.get("x", self.stage_setpoint[0])
-        y = coords.get("y", self.stage_setpoint[1])
-        z = coords.get("z", self.stage_setpoint[2])
-        self.stage_setpoint = (x, y, z)
-        self.on_event(Event.STAGE_POSITION_CHANGED)
-
-    def move_relative(self, coords: dict[str, float]):
-        target = (
-            coords.get("x", 0) + self.stage_setpoint[0],
-            coords.get("y", 0) + self.stage_setpoint[1],
-            coords.get("z", 0) + self.stage_setpoint[2],
-        )
-        self._stage_move_to({"x": target[0], "y": target[1], "z": target[2]})
-        self.stage_setpoint = target
-        self.on_event(Event.STAGE_POSITION_CHANGED)
-
-    def wait_for_stage_idle(self, timeout: float = 20.0) -> bool:
-        """Wait (keeping the window responsive) until the stage reports it has stopped."""
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if self.hardware.stage.is_idle():
-                return True
-            self.non_blocking_delay(0.1)
-        return False
-
-    def set_use_solid_red(self, use: bool):
-        self.use_solid_red = use
-        self.set_shown_image(ShownImage.RED_FOCUS)
-        self._refresh_red_focus()
-
-    def set_pattern_image(self, img: Image.Image, path: str):
-        self.pattern_image = img
-        self.pattern_image_path = path
-        self._refresh_pattern()
-
-    def set_red_focus_image(self, img: Image.Image):
-        self.red_focus_image = img
-        self._refresh_red_focus()
-
-    def set_uv_focus_image(self, img: Image.Image):
-        self.uv_focus_image = img
-        self._refresh_uv_focus()
-
-    def set_patterning_busy(self, busy: bool):
-        self.patterning_busy = busy
-        self.on_event(Event.MOVEMENT_LOCK_CHANGED)
-        self.on_event(Event.PATTERNING_BUSY_CHANGED)
-
-    def set_progress(self, pattern_progress: float, exposure_progress: float):
-        self.patterning_progress = pattern_progress
-        self.exposure_progress = exposure_progress
-        self.on_event(Event.EXPOSURE_PATTERN_PROGRESS_CHANGED)
-
-    def set_latest_image(self, camera_image):
-        self.camera_image = camera_image
-
-    def set_autofocus_busy(self, busy):
-        self.autofocus_busy = busy
-        self.on_event(Event.MOVEMENT_LOCK_CHANGED)
-
-    def abort_patterning(self):
-        self.should_abort = True
-        print("Aborting patterning")
-
-    def in_uv(self):
-        return self.shown_image in (ShownImage.PATTERN, ShownImage.UV_FOCUS)
-
-    def home_stage(self):
-        try:
-            self.hardware.stage.home()
-            self.non_blocking_delay(1.0)
-            deadline = time.monotonic() + 120.0
-            while True:
-                self.non_blocking_delay(1.0)
-                idle, pos = self.hardware.stage._query_state()
-                if idle:
-                    break
-                if time.monotonic() > deadline:
-                    raise TimeoutError("homing did not finish within 2 minutes")
-        except Exception as exc:
-            print(f"Homing failed: {exc}")
-            messagebox.showerror("Homing failed", "The stage could not complete homing, so positions are not "
-                                 "referenced to the limit switches.\n\n" + describe_stage_error(exc))
-            return
-
-        self.stage_setpoint = (pos[0] * 1000.0, pos[1] * 1000.0, pos[2] * 1000.0)
-        print(f"Homed stage to {self.stage_setpoint}")
-        self.on_event(Event.STAGE_POSITION_CHANGED)
-
-    def set_image_position(self, x, y, t):
-        self.image_adjust_position = (x, y, t)
-        self._refresh_red_focus()
-        self._refresh_uv_focus()
-        self._refresh_pattern()
-        self.on_event(Event.IMAGE_ADJUST_CHANGED)
-
-    @property
-    def image_position(self):
-        return self.image_adjust_position
-
-    @property
-    def movement_lock(self):
-        if self.patterning_busy or self.autofocus_busy:
-            return MovementLock.LOCKED
-        # elif (self.shown_image == ShownImage.UV_FOCUS or self.shown_image == ShownImage.PATTERN):
-        #     return MovementLock.XY_LOCKED
-        else:
-            return MovementLock.UNLOCKED
-
-    def on_event(self, event: Event, *args, **kwargs):
-        if event not in self.listeners:
-            return
-
-        for listener in self.listeners[event]:
-            listener(*args, **kwargs)
-
-    def on_event_cb(self, event: Event, *args, **kwargs):
-        return lambda: self.on_event(event, *args, **kwargs)
-
-    def add_event_listener(self, event: Event, listener: Callable):
-        if event not in self.listeners:
-            self.listeners[event] = []
-        self.listeners[event].append(listener)
-
-    def begin_patterning(self):
-        if self.patterning_busy or self.autofocus_busy:
-            return
-        if not self.pattern_image_path:
-            messagebox.showinfo("Choose a pattern", "Select a pattern image before starting an exposure.")
-            return
-        if not isinstance(self.exposure_time, (int, float)) or not math.isfinite(self.exposure_time) or self.exposure_time <= 0:
-            messagebox.showerror("Exposure time", "Enter a positive exposure time in milliseconds.")
-            return
-        # TODO: Update patterning preview
-
-        print("Patterning at ", self.stage_setpoint)
-        duration = self.exposure_time
-        print(f"Patterning 1 tiles for {duration}ms\nTotal time: {str(round((duration) / 1000))}s")
-
-        # TODO: Image slicing.
-        # Note that flatfield correction and image adjustment should be applied *after* slicing
-        img = self.pattern.processed()
-
-        # Motion commands return as soon as they are queued, so the stage can still be
-        # travelling here (e.g. right after "Go to these coordinates"). Exposing then smears the pattern.
-        if not self.stage_connected:
-            if not messagebox.askokcancel("Stage disconnected", "The stage is disconnected, so the app cannot check "
-                                          "that it has stopped moving.\n\nExpose anyway at the current position?"):
-                return
-            stage_ready = True
-        else:
-            try:
-                stage_ready = self.wait_for_stage_idle(self.stage_idle_timeout)
-            except Exception as exc:
-                if is_disconnect(exc):
-                    self.set_stage_connected(False)
-                messagebox.showerror("Exposure not started", describe_stage_error(exc))
-                return
-        if not stage_ready:
-            state = self.hardware.stage.state_name()
-            if state.startswith("Alarm"):
-                detail = describe_stage_error(RuntimeError(state), state)
-            else:
-                detail = (f"The controller still reports '{state}' after {self.stage_idle_timeout:g} seconds. Wait for the stage to "
-                          "settle and try again. If it stays like this, check the controller.")
-            messagebox.showerror("Exposure not started", "The stage has not stopped moving, so the exposure "
-                                 "was not started.\n\n" + detail)
-            return
-
-        self.set_patterning_busy(True)
-        try:
-            try:
-                self.hardware.projector.show(img)
-                end_time = time.time() + duration / 1000.0
-                while time.time() < end_time:
-                    progress = 1.0 - ((end_time - time.time()) * 1000 / duration)
-                    self.set_progress(0.0, progress)
-                    self.root.update()
-                    if self.should_abort:
-                        break
-            finally:
-                # Never leave the exposure light on if anything above fails.
-                self.set_shown_image(ShownImage.CLEAR)
-                self.root.update()  # Force image to stop being displayed ASAP
-            self.set_progress(1.0, 1.0)
-
-            log = ExposureLog(
-                datetime.now(),
-                self.pattern_image_path,
-                self.stage_setpoint,
-                duration,
-                self.should_abort,
-            )
-            self.exposure_history.append(log)
-            self.chip.layers[-1].exposures.append(log)
-            self.on_event(Event.CHIP_CHANGED)
-        finally:
-            # Whatever happens above, never leave the stage and exposure controls locked.
-            self.set_patterning_busy(False)
-            if self.should_abort:
-                print("Patterning aborted")
-                self.should_abort = False
-
-    def non_blocking_delay(self, t: float):
-        start = time.time()
-        while time.time() - start < t:
-            self.root.update()
-
-    def enter_red_mode(self, mode_switch_autofocus=True):
-        print("enter_red_mode")
-        self.set_shown_image(ShownImage.RED_FOCUS)
-        if self.camera:
-            self.camera.setExposureTime(self.red_exposure_time)
-        if mode_switch_autofocus and self.autofocus_on_mode_switch:
-            self.autofocus(blue_only=False)
-        self.on_event(Event.MOVEMENT_LOCK_CHANGED)
-
-    def enter_uv_mode(self, mode_switch_autofocus=True):
-        if self.auto_snapshot_on_uv:
-            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            filename = self.snapshot_directory / f"uv_mode_entry_{timestamp}.png"
-            self.on_event(Event.SNAPSHOT, str(filename))
-
-        if self.camera:
-            self.camera.setExposureTime(self.uv_exposure_time)
-        if (
-            mode_switch_autofocus
-            and not self.autofocus_busy
-            and self.autofocus_on_mode_switch
-        ):
-            # UV mode usually needs about -70 to be in focus compared to red mode
-            #self.move_relative({"z": -85.0})
-            pass
-
-        # self.set_shown_image(ShownImage.UV_FOCUS)
-        self.set_shown_image(ShownImage.CLEAR) # enter uv mode: don't project uv
-
-        if mode_switch_autofocus and self.autofocus_on_mode_switch:
-            self.non_blocking_delay(2.0)
-            self.autofocus(blue_only=True)
-
-        self.on_event(Event.MOVEMENT_LOCK_CHANGED)
-
-    def autofocus(self, blue_only, log=False, interactive=False):
-        """Find the sharpest Z near the current position and move there.
-
-        Samples the focus score at the start and 20 µm either side to pick a direction,
-        climbs in 10 µm steps until the score drops, scans ±8 µm around the best point in
-        2 µm steps, and finally moves to the best Z it measured. interactive=True (the
-        Autofocus button) explains failures in a dialog; automatic runs only log them.
-        """
-        def tell(message):
-            print(f"Autofocus: {message}")
-            if interactive:
-                messagebox.showinfo("Autofocus", message)
-
-        if not self.camera or self.camera_image is None:
-            tell("Autofocus needs a live camera image. Connect the camera first.")
-            return
-        if self.autofocus_busy:
-            print("Skipping nested autofocus!")
-            return
-        if log:
-            os.makedirs('aftest', exist_ok=True)
-            log_file = open('aftest/log.csv', 'w')
-        counter = 0
-        samples: dict[float, float] = {}
-
-        def sample_focus():
-            def do_thing():
-                self.non_blocking_delay(0.1)
-                if self.camera_image is None:
-                    raise RuntimeError("Camera feed lost during autofocus")
-                return compute_focus_score(self.camera_image, blue_only=blue_only)
-            focus_score = sorted([do_thing() for _ in range(3)])[1]
-            nonlocal counter
-            if log:
-                log_file.write(f'{counter},{self.stage_setpoint[2]},{focus_score}\n')
-                cv2.imwrite(f'aftest/img{counter}.png', self.camera_image)
-            counter += 1
-            samples[round(self.stage_setpoint[2], 3)] = focus_score
-            return focus_score
-
-        def step(dz, settle=0.5):
-            self.move_relative({"z": dz})
-            self.non_blocking_delay(settle)
-            return sample_focus()
-
-        print("Starting autofocus")
-        self.set_autofocus_busy(True)
-        start_z = self.stage_setpoint[2]
-        try:
-            self.non_blocking_delay(1.0)
-            mid_score = sample_focus()
-            neg_score = step(-20.0, 1.0)
-            pos_score = step(40.0, 1.0)
-            self.move_relative({"z": -20.0})
-            self.non_blocking_delay(1.0)
-
-            if neg_score < mid_score < pos_score:
-                direction = 1.0    # sharper towards +Z
-            elif neg_score > mid_score > pos_score:
-                direction = -1.0   # sharper towards -Z
-            elif neg_score < mid_score and pos_score < mid_score:
-                direction = 0.0    # already close to focus
-            else:
-                tell("Autofocus could not tell which way is sharper. Focus roughly by hand first, and "
-                     "project Solid red or a pattern with sharp edges so the camera has detail to measure.")
-                return
-
-            if direction:
-                last = mid_score
-                for _ in range(30):  # coarse climb until the score drops
-                    score = step(10.0 * direction)
-                    if score < last:
-                        break
-                    last = score
-
-            # Fine scan ±8 µm around the best point so far, then go to the best measurement.
-            best_z = max(samples, key=samples.get)
-            self.move_relative({"z": best_z - 8.0 - self.stage_setpoint[2]})
-            self.non_blocking_delay(0.5)
-            sample_focus()
-            for _ in range(8):
-                step(2.0)
-            best_z = max(samples, key=samples.get)
-            self.move_relative({"z": best_z - self.stage_setpoint[2]})
-            self.non_blocking_delay(0.5)
-            print(f"Autofocus finished: Z {start_z:.1f} -> {best_z:.1f} µm (score {samples[best_z]:.3f})")
-        except StageError:
-            pass  # the stage error dialog has already explained what happened
-        except RuntimeError as exc:
-            tell(f"Autofocus stopped: {exc}")
-        finally:
-            self.set_autofocus_busy(False)
-            if log:
-                log_file.close()
-
-    def initialize_alignment(self, config: LithographerConfig):
-        self.config = config
-        self.realtime_detection = config.alignment.enabled
-        # Load the model even if live detection is off by default (Auto-align and tiling use it).
-        self.model = load_marker_detector(config.alignment.model_path)
-        print(f"Alignment model: {getattr(self.model, 'path', 'not available')}")
-
-    def set_snapshot_directory(self, directory: Path):
-        self.snapshot_directory = directory
-        self.snapshot_directory.mkdir(exist_ok=True)
-
-
-class SnapshotFrame:
-    """
-    Presents a frame with a filename entry and a button to save screenshots of the current camera view.
-    """
-
-    def __init__(self, parent, enable, event_dispatcher: EventDispatcher):
-        self.event_dispatcher = event_dispatcher
-        self.frame = ttk.Frame(parent)
-        self.frame.grid(row=1, column=0)
-
-        state = "normal" if enable else "disable"
-
-        # TODO: Allow %X, %Y, %Z formats to save position on chip
-        self.name_var = StringVar(value="output_%T.png")
-        self.name_var.trace_add("write", lambda _a, _b, _c: self._refresh_name_preview())
-
-        self.counter = 0
-
-        ttk.Label(self.frame, text="Photo file name  (%T = date and time, %C = counter)",
-                  bootstyle="secondary").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        self.name_entry = ttk.Entry(self.frame, textvariable=self.name_var, state=state)
-        self.name_entry.grid(row=1, column=0, sticky="ew", padx=(0, 8))
-        self.frame.columnconfigure(0, weight=1)
-
-        self.name_preview = ttk.Label(self.frame, wraplength=480, bootstyle="secondary")
-        self.name_preview.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.last_saved = ttk.Label(self.frame, text="", wraplength=480, bootstyle="success")
-        self.last_saved.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 0))
-
-        def on_snapshot_button():
-            event_dispatcher.on_event(Event.SNAPSHOT, self._next_filename())
-            self.counter += 1
-            self._refresh_name_preview()
-
-        self.button = ttk.Button(self.frame, text="Save camera photo", command=on_snapshot_button, state=state)
-        self.button.grid(row=1, column=1)
-
-        self._refresh_name_preview()
-
-    def _next_filename(self):
-        counter_str = str(self.counter)
-        time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        name = self.name_var.get().strip() or "snapshot_%T.png"
-        name = name.replace("%C", counter_str).replace("%c", counter_str)
-        name = name.replace("%T", time_str).replace("%t", time_str)
-        path = Path(name)
-        safe = _INVALID_FILENAME_CHARS.sub("-", path.name) or f"snapshot_{time_str}.png"
-        path = path.with_name(safe)
-        if not path.is_absolute():
-            path = self.event_dispatcher.snapshot_directory / path
-        return str(path)
-
-    def _refresh_name_preview(self):
-        self.name_preview.configure(text=f"Next file: {self._next_filename()}")
-
-
-class CameraFrame:
-    def __init__(self, parent, event_dispatcher, c, camera_scale):
-        self.frame = ttk.Labelframe(parent, text="Camera", padding=16)
-        self.frame.columnconfigure(0, weight=1)
-        self.label = ttk.Label(self.frame, text="Connect your microscope camera\n\nChoose a device in Settings to see a live preview.", anchor="center")
-        self.label.grid(row=0, column=0, sticky="nsew", ipady=70)
-        self.status = ttk.Label(self.frame, text="Not connected", wraplength=620, bootstyle="secondary")
-        self.status.grid(row=1, column=0, sticky="w", pady=(12, 4))
-        self.focus_score_label = ttk.Label(self.frame, text="Focus · —", bootstyle="secondary")
-        self.focus_score_label.grid(row=3, column=0, sticky="w")
-        self.reconnect_button = ttk.Button(self.frame, text="Reconnect camera", bootstyle="warning", command=self.reconnect)
-        add_tooltip(self.reconnect_button, "Try the camera again with the same settings. Close other camera apps "
-                    "(Zoom, Teams, OBS, the Windows Camera app) first.")
-        self.snapshot = SnapshotFrame(self.frame, True, event_dispatcher)
-        self.snapshot.frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
-        self.event_dispatcher = event_dispatcher
-        self.snapshots_pending = queue.Queue()
-        event_dispatcher.add_event_listener(Event.SNAPSHOT, lambda filename: self.snapshots_pending.put(filename))
-        self.gui_img = None
-        self.camera = c
-        self.pending_frame = None
-        self.poll_id = None
-        self.generation = 0
-        self.last_received = 0
-
-    def _on_new_frame(self):
-        self.status.configure(text=getattr(self.camera, "status", "Camera disabled" if not self.camera else "Vendor camera connected"))
-        packet, self.pending_frame = self.pending_frame, None
-        if getattr(self.camera, "state", "") == "error":
-            packet = None
-            self.event_dispatcher.camera_image = None
-            self.label.configure(image="", text="Camera connection failed · see details below")
-            self.focus_score_label.configure(text="Focus · unavailable")
-        if getattr(self.camera, "state", "") != "error" and self.last_received and time.monotonic() - self.last_received > 2:
-            self.event_dispatcher.camera_image = None
-            self.label.configure(image="", text="Camera feed interrupted · click Reconnect camera")
-            self.focus_score_label.configure(text="Focus · unavailable")
-        if packet is not None:
-            image, dimensions, format = packet
-            self.last_received = time.monotonic()
-            red_score = compute_focus_score(image, blue_only=False)
-            blue_score = compute_focus_score(image, blue_only=True)
-            self.focus_score_label.configure(text=f"Focus · Red {red_score:.2f}   UV {blue_score:.2f}")
-            try:
-                filename = self.snapshots_pending.get_nowait()
-                saved = write_rgb_image(filename, image)
-                self.snapshot.last_saved.configure(text=f"Saved {saved}")
-                print(f"Saved snapshot {saved}")
-            except queue.Empty:
-                pass
-            except (OSError, cv2.error) as exc:
-                self.snapshot.last_saved.configure(text=f"Snapshot failed: {exc}")
-                print(f"Snapshot failed: {exc}")
-            self.gui_camera_preview(image, dimensions)
-        elif self.event_dispatcher.camera_image is None:
-            while not self.snapshots_pending.empty():
-                self.snapshots_pending.get_nowait()
-        self.snapshot.button.configure(state="normal" if self.event_dispatcher.camera_image is not None else "disabled")
-        needs_reconnect = isinstance(self.camera, Webcam) and (
-            getattr(self.camera, "state", "") == "error" or self.event_dispatcher.camera_image is None and self.last_received)
-        if needs_reconnect and not self.reconnect_button.winfo_ismapped():
-            self.reconnect_button.grid(row=2, column=0, sticky="w", pady=(4, 8))
-        elif not needs_reconnect and self.reconnect_button.winfo_ismapped():
-            self.reconnect_button.grid_remove()
-        self.poll_id = self.frame.after(66, self._on_new_frame)
-
-    def start(self):
-        if self.camera:
-            generation = self.generation
-            def callback(image, dimensions, format):
-                if generation == self.generation:
-                    self.pending_frame = (image, dimensions, format)
-            self.camera.setStreamCaptureCallback(callback)
-            try:
-                if not self.camera.open() or not self.camera.startStreamCapture():
-                    self.status.configure(text="Camera failed to start. Open Settings to reconnect.")
-            except Exception as exc:
-                self.status.configure(text=f"Camera failed: {exc}")
-        if self.poll_id is None:
-            self._on_new_frame()
-
-    def reconnect(self):
-        dispatcher = self.event_dispatcher
-        if dispatcher.patterning_busy or dispatcher.autofocus_busy:
-            messagebox.showinfo("Camera busy", "Wait for the exposure or autofocus to finish first.")
-            return
-        if isinstance(self.camera, Webcam):
-            self.replace(Webcam(settings=self.camera.settings))
-
-    def replace(self, camera):
-        self.generation += 1
-        if self.camera:
-            self.camera.close()
-        self.camera = camera
-        self.event_dispatcher.camera = camera
-        self.event_dispatcher.config.camera = camera
-        self.event_dispatcher.camera_image = None
-        self.pending_frame = None
-        self.last_received = 0
-        self.label.configure(image="", text="Connecting…" if camera else "Camera disabled")
-        self.focus_score_label.configure(text="Focus · —")
-        self.start()
-
-    def cleanup(self):
-        self.generation += 1
-        if self.poll_id:
-            self.frame.after_cancel(self.poll_id)
-            self.poll_id = None
-        if self.camera:
-            self.camera.close()
-
-    def gui_camera_preview(self, camera_image, dimensions):
-        # Measurement and snapshots always use the original unannotated image.
-        self.event_dispatcher.set_latest_image(camera_image)
-        model = self.event_dispatcher.model
-        if model and self.event_dispatcher.realtime_detection:
-            # Detection takes tens of ms; run it twice a second and reuse the boxes in between,
-            # so the preview stays smooth.
-            now = time.monotonic()
-            if now - getattr(self, "_last_detection_at", 0.0) > 0.5:
-                self._last_detection_at = now
-                self._last_marks, _ = detect_alignment_markers(model, camera_image)
-            camera_image = camera_image.copy()
-            for corner0, corner1 in getattr(self, "_last_marks", []):
-                cv2.rectangle(camera_image, corner0, corner1, (0, 255, 0), max(2, camera_image.shape[1] // 400))
-        width = max(320, min(760, self.frame.winfo_width() - 36))
-        image = Image.fromarray(camera_image)
-        image.thumbnail((width, 360), Image.Resampling.LANCZOS)
-        self.gui_img = image_to_tk_image(image)
-        self.label.configure(image=self.gui_img, text="")
-
-class StagePositionFrame:
-    """Explicit movement distance and direction, with the same stage interlocks."""
-    def __init__(self, parent, event_dispatcher, uvmode):
-        self.frame = ttk.Labelframe(parent, text="Move the stage", padding=20)
-        self.event_dispatcher = event_dispatcher
-        self.xy_widgets, self.z_widgets = [], []
-        self.position_intputs = []
-        self.position_frame = ttk.Frame(self.frame)
-        self.position_frame.grid(row=0, column=0, sticky="ew")
-        for i, axis in enumerate(('X', 'Y', 'Z')):
-            ttk.Label(self.position_frame, text=f"{axis} (µm)", bootstyle="secondary").grid(row=0, column=i, sticky="w", padx=4)
-            field = FloatEntry(self.position_frame, default=0)
-            field.widget.configure(width=8)
-            field.widget.grid(row=1, column=i, padx=4, pady=8, sticky="ew")
-            self.position_intputs.append(field)
-            (self.xy_widgets if i < 2 else self.z_widgets).append(field.widget)
-        def move_absolute():
-            try:
-                values = [field.get() for field in self.position_intputs]
-                if not all(math.isfinite(v) for v in values):
-                    raise ValueError()
-                if not confirm_large_move(max(abs(v - c) for v, c in zip(values, event_dispatcher.stage_setpoint))):
-                    return
-                event_dispatcher.move_absolute(dict(zip(('x', 'y', 'z'), values)))
-            except (ValueError, tkinter.TclError):
-                messagebox.showerror("Position", "Enter a valid number for each position.")
-        self.set_position_button = ttk.Button(self.frame, text="Go to these coordinates", command=move_absolute, bootstyle="secondary-outline")
-        self.set_position_button.grid(row=1, column=0, sticky="ew", pady=(0, 20))
-        ttk.Separator(self.frame).grid(row=2, column=0, sticky="ew", pady=(0, 16))
-        step = ttk.Frame(self.frame)
-        step.grid(row=3, column=0, sticky="ew")
-        ttk.Label(step, text="Step size (µm)").grid(row=0, column=0, sticky="w", padx=(0, 12))
-        self.step_size = StringVar(value="10")
-        ttk.Entry(step, textvariable=self.step_size, width=7).grid(row=0, column=1)
-        presets = ttk.Frame(self.frame)
-        presets.grid(row=4, column=0, sticky="ew", pady=12)
-        for i, amount in enumerate((1, 10, 50, 250)):
-            ttk.Radiobutton(presets, text=str(amount), variable=self.step_size, value=str(amount), bootstyle="toolbutton").grid(row=0, column=i, padx=3, sticky="ew")
-            presets.columnconfigure(i, weight=1)
-        def jog(axis, direction):
-            try:
-                distance = float(self.step_size.get())
-                if not math.isfinite(distance) or distance <= 0:
-                    raise ValueError()
-                if not confirm_large_move(distance):
-                    return
-                event_dispatcher.move_relative({axis: direction * distance})
-            except ValueError:
-                messagebox.showerror("Movement distance", "Enter a positive distance in micrometers.")
-        controls = ttk.Frame(self.frame)
-        controls.grid(row=5, column=0, pady=(8, 16))
-        if not uvmode:
-            for text, axis, direction, row, column in [('Y+', 'y', 1, 0, 1), ('X-', 'x', -1, 1, 0), ('X+', 'x', 1, 1, 2), ('Y-', 'y', -1, 2, 1)]:
-                button = ttk.Button(controls, text=text, width=5, command=lambda a=axis, d=direction: jog(a, d), bootstyle="secondary-outline")
-                button.grid(row=row, column=column, padx=3, pady=3)
-                self.xy_widgets.append(button)
-        focus = ttk.Frame(self.frame)
-        focus.grid(row=6, column=0, sticky="ew")
-        ttk.Label(focus, text="Focus (Z)", bootstyle="secondary").pack(side="left", padx=(0, 12))
-        for label, direction in [('Z-  (farther)', -1), ('Z+  (closer)', 1)]:
-            button = ttk.Button(focus, text=label, command=lambda d=direction: jog('z', d), bootstyle="secondary-outline")
-            button.pack(side="left", fill="x", expand=True, padx=4)
-            self.z_widgets.append(button)
-        shortcuts = ttk.Frame(self.frame)
-        shortcuts.grid(row=7, column=0, sticky="ew", pady=(20, 0))
-        self.shortcuts = []
-        for label, coords in [('Chip origin', {'x': -14500., 'y': -13500., 'z': -13844.}), ('Load / unload', {'x': -14500., 'y': -14500., 'z': -14500.})]:
-            def go(label=label, c=coords):
-                if confirm_stage_move(label, c):
-                    event_dispatcher.move_absolute(c)
-            button = ttk.Button(shortcuts, text=label, bootstyle="secondary-link", command=go)
-            button.pack(side="left", padx=3)
-            self.shortcuts.append(button)
-        def on_lock_change():
-            lock = event_dispatcher.movement_lock if event_dispatcher.stage_connected else MovementLock.LOCKED
-            for widget in self.xy_widgets + [self.set_position_button]:
-                widget.configure(state="normal" if lock == MovementLock.UNLOCKED else "disabled")
-            for widget in self.z_widgets:
-                widget.configure(state="disabled" if lock == MovementLock.LOCKED else "normal")
-            for widget in self.shortcuts:
-                widget.configure(state="normal" if lock == MovementLock.UNLOCKED and event_dispatcher.hardware.stage.has_homing() else "disabled")
-        def on_position_change():
-            for field, value in zip(self.position_intputs, event_dispatcher.stage_setpoint):
-                field.set(value)
-        event_dispatcher.add_event_listener(Event.MOVEMENT_LOCK_CHANGED, on_lock_change)
-        event_dispatcher.add_event_listener(Event.STAGE_POSITION_CHANGED, on_position_change)
-        on_lock_change()
-
-class ImageAdjustFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent)
-
-        self.position_intputs = []
-        self.step_size_intputs = []
-
-        self.lockable_widgets = []
-
-        # Absolute
-
-        self.absolute_frame = ttk.Labelframe(self.frame, text="Shift / rotate the projected image")
-        self.absolute_frame.grid(row=0, column=0)
-
-        for i, coord in ((0, "x"), (1, "y"), (2, "ϴ")):
-            if i == 0 or i == 1:
-                self.position_intputs.append(
-                    IntEntry(parent=self.absolute_frame, default=0)
-                )
-            else:
-                self.position_intputs.append(
-                    FloatEntry(parent=self.absolute_frame, default=0)
-                )
-            self.position_intputs[-1].widget.grid(row=0, column=i)
-
-        def callback_set():
-            x, y, t = self._position()
-            event_dispatcher.set_image_position(x, y, t)
-
-        self.set_position_button = ttk.Button(self.absolute_frame, text="Apply position",
-                                               command=callback_set, bootstyle="primary-outline")
-        self.set_position_button.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=(2, 6))
-
-        # Relative
-        self.relative_frame = ttk.Labelframe(self.frame, text="Nudge the image")
-        self.relative_frame.grid(row=1, column=0)
-
-        for i, coord in ((0, "x"), (1, "y"), (2, "ϴ")):
-            if i == 0 or i == 1:
-                self.step_size_intputs.append(
-                    IntEntry(
-                        parent=self.relative_frame,
-                        default=10,
-                        min_value=-1000,
-                        max_value=1000,
-                    )
-                )
-            else:
-                self.step_size_intputs.append(
-                    FloatEntry(
-                        parent=self.relative_frame,
-                        default=10.0,
-                        min_value=0.0,
-                        max_value=360.0
-                    )
-                )
-            self.step_size_intputs[-1].widget.grid(row=3, column=i)
-
-            def callback_pos(index, c):
-                pos = list(event_dispatcher.image_position)
-                pos[index] += self.step_sizes()[index]
-                event_dispatcher.set_image_position(*pos)
-
-            def callback_neg(index, c):
-                pos = list(event_dispatcher.image_position)
-                pos[index] -= self.step_sizes()[index]
-                event_dispatcher.set_image_position(*pos)
-
-            coord_inc_button = ttk.Button(
-                self.relative_frame,
-                text=f"+{coord.upper()}",
-                command=partial(callback_pos, i, coord),
-                bootstyle="info-outline",
-                width=6,
-            )
-            coord_dec_button = ttk.Button(
-                self.relative_frame,
-                text=f"-{coord.upper()}",
-                command=partial(callback_neg, i, coord),
-                bootstyle="info-outline",
-                width=6,
-            )
-
-            coord_inc_button.grid(row=0, column=i, padx=4, pady=(6, 2))
-            coord_dec_button.grid(row=1, column=i, padx=4, pady=(2, 4))
-
-            self.lockable_widgets.append(coord_inc_button)
-            self.lockable_widgets.append(coord_dec_button)
-            self.lockable_widgets.append(self.position_intputs[i].widget)
-            self.lockable_widgets.append(self.step_size_intputs[i].widget)
-        self.lockable_widgets.append(self.set_position_button)
-
-        ttk.Label(
-            self.relative_frame,
-            text="Nudge size: X pixels, Y pixels, rotation degrees",
-            anchor="center",
-        ).grid(row=2, column=0, columnspan=3, sticky="ew")
-
-        def on_position_change():
-            pos = event_dispatcher.image_adjust_position
-            for i in range(3):
-                self.position_intputs[i].set(pos[i])
-
-        event_dispatcher.add_event_listener(Event.IMAGE_ADJUST_CHANGED, on_position_change)
-
-        def on_lock_change():
-            if event_dispatcher.movement_lock == MovementLock.UNLOCKED:
-                for w in self.lockable_widgets:
-                    w.configure(state="normal")
-            else:
-                for w in self.lockable_widgets:
-                    w.configure(state="disabled")
-
-        event_dispatcher.add_event_listener(Event.MOVEMENT_LOCK_CHANGED, on_lock_change)
-
-    def _position(self) -> tuple[int, int, int]:
-        return tuple(intput.get() for intput in self.position_intputs)
-
-    def _set_position(self, pos: tuple[int, int, int]):
-        for i in range(3):
-            self.position_intputs[i].set(pos[i])
-
-    def step_sizes(self) -> tuple[int, int, int]:
-        return tuple(intput.get() for intput in self.step_size_intputs)
-
-class PredefinedImageSelector:
-    """A widget that shows a selection of predefined images instead of file dialog"""
-
-    def __init__(self, parent, size, predefined_images, on_select=None):
-        self.parent = parent
-        self.size = size
-        self.predefined_images = predefined_images  # List of (name, path) tuples
-        self.on_select = on_select
-        self.current_image = None
-        self.current_path = ""
-
-        # Create main frame
-        self.widget = ttk.Frame(parent)
-
-        # Create thumbnail display
-        placeholder = Image.new("RGB", size, "gray")
-        self.photo = image_to_tk_image(placeholder)
-        self.label = ttk.Label(self.widget, image=self.photo, relief="solid", borderwidth=2)
-        self.label.grid(row=0, column=0, columnspan=2, pady=5)
-
-        # Create dropdown for image selection
-        self.image_var = StringVar()
-        self.image_dropdown = ttk.Combobox(
-            self.widget, 
-            textvariable=self.image_var,
-            values=[name for name, _ in predefined_images],
-            state="readonly"
-        )
-        self.image_dropdown.grid(row=1, column=0, columnspan=2, sticky="ew", pady=2)
-        self.image_dropdown.bind("<<ComboboxSelected>>", self._on_selection_change)
-
-        # Add a button to Load custom alignment marks
-        self.upload_button = ttk.Button(self.widget, text="Add mark image…", command= self._upload_marks)
-        self.upload_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=2)
-
-        # Add a button to load the selected image
-        self.load_button = ttk.Button(self.widget, text="Use selected mark", command=self._load_selected)
-        self.load_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=2)
-
-        # Set default selection if images are available
-        if predefined_images:
-            self.image_dropdown.set(predefined_images[0][0])
-            self._load_image(predefined_images[0][1])
-
-    def _on_selection_change(self, event=None):
-        """Called when dropdown selection changes"""
-        selected_name = self.image_var.get()
-        for name, path in self.predefined_images:
-            if name == selected_name:
-                self._load_image(path)
-                break
-
-    def _upload_marks(self):
-        """Called when the Add mark image button is clicked"""
-        current_directory = StringVar(value=str("~"));
-        # checks need to be made before we allow user to do this
-        dir_path = filedialog.askopenfilename(
-            initialdir=current_directory,
-            filetypes=[("All Files", "*.*")],
-            title="Choose an alignment mark image",
-        )
-        filename = f"Plus Mark {len(self.predefined_images)}"
-        print(f'uploading custom alignment marker file: {filename}')
-
-        if dir_path:  # User didn't cancel            
-            self.predefined_images.append((filename, dir_path))
-            self.image_dropdown['values'] = [name for name, _ in self.predefined_images]
-
-    def _load_selected(self):
-        """Called when Load Selected button is clicked"""
-        if self.on_select and self.current_image:
-            self.on_select(None)  # Call the callback
-
-    def _load_image(self, path):
-        """Load and display an image from the given path"""
-        try:
-            img = Image.open(path)
-            self.current_image = img
-            self.current_path = path
-
-            # Create thumbnail for display
-            thumb = img.copy()
-            thumb.thumbnail(self.size, Image.Resampling.LANCZOS)
-            self.photo = image_to_tk_image(thumb)
-            self.label.configure(image=self.photo)
-        except Exception as e:
-            print(f"Failed to load image {path}: {e}")
-            # Show placeholder on error
-            placeholder = Image.new("RGB", self.size, "red")
-            self.photo = image_to_tk_image(placeholder)
-            self.label.configure(image=self.photo)
-
-    @property
-    def image(self):
-        """Return the current image"""
-        return self.current_image
-
-    @property
-    def path(self):
-        """Return the current image path"""
-        return self.current_path
-
-class ImageSelectFrame:
-    def __init__(self, parent, button_text, import_command, predefined_images=None):
-        self.frame = ttk.Frame(parent)
-
-        if predefined_images:
-            # Use predefined image selector
-            self.selector = PredefinedImageSelector(
-                self.frame, 
-                THUMBNAIL_SIZE, 
-                predefined_images,
-                on_select=import_command
-            )
-            self.selector.widget.grid(row=0, column=0)
-
-            # For compatibility with existing code
-            self.thumb = self.selector
-        else:
-            # Use original thumbnail selector (file dialog)
-            self.thumb = Thumbnail(self.frame, THUMBNAIL_SIZE, on_import=import_command)
-            self.thumb.widget.grid(row=0, column=0)
-
-        self.label = ttk.Label(self.frame, text=button_text)
-        self.label.grid(row=1, column=0)
-
-
-class PatternDisplayFrame: # read only pattern display in red and uv focusing mode
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent)
-        self.event_dispatcher = event_dispatcher
-        # instead of pattern_frame = ImageSelectFrame
-        # use pattern_display_frame (read-only)
-        self.pattern_display_frame = ttk.Labelframe(self.frame, text="Pattern in use")
-        self.pattern_display_frame.grid(row=0, column=0, padx=5, pady=5)
-
-        placeholder = Image.new("RGB", THUMBNAIL_SIZE, "gray")
-        self.pattern_photo = image_to_tk_image(placeholder)
-        self.pattern_label = ttk.Label(self.pattern_display_frame, image=self.pattern_photo)
-        self.pattern_label.grid(row=0, column=0, padx=5, pady=5)
-
-        ttk.Label(self.pattern_display_frame, text="(choose one on the 1 · Choose pattern tab)", 
-                 font=("TkDefaultFont", 8), foreground="gray").grid(row=1, column=0)
-
-        event_dispatcher.add_event_listener(Event.PATTERN_IMAGE_CHANGED, self._update_pattern_display)
-        event_dispatcher.add_event_listener(Event.SHOWN_IMAGE_CHANGED, self._on_shown_image_changed)
-
-    def _update_pattern_display(self):
-        """Update the read-only pattern display when pattern changes"""
-        if hasattr(self.event_dispatcher, 'pattern_image') and self.event_dispatcher.pattern_image:
-            # Create thumbnail for display
-            thumb = self.event_dispatcher.pattern_image.copy()
-            thumb.thumbnail(THUMBNAIL_SIZE, Image.Resampling.LANCZOS)
-            self.pattern_photo = image_to_tk_image(thumb)
-            self.pattern_label.configure(image=self.pattern_photo)
-
-    def _on_shown_image_changed(self):
-        """Handle visual highlighting when shown image changes"""
-        # TODO: Add highlighting logic if needed
-        # For example, highlight the pattern preview when pattern is being shown
-        shown_image = self.event_dispatcher.shown_image
-        if shown_image == ShownImage.PATTERN:
-            # Could add border or background color change here
-            pass
-
-class UvFocusFrame: # crosses
-    def __init__(self, parent, event_dispatcher: EventDispatcher, show_uv_focus=False):
-        self.frame = ttk.Frame(parent)
-        self.event_dispatcher = event_dispatcher
-        # UV focus frame - use predefined images - only shown in UV mode
-        uv_focus_predefined = [("Plus Mark", "src/uvFocusImage/plus.png")]
-        self.uv_focus_frame = ImageSelectFrame(
-            self.frame,
-            "UV Focus",
-            self._on_uv_focus_change,
-            # lambda t: event_dispatcher.set_uv_focus_image(self.uv_focus_image),
-            # import_command in ImageSelectFrame --> on_select in PredefinedImageSelector
-            predefined_images=uv_focus_predefined
-        )
-        self.uv_focus_frame.frame.grid(row=1, column=0, padx=5, pady=5)
-
-        # event_dispatcher.add_event_listener(Event.PATTERN_IMAGE_CHANGED, self._update_pattern_display)
-        event_dispatcher.add_event_listener(Event.SHOWN_IMAGE_CHANGED, self._on_shown_image_changed)
-
-    def _on_uv_focus_change(self, _):
-        """Handle UV focus image selection and projection"""
-        if self.uv_focus_frame.thumb.image:
-            self.event_dispatcher.set_uv_focus_image(self.uv_focus_frame.thumb.image)
-            self.event_dispatcher.set_shown_image(ShownImage.UV_FOCUS)
-
-    def _on_shown_image_changed(self):
-        """Handle visual highlighting when shown image changes"""
-        # TODO: Add highlighting logic if needed
-        # For example, highlight the UV focus selector when UV focus is being shown
-        shown_image = self.event_dispatcher.shown_image
-        if shown_image == ShownImage.UV_FOCUS:
-            # Could add border or background color change here
-            pass
-
-    @property
-    def uv_focus_image(self):
-        """Get the currently selected UV focus image"""
-        return self.uv_focus_frame.thumb.image if hasattr(self.uv_focus_frame, 'thumb') else None
-
-class ChipFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent)
-        self.model = event_dispatcher
-        self.path = StringVar()
-
-        self.image_cache = dict()
-
-        self.chip_select_frame = ttk.Frame(self.frame)
-        self.chip_select_frame.grid(row=0, column=0)
-        ttk.Label(self.chip_select_frame, text="Chip record file: ").grid(row=0, column=0)
-        ttk.Label(self.chip_select_frame, textvariable=self.path).grid(row=0, column=1)
-
-        chip_types = [("Chip records", "*.json"), ("All files", "*.*")]
-
-        def on_open():
-            path = filedialog.askopenfilename(title="Open a chip record", filetypes=chip_types)
-            if not path:
-                return
-            try:
-                self.model.load_chip(path)
-            except (OSError, ValueError, KeyError, TypeError) as exc:
-                messagebox.showerror("Could not open chip", f"{path}\n\n{exc}")
-                return
-            self.path.set(path)
-
-        def on_new():
-            if not self.offer_to_save("Start a new chip record"):
-                return
-            path = filedialog.asksaveasfilename(title="Create a new chip record", defaultextension=".json", filetypes=chip_types)
-            if not path:
-                return
-            self.path.set(path)
-            self.model.new_chip()
-            self.model.save_chip(path)
-
-        def on_save():
-            self.save_as()
-
-        def on_finish_layer():
-            print("Layer finished!")
-            self.model.add_chip_layer()
-            if self.path.get():
-                self.model.save_chip(self.path.get())
-
-        def on_delete_exposure():
-            pair = self._selected_exposure()
-            if pair is None:
-                return
-            yes = messagebox.askyesno(title="Delete Exposure", message="Are you sure you want to delete the selected exposure?")
-            if yes:
-                self.model.delete_chip_exposure(pair[0], pair[1])
-                if self.path.get() != "":
-                    self.model.save_chip(self.path.get())
-
-        def on_select(e, cur):
-            if cur and len(self.cur_layer_view.selection()) > 0:
-                self.prev_layer_view.selection_set([])
-                self.delete_exposure_button["state"] = "normal"
-            elif not cur and len(self.prev_layer_view.selection()) > 0:
-                self.cur_layer_view.selection_set([])
-                self.delete_exposure_button["state"] = "normal"
-            else:
-                self.delete_exposure_button["state"] = "disabled"
-
-        def on_double_click(cur):
-            pair = self._selected_exposure()
-            if pair is None or self.model.movement_lock != MovementLock.UNLOCKED:
-                return  # nothing selected, or an exposure/autofocus is running
-            x, y, z = self.model.chip.layers[pair[0]].exposures[pair[1]].coords
-            target = {"x": x, "y": y, "z": z}
-            if confirm_stage_move("where this exposure was made", target):
-                self.model.move_absolute(target)
-
-        def on_chip_changed():
-            if len(self.model.chip.layers) < 2:
-                self.prev_layer_select.configure(state="disabled")
-                self.prev_layer_select.configure(to=0)
-            else:
-                self.prev_layer_select.configure(state="readonly")
-                self.prev_layer_select.configure(to=len(self.model.chip.layers) - 2)
-                self.prev_layer_select_var.set(str(len(self.model.chip.layers) - 2))
-            self.refresh_prev_layer()
-            self.refresh_cur_layer()
-            if self.path.get() != "":
-                self.model.save_chip(self.path.get())
-            if len(self.model.chip.layers[-1].exposures) > 0:
-                self.finish_layer_button.configure(state="normal")
-            else:
-                self.finish_layer_button.configure(state="disabled")
-
-        def prev_layer_index_changed(a, b, c):
-            self.refresh_prev_layer()
-
-        self.model.add_event_listener(Event.CHIP_CHANGED, on_chip_changed)
-
-        _cbtn_grid = dict(padx=4, pady=4)
-        _cbtn_w = 0  # size each button to its label
-        self.open_chip_button = ttk.Button(self.chip_select_frame, text="Open record…",
-                                           command=on_open, bootstyle="secondary-outline", width=_cbtn_w)
-        self.open_chip_button.grid(row=0, column=2, **_cbtn_grid)
-        self.new_chip_button = ttk.Button(self.chip_select_frame, text="New record",
-                                          command=on_new, bootstyle="secondary-outline", width=_cbtn_w)
-        self.new_chip_button.grid(row=0, column=3, **_cbtn_grid)
-        self.save_chip_button = ttk.Button(self.chip_select_frame, text="Save record as…",
-                                           command=on_save, bootstyle="secondary-outline", width=_cbtn_w)
-        self.save_chip_button.grid(row=0, column=4, **_cbtn_grid)
-        self.finish_layer_button = ttk.Button(self.chip_select_frame, text="Finish this layer",
-                                              command=on_finish_layer, bootstyle="primary-outline", width=_cbtn_w)
-        self.finish_layer_button.grid(row=0, column=5, **_cbtn_grid)
-        self.finish_layer_button.configure(state="disabled")
-        self.delete_exposure_button = ttk.Button(
-            self.chip_select_frame,
-            text="Delete selected exposure",
-            command=on_delete_exposure,
-            bootstyle="danger-outline",
-            state="disabled",
-            width=_cbtn_w,
-        )
-        self.delete_exposure_button.grid(row=0, column=6, **_cbtn_grid)
-
-        self.layer_frame = ttk.Frame(self.frame)
-        self.layer_frame.grid(row=1, column=0)
-
-        self.prev_layer_frame = ttk.Labelframe(self.layer_frame, text="Previous layer")
-        self.prev_layer_frame.grid(row=0, column=0, sticky="ns")
-        self.cur_layer_frame = ttk.Labelframe(self.layer_frame, text="This layer")
-        self.cur_layer_frame.grid(row=0, column=1, sticky="ns")
-
-        self.tree_view_style = ttk.Style()
-        self.tree_view_style.configure("Treeview", rowheight=50)
-
-        self.prev_layer_view = ttk.Treeview(self.prev_layer_frame, selectmode="browse", columns=("XYZ",), height=5)
-        self.prev_layer_view.grid(row=0, column=0)
-        self.prev_layer_view.bind("<<TreeviewSelect>>", lambda e: on_select(e, cur=False))
-        self.prev_layer_view.bind("<Double-1>", lambda e: on_double_click(cur=False))
-        self.cur_layer_view = ttk.Treeview(self.cur_layer_frame, selectmode="browse", columns=("XYZ",), height=5)
-        self.cur_layer_view.grid(row=0, column=0)
-        self.cur_layer_view.bind("<<TreeviewSelect>>", lambda e: on_select(e, cur=True))
-        self.cur_layer_view.bind("<Double-1>", lambda e: on_double_click(cur=True))
-
-        select_frame = ttk.Frame(self.prev_layer_frame)
-        select_frame.grid(row=1, column=0)
-
-        prev_layer_select_label = ttk.Label(select_frame, text="Show previous layer:")
-        prev_layer_select_label.grid(row=0, column=0)
-
-        self.prev_layer_select_var = StringVar()
-        self.prev_layer_select_var.trace_add("write", prev_layer_index_changed)
-        self.prev_layer_select = ttk.Spinbox(select_frame, from_=0, to=0, textvariable=self.prev_layer_select_var)
-        self.prev_layer_select.configure(state="disabled")
-        self.prev_layer_select.grid(row=0, column=1)
-
-    def _selected_exposure(self):
-        cur_sel = self.cur_layer_view.selection()
-        if len(cur_sel) > 0:
-            layer_idx, ex_idx = cur_sel[0].split("_")
-            return int(layer_idx), int(ex_idx)
-        prev_sel = self.prev_layer_view.selection()
-        if len(prev_sel) > 0:
-            layer_idx, ex_idx = prev_sel[0].split("_")
-            return int(layer_idx), int(ex_idx)
-        return None
-
-    def unsaved_exposures(self) -> int:
-        """Exposures that exist only in memory (no chip file chosen yet)."""
-        if self.path.get():
-            return 0
-        return sum(len(layer.exposures) for layer in self.model.chip.layers)
-
-    def save_as(self) -> bool:
-        path = filedialog.asksaveasfilename(title="Save chip record as", defaultextension=".json",
-                                            filetypes=[("Chip records", "*.json"), ("All files", "*.*")])
-        if not path:
-            return False
-        self.path.set(path)
-        self.model.save_chip(path)
-        return True
-
-    def offer_to_save(self, action: str) -> bool:
-        """Ask before discarding unsaved exposures. False means the user cancelled."""
-        count = self.unsaved_exposures()
-        if count == 0:
-            return True
-        answer = messagebox.askyesnocancel(action, f"The current chip record has {count} exposure(s) that are not "
-                                           "saved to a file. Save them first?")
-        if answer is None:
-            return False
-        return self.save_as() if answer else True
-
-    def _get_thumbnail(self, path: str):
-        try:
-            return self.image_cache[path][1]
-        except KeyError:
-            try:
-                with Image.open(path) as source:
-                    img = source.convert("RGB").resize((80, 45))
-            except (OSError, ValueError):
-                # Pattern file moved, deleted, or from another PC: show a grey placeholder.
-                img = Image.new("RGB", (80, 45), "#5a646c")
-            photo = image_to_tk_image(img)
-            self.image_cache[path] = (img, photo)
-            return photo
-
-    def refresh_prev_layer(self):
-        chip = self.model.chip
-
-        for item in self.prev_layer_view.get_children():
-            self.prev_layer_view.delete(item)
-
-        try:
-            idx = int(self.prev_layer_select_var.get())
-        except ValueError:
-            print(f"Leaving previous layer empty because select var is {self.prev_layer_select_var.get()!r}")
-            return
-
-        if len(chip.layers) < 2:
-            return
-
-        for i, ex in enumerate(chip.layers[idx].exposures):
-            ex_id = f"{idx}_{i}"
-            pos = f"{ex.coords[0]},{ex.coords[1]},{ex.coords[2]}"
-            self.prev_layer_view.insert("", "end", ex_id, image=self._get_thumbnail(ex.path), values=(pos,))
-
-    def refresh_cur_layer(self):
-        chip = self.model.chip
-
-        for item in self.cur_layer_view.get_children():
-            self.cur_layer_view.delete(item)
-
-        for i, ex in enumerate(chip.layers[-1].exposures):
-            ex_id = f"{len(chip.layers) - 1}_{i}"
-            pos = f"{ex.coords[0]},{ex.coords[1]},{ex.coords[2]}"
-            self.cur_layer_view.insert("", "end", ex_id, image=self._get_thumbnail(ex.path), values=(pos,))
-
-
-class ExposureFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent)
-        self.frame.columnconfigure(0, weight=1)
-        ttk.Label(self.frame, text="Exposure time (milliseconds)", anchor="w").grid(row=0, column=0)
-        self.exposure_time_entry = IntEntry(self.frame, default=8000, min_value=0)
-        self.exposure_time_entry.widget.grid(row=0, column=1, columnspan=2, sticky="nesw")
-
-        def on_exposure_time_change(_a, _b, _c):
-            try:
-                event_dispatcher.exposure_time = self.exposure_time_entry._var.get()
-            except tkinter.TclError:
-                event_dispatcher.exposure_time = None
-
-        self.exposure_time_entry._var.trace_add("write", on_exposure_time_change)
-
-        # Posterization
-        def on_posterize_change(*args):
-            event_dispatcher.set_posterize_strength(self._posterize_strength())
-
-        def on_posterize_check():
-            if self.posterize_enable_var.get():
-                self.posterize_scale["state"] = "normal"
-                self.posterize_cutoff_entry.widget["state"] = "normal"
-            else:
-                self.posterize_scale["state"] = "disabled"
-                self.posterize_cutoff_entry.widget["state"] = "disabled"
-            on_posterize_change()
-
-        self.posterize_enable_var = BooleanVar()
-        self.posterize_checkbutton = ttk.Checkbutton(
-            self.frame,
-            text="Black & white threshold (%)",
-            command=on_posterize_check,
-            variable=self.posterize_enable_var,
-            onvalue=True,
-            offvalue=False,
-        )
-        self.posterize_checkbutton.grid(row=2, column=0)
-        self.posterize_strength_var = IntVar()
-        self.posterize_strength_var.trace_add("write", on_posterize_change)
-        self.posterize_scale = ttk.Scale(self.frame, variable=self.posterize_strength_var, from_=0.0, to=100.0)
-        self.posterize_scale.grid(row=2, column=1, sticky="nesw")
-        self.posterize_scale["state"] = "disabled"
-        self.posterize_cutoff_entry = IntEntry(
-            self.frame,
-            var=self.posterize_strength_var,
-            default=50,
-            min_value=0,
-            max_value=100,
-        )
-        self.posterize_cutoff_entry.widget.grid(row=2, column=2, sticky="nesw")
-        self.posterize_cutoff_entry.widget["state"] = "disabled"
-
-    # returns threshold percentage if posterizing is enabled, else None
-    def _posterize_strength(self) -> Optional[int]:
-        if self.posterize_enable_var.get():
-            return self.posterize_cutoff_entry.get()
-        else:
-            return None
-
-
-class PatterningFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent)
-
-        self.preview_tile = ttk.Label(self.frame, text="Next tile", compound="top")  # type:ignore
-        self.preview_tile.grid(row=0, column=0)
-
-        self.begin_patterning_button = ttk.Button(
-            self.frame,
-            text="Start exposure",
-            command=lambda: event_dispatcher.begin_patterning(),
-            bootstyle="success",
-            state="normal",
-        )
-        self.begin_patterning_button.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 2))
-
-        self.abort_patterning_button = ttk.Button(
-            self.frame,
-            text="Stop exposure",
-            command=lambda: event_dispatcher.abort_patterning(),
-            bootstyle="danger",
-            state="disabled",
-        )
-        self.abort_patterning_button.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 4))
-
-        ttk.Label(self.frame, text="Exposure progress", anchor="s").grid(row=3, column=0)
-        self.exposure_progress = ttk.Progressbar(self.frame, orient="horizontal", mode="determinate", maximum=1000, bootstyle="success")
-        self.exposure_progress.grid(row=4, column=0, sticky="ew")
-
-        self.set_image(Image.new("RGB", (1, 1)))
-
-        def on_change_patterning_status():
-            if event_dispatcher.patterning_busy:
-                self.begin_patterning_button["state"] = "disabled"
-                self.abort_patterning_button["state"] = "normal"
-            else:
-                self.begin_patterning_button["state"] = "normal"
-                self.abort_patterning_button["state"] = "disabled"
-
-        event_dispatcher.add_event_listener(Event.PATTERNING_BUSY_CHANGED, on_change_patterning_status)
-        event_dispatcher.add_event_listener(Event.PATTERN_IMAGE_CHANGED, lambda: self.set_image(event_dispatcher.pattern.processed()))
-
-        def on_progress_changed():
-            self.exposure_progress["value"] = (event_dispatcher.exposure_progress * 1000.0)
-
-        event_dispatcher.add_event_listener(Event.EXPOSURE_PATTERN_PROGRESS_CHANGED, on_progress_changed)
-
-    def set_image(self, img: Image.Image):
-        # TODO: What is the correct size?
-        self.thumb_image = image_to_tk_image(img.resize(THUMBNAIL_SIZE))
-        self.preview_tile.configure(image=self.thumb_image)  # type:ignore
-
-
-class RedModeFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent, name="redmodeframe", padding=20)
-        self.event_dispatcher = event_dispatcher
-
-        # Create left middle right sections
-        self.left_frame = ttk.Frame(self.frame)
-        self.left_frame.grid(row=0, column=0)
-
-        self.middle_frame = ttk.Frame(self.frame)
-        self.middle_frame.grid(row=0, column=1)
-
-        self.right_frame = ttk.Frame(self.frame)
-        self.right_frame.grid(row=0, column=2)
-
-        # center the frames
-        self.frame.grid_columnconfigure(0, weight=1)
-        self.frame.grid_columnconfigure(1, weight=0)
-        self.frame.grid_columnconfigure(2, weight=1)
-        self.frame.grid_rowconfigure(0, weight=1)
-
-        # Stage position controls (middle)
-        self.stage_position_frame = StagePositionFrame(self.middle_frame, event_dispatcher, False)
-        self.stage_position_frame.frame.grid(row=0, column=0)
-
-        # test tiling check button & preview
-        # self.tiling_check_frame  = TilingCheckFrame(self.middle_frame, event_dispatcher)
-        # self.tiling_check_frame.frame.grid(row=0, column = 1)
-
-        # Pattern preview display (right side)
-        self.pattern_display = PatternDisplayFrame(self.right_frame, event_dispatcher)
-        self.pattern_display.frame.grid(row=0, column=0)
-
-        # Red focus image selection (left)
-        self.red_select_var = StringVar(value=event_dispatcher.red_focus_source.value)
-        self.red_focus_rb = ttk.Radiobutton(
-            self.left_frame,
-            variable=self.red_select_var,
-            text="A custom image (choose below)",
-            value=RedFocusSource.IMAGE.value,
-        )
-        self.solid_red_rb = ttk.Radiobutton(
-            self.left_frame,
-            variable=self.red_select_var,
-            text="Solid red (whole area)",
-            value=RedFocusSource.SOLID.value,
-        )
-        self.pattern_rb = ttk.Radiobutton(
-            self.left_frame,
-            variable=self.red_select_var,
-            text="The pattern, in red",
-            value=RedFocusSource.PATTERN.value,
-        )
-        self.inv_pattern_rb = ttk.Radiobutton(
-            self.left_frame,
-            variable=self.red_select_var,
-            text="The pattern inverted, in red",
-            value=RedFocusSource.INV_PATTERN.value,
-        )
-
-        ttk.Label(self.left_frame, text="What to project in red", font="StepperSection").grid(row=0, column=0, sticky="w", pady=(0, 8))
-        self.solid_red_rb.grid(row=1, column=0, sticky="w", pady=3)
-        self.pattern_rb.grid(row=2, column=0, sticky="w", pady=3)
-        self.inv_pattern_rb.grid(row=3, column=0, sticky="w", pady=3)
-        self.red_focus_rb.grid(row=4, column=0, sticky="w", pady=3)
-
-        self.red_focus_frame = ImageSelectFrame(
-            self.left_frame,
-            "Custom red image",
-            lambda t: event_dispatcher.set_red_focus_image(self.red_focus_image()),
-        )
-        self.red_focus_frame.frame.grid(row=5, column=0)
-
-        brightness = ttk.Frame(self.left_frame)
-        brightness.grid(row=6, column=0, sticky="ew", pady=(14, 0))
-        brightness.columnconfigure(0, weight=1)
-        ttk.Label(brightness, text="Red brightness").grid(row=0, column=0, sticky="w")
-        self.red_brightness_text = ttk.Label(brightness, text="100%", bootstyle="secondary")
-        self.red_brightness_text.grid(row=0, column=1, sticky="e")
-        self.red_brightness_var = tkinter.DoubleVar(value=round(event_dispatcher.red_brightness * 100))
-        self.red_brightness_scale = ttk.Scale(brightness, from_=2, to=100, variable=self.red_brightness_var)
-        self.red_brightness_scale.grid(row=1, column=0, columnspan=2, sticky="ew")
-        self.on_red_brightness = None  # set by the main window to remember the value
-        def on_brightness(*_):
-            percent = int(round(self.red_brightness_var.get()))
-            self.red_brightness_text.configure(text=f"{percent}%")
-            event_dispatcher.set_red_brightness(percent / 100)
-            if self.on_red_brightness:
-                self.on_red_brightness(percent)
-        self.red_brightness_var.trace_add("write", on_brightness)
-        on_brightness()
-
-        def on_radiobutton(*_):
-            print(f"red select var {self.red_select_var.get()}")
-            for s in RedFocusSource:
-                if s.value == self.red_select_var.get():
-                    event_dispatcher.set_red_focus_source(s)
-                    break
-            else:
-                raise Exception()
-
-        self.red_select_var.trace_add("write", on_radiobutton)
-
-    def red_focus_image(self):
-        return self.red_focus_frame.thumb.image
-
-
-class UvModeFrame:
-    def __init__(self, parent, event_dispatcher):
-        self.frame = ttk.Frame(parent, name="uvmodeframe", padding=20)
-        # Create left and right sections
-        self.left_frame = ttk.Frame(self.frame)
-        self.left_frame.grid(row=0, column=0, sticky="ns", padx=(0,10))
-
-        self.middle_frame = ttk.Frame(self.frame)
-        self.middle_frame.grid(row=0, column=1, sticky="ns")
-
-        self.right_frame = ttk.Frame(self.frame)
-        self.right_frame.grid(row=0, column=2, sticky="ns")
-
-        # center the frames
-        self.frame.grid_columnconfigure(0, weight=1)
-        self.frame.grid_columnconfigure(1, weight=0)
-        self.frame.grid_columnconfigure(2, weight=1)
-        self.frame.grid_rowconfigure(0, weight=1)
-
-        # Predefined UV focus image selection
-        self.uv_focus_frame = UvFocusFrame(self.left_frame, event_dispatcher)
-        self.uv_focus_frame.frame.grid(row=0, column=0, pady=(10,0))
-
-        # Stage position controls (middle)
-        self.stage_position_frame = StagePositionFrame(self.middle_frame, event_dispatcher, True)
-        self.stage_position_frame.frame.grid(row=0, column=0, sticky="n")
-
-        # Pattern preview and UV focus selector (right side)
-        # self.pattern_display = PatternDisplayFrame(self.right_frame, event_dispatcher)
-        # self.pattern_display.frame.grid(row=0, column=0)
-
-        # Exposure and patterning controls (right side, below images)
-        self.exposure_frame = ExposureFrame(self.right_frame, event_dispatcher)
-        self.exposure_frame.frame.grid(row=0, column=0)
-        self.patterning_frame = PatterningFrame(self.right_frame, event_dispatcher)
-        self.patterning_frame.frame.grid(row=1, column=0)
-        self.checklist = ExposeChecklist(self.right_frame, event_dispatcher)
-        self.checklist.frame.grid(row=2, column=0, sticky="w", pady=(14, 0))
-
-class ExposeChecklist:
-    """Live "ready to expose?" summary next to the Start button."""
-
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.dispatcher = event_dispatcher
-        self.projector_status = None  # set by the main window: () -> (bootstyle, text)
-        self.frame = ttk.Frame(parent)
-        ttk.Label(self.frame, text="Before you expose", font="StepperSection").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self.lines = []
-        for row in range(1, 5):
-            label = ttk.Label(self.frame, text="", wraplength=330, justify="left")
-            label.grid(row=row, column=0, sticky="w", pady=1)
-            self.lines.append(label)
-        self.refresh()
-
-    def items(self):
-        d = self.dispatcher
-        ok, warn, info = "success", "danger", "secondary"
-        if d.pattern_image_path:
-            w, h = d.pattern_image.size
-            yield ok, f"✓ Pattern: {Path(d.pattern_image_path).name} ({w} × {h})"
-        else:
-            yield warn, "✗ No pattern chosen. Pick one on the 1 · Choose pattern tab."
-        if isinstance(d.exposure_time, int) and d.exposure_time > 0:
-            yield ok, f"✓ Exposure time: {d.exposure_time:,} ms = {d.exposure_time / 1000:.2f} s"
-        else:
-            yield warn, "✗ Enter an exposure time greater than 0 ms."
-        if isinstance(d.hardware.stage, GrblStage):
-            yield ok, "✓ Stage connected"
-        else:
-            yield info, "• Stage in simulation: it will not move"
-        if self.projector_status is not None:
-            yield self.projector_status()
-        else:
-            yield info, "• The pattern is shown on the display this window is on. Move it to the projector first."
-
-    def refresh(self):
-        for label, (style, text) in zip(self.lines, self.items()):
-            label.configure(text=text, bootstyle=style)
-        self.frame.after(700, self.refresh)
-
-
-class PatternUploadFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.last_folder = None
-        self.frame = ttk.Frame(parent, padding=24)
-        self.event_dispatcher = event_dispatcher
-        details = ttk.Frame(self.frame)
-        details.grid(row=0, column=0, sticky="nw", padx=(0, 32))
-        ttk.Label(details, text="Pattern image", font="StepperSection").pack(anchor="w", pady=(0, 8))
-        ttk.Label(details, text="Choose the image you want to project. You can check its alignment before starting an exposure.", wraplength=340, bootstyle="secondary").pack(anchor="w", pady=(0, 20))
-        self.choose_button = ttk.Button(details, text="Choose image…", command=self.choose_image)
-        self.choose_button.pack(anchor="w")
-        self.pattern_path_var = StringVar(value="No image selected")
-        ttk.Label(details, textvariable=self.pattern_path_var, wraplength=340, bootstyle="secondary").pack(anchor="w", pady=(16, 0))
-        self.preview_photo = image_to_tk_image(Image.new('RGB', (380, 220), '#e7ece8'))
-        self.preview_label = ttk.Label(self.frame, image=self.preview_photo, text="Your pattern preview", compound="center", anchor="center")
-        self.preview_label.grid(row=0, column=1, sticky="n")
-        self.frame.columnconfigure(1, weight=1)
-        event_dispatcher.add_event_listener(Event.PATTERN_IMAGE_CHANGED, self.refresh)
-        event_dispatcher.add_event_listener(Event.PATTERNING_BUSY_CHANGED, lambda: self.choose_button.configure(state="disabled" if event_dispatcher.patterning_busy else "normal"))
-
-    def choose_image(self):
-        if self.event_dispatcher.patterning_busy:
-            return
-        path = filedialog.askopenfilename(title="Choose a pattern image", initialdir=self.last_folder,
-                                          filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff"), ("All files", "*.*")])
-        if not path:
-            return
-        self.last_folder = str(Path(path).parent)
-        try:
-            image = load_pattern_image(path)
-            self.event_dispatcher.set_pattern_image(image, path)
-        except (OSError, ValueError) as exc:
-            messagebox.showerror("Could not open image", str(exc))
-
-    def refresh(self):
-        image = self.event_dispatcher.pattern_image
-        if not self.event_dispatcher.pattern_image_path:
-            self.pattern_path_var.set("No pattern chosen yet")
-        else:
-            self.pattern_path_var.set(f"{Path(self.event_dispatcher.pattern_image_path).name}\n{image.width} × {image.height} pixels")
-        preview = image.copy()
-        preview.thumbnail((380, 260), Image.Resampling.LANCZOS)
-        self.preview_photo = image_to_tk_image(preview)
-        self.preview_label.configure(image=self.preview_photo, text="")
-
-class ModeSelectFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.notebook = ttk.Notebook(parent)
-
-        # Add Pattern Upload tab first
-        self.pattern_upload_frame = PatternUploadFrame(self.notebook, event_dispatcher)
-        self.notebook.add(self.pattern_upload_frame.frame, text="1 · Choose pattern")
-        self.red_mode_frame = RedModeFrame(self.notebook, event_dispatcher)
-        self.notebook.add(self.red_mode_frame.frame, text="2 · Focus (red light)")
-        self.uv_mode_frame = UvModeFrame(self.notebook, event_dispatcher)
-        self.notebook.add(self.uv_mode_frame.frame, text="3 · Expose (UV light)")
-
-        def on_tab_change():
-            if event_dispatcher.patterning_busy or event_dispatcher.autofocus_busy:
-                return
-            current_tab = self._current_tab()
-            if current_tab == "uv":
-                event_dispatcher.enter_uv_mode()
-            elif current_tab == "red":
-                event_dispatcher.enter_red_mode()
-
-        self.notebook.bind("<<NotebookTabChanged>>", lambda _: on_tab_change())
-        def update_tab_lock():
-            locked = event_dispatcher.patterning_busy or event_dispatcher.autofocus_busy
-            selected = self.notebook.select()
-            for tab in self.notebook.tabs():
-                self.notebook.tab(tab, state="disabled" if locked and tab != selected else "normal")
-        event_dispatcher.add_event_listener(Event.MOVEMENT_LOCK_CHANGED, update_tab_lock)
-
-        # def on_tab_event(evt):
-        #  self.notebook.select(1 if evt == Event.EnterUvMode else 0)
-
-        # event_dispatcher.add_event_listener(Event.EnterRedMode, lambda: on_tab_event(Event.EnterRedMode))
-        # event_dispatcher.add_event_listener(Event.EnterUvMode, lambda: on_tab_event(Event.EnterUvMode))
-
-    def _current_tab(self):
-        selected = self.notebook.select()
-        if not selected:
-            return None
-        if "patternupload" in selected.lower() or self.notebook.index("current") == 0:
-            return "pattern"
-        elif "redmode" in selected or self.notebook.index("current") == 1:
-            return "red" 
-        else:
-            return "uv"
-
-class GlobalSettingsFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher, enable_detection: bool = False):
-        self.frame = ttk.Labelframe(parent, text="Focus & detection options")
-
-        def set_autofocus_on_mode_switch(*_):
-            event_dispatcher.autofocus_on_mode_switch = self.autofocus_on_mode_switch_var.get()
-
-        self.autofocus_on_mode_switch_var = BooleanVar(value=False)
-        self.autofocus_on_mode_switch_check = ttk.Checkbutton(
-            self.frame,
-            text="Autofocus when switching between red and UV",
-            variable=self.autofocus_on_mode_switch_var,
-        )
-        self.autofocus_on_mode_switch_check.grid(row=0, column=0, columnspan=2)
-        self.autofocus_on_mode_switch_var.trace_add("write", set_autofocus_on_mode_switch)
-
-        def set_realtime_detection(*_):
-            event_dispatcher.realtime_detection = self.realtime_detection_var.get()
-
-        self.realtime_detection_var = BooleanVar(value=enable_detection)
-        self.realtime_detection_check = ttk.Checkbutton(
-            self.frame,
-            text="Detect alignment markers in real time",
-            variable=self.realtime_detection_var,
-            state="disabled" if event_dispatcher.model is None else "normal",
-        )
-        self.realtime_detection_check.grid(row=1, column=0, columnspan=2)
-        self.realtime_detection_var.trace_add("write", set_realtime_detection)
-
-        def do_align():
-            if event_dispatcher.camera_image is None or event_dispatcher.model is None:
-                messagebox.showinfo("Alignment unavailable", "Auto-align needs a live camera image and the alignment "
-                                    "model (ckpts/best.onnx).")
-                return
-            image = event_dispatcher.camera_image
-            h, w = image.shape[:2]
-            markers, _ = detect_alignment_markers(event_dispatcher.model, image)
-            if not markers:
-                self.align_status.configure(text="No alignment marks found. Focus in red and make sure the marks are in view.")
-                return
-            dx, dy, _, _ = alignment_correction(marker_centers(markers, w, h), event_dispatcher.config.alignment)
-            try:
-                event_dispatcher.move_relative({'x': dx, 'y': dy})
-            except StageError:
-                return
-            self.align_status.configure(text=f"Moved X {dx:+.1f} µm, Y {dy:+.1f} µm using {len(markers)} mark(s). "
-                                             "Click again to refine.")
-
-        self.alignbutton = ttk.Button(
-            self.frame,
-            text="Auto-align",
-            command=do_align,
-            state="disabled" if event_dispatcher.model is None else "normal",
-            bootstyle="primary-outline",
-        )
-        self.alignbutton.grid(row=2, column=1, padx=4, pady=4, sticky="ew")
-        self.align_status = ttk.Label(self.frame, text="" if event_dispatcher.model is not None else
-                                      "Alignment model not found, so marker detection and Auto-align are off.",
-                                      bootstyle="secondary", wraplength=420)
-        self.align_status.grid(row=3, column=0, columnspan=2, sticky="w", padx=4)
-
-        self.autofocus_button = ttk.Button(
-            self.frame, text="Autofocus now",
-            command=lambda: event_dispatcher.autofocus(blue_only=event_dispatcher.in_uv(), interactive=True),
-            bootstyle="secondary-outline",
-        )
-        self.autofocus_button.grid(row=2, column=0, padx=4, pady=4, sticky="ew")
-
-        # Maybe this should have a scale?
-        # Or, even further, maybe this should just be the same as the interface for posterization strength?
-        self.border_size_var = IntVar()
-        self.border_label = ttk.Label(self.frame, text="Black border around pattern (%)")
-        self.border_label.grid(row=4, column=0, sticky="w", padx=4, pady=(8, 14))
-        self.border_entry = IntEntry(self.frame, var=self.border_size_var, default=0, min_value=0, max_value=100)
-        self.border_entry.widget.grid(row=4, column=1, sticky="ew", padx=4, pady=(8, 14))
-
-        def on_border_size_change(*_):
-            event_dispatcher.set_border_size(self.border_size_var.get())
-
-        self.border_size_var.trace_add("write", on_border_size_change)
-
-        self.placeholder_photo = image_to_tk_image(Image.new("RGB", THUMBNAIL_SIZE, "black"))
-        self.photo = None
-
-        ttk.Label(self.frame, text="Pattern in use", anchor="center").grid(
-            row=5, column=0, columnspan=2, pady=(6, 2))
-        self.current_image = ttk.Label(self.frame, image=self.placeholder_photo)  # type:ignore
-        self.current_image.grid(row=6, column=0, columnspan=2, pady=(0, 4))
-
-        # Disable the autofocus button if autofocus is already running
-        def movement_lock_changed():
-            if event_dispatcher.movement_lock == MovementLock.LOCKED:
-                self.autofocus_button.configure(state="disabled")
-            else:
-                self.autofocus_button.configure(state="normal")
-
-        event_dispatcher.add_event_listener(Event.MOVEMENT_LOCK_CHANGED, movement_lock_changed)
-
-        def shown_image_changed():
-            img = event_dispatcher.current_image
-            if img is None:
-                self.current_image.configure(image=self.placeholder_photo)  # type:ignore
-            else:
-                photo = image_to_tk_image(img.resize(THUMBNAIL_SIZE, Image.Resampling.NEAREST))
-                self.current_image.configure(image=photo)  # type:ignore
-                self.photo = photo
-
-        event_dispatcher.add_event_listener(Event.SHOWN_IMAGE_CHANGED, shown_image_changed)
-
-        self.snapshot_frame = ttk.Labelframe(self.frame, text="Camera photos")
-        self.snapshot_frame.grid(row=7, column=0, columnspan=2, sticky="ew", pady=5)
-
-        self.auto_snapshot_var = BooleanVar(value=event_dispatcher.auto_snapshot_on_uv)
-        self.auto_snapshot_check = ttk.Checkbutton(
-            self.snapshot_frame,
-            text="Save a photo automatically when entering UV",
-            variable=self.auto_snapshot_var,
-        )
-        self.auto_snapshot_check.grid(row=0, column=0, columnspan=2)
-
-        def on_auto_snapshot_change(*_):
-            event_dispatcher.auto_snapshot_on_uv = self.auto_snapshot_var.get()
-
-        self.auto_snapshot_var.trace_add("write", on_auto_snapshot_change)
-
-        # Directory selection
-        ttk.Label(self.snapshot_frame, text="Save photos to:").grid(row=1, column=0)
-        self.directory_var = StringVar(value=str(event_dispatcher.snapshot_directory))
-        self.directory_entry = ttk.Entry(self.snapshot_frame, textvariable=self.directory_var, state="readonly")
-        self.directory_entry.grid(row=1, column=1, sticky="ew")
-
-        def choose_directory():
-            dir_path = filedialog.askdirectory(
-                initialdir=self.directory_var.get(),
-                title="Choose a folder for camera photos",
-            )
-            if dir_path:  # User didn't cancel
-                event_dispatcher.set_snapshot_directory(Path(dir_path))
-                self.directory_var.set(dir_path)
-
-        self.choose_dir_button = ttk.Button(self.snapshot_frame, text="Choose folder…", command=choose_directory)
-        self.choose_dir_button.grid(row=2, column=0, columnspan=2, sticky="ew")
-
-        # Configure grid weights for proper expansion
-        self.snapshot_frame.columnconfigure(1, weight=1)
-
-
-class ExposureHistoryFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Labelframe(parent, text="Exposure History")
-        self.text = tkinter.Text(self.frame, width=80, height=10, wrap="none", state="disabled")
-        self.text.grid(row=0, column=0)
-        self.event_dispatcher = event_dispatcher
-        event_dispatcher.add_event_listener(Event.PATTERNING_BUSY_CHANGED, lambda: self._refresh())
-
-    def _refresh(self):
-        self.text["state"] = "normal"
-        self.text.delete("1.0", "end")
-        for exp_log in self.event_dispatcher.exposure_history[-10:]:
-            t = exp_log.time.strftime("%H:%M:%S")
-            line = f"{t} {exp_log.path} {int(exp_log.duration)}ms X:{exp_log.coords[0]} Y:{exp_log.coords[1]} Z:{exp_log.coords[2]}\n"
-
-            if self.text.index("end-1c") != 1.0:
-                self.text.insert("end", "\n")
-            self.text.insert("end", line)
-        self.text["state"] = "disabled"
-
-
-class OffsetAmountFrame:
-    def __init__(self, parent, label, default_offset):
-        self.frame = ttk.Labelframe(parent, text=label)
-
-        offset_label = ttk.Label(self.frame, text="Distance between tiles (µm)")
-        offset_label.grid(row=0, column=0)
-        self.offset_var = StringVar(value=str(default_offset))
-        self.offset_entry = ttk.Entry(self.frame, textvariable=self.offset_var, width=5)
-        self.offset_entry.grid(row=0, column=1)
-        amount_label = ttk.Label(self.frame, text="Number of tiles")
-        amount_label.grid(row=0, column=2)
-        self.amount_var = StringVar(value="1")
-        self.amount_spinbox = ttk.Spinbox(self.frame, from_=-20, to=20, textvariable=self.amount_var, width=3)
-        self.amount_spinbox.grid(row=0, column=3)
-
-class TilingFrame:
-    def __init__(self, parent, model: EventDispatcher):
-        self.frame = ttk.Labelframe(parent, text="Tiling")
-        self.model = model
-
-        self.red_to_uv_offset = -40
-
-        self.overall_pattern_size_w = 0
-        self.overall_pattern_size_h = 0
-
-        #Defaults set based on DLP471TP and a 10x objective
-        #5.4 um Pixel Pitch
-        #Width 10.368 mm
-        #Height 5.832 mm
-        # Move in X = 10.368mm / 10 = 1037um
-        # Move in Y = 5.832 mm / 10 = 538.2 um ~ 539 um
-        #Subtraction amounts are there to tune the offset for the alignment markers
-        self.x_settings = OffsetAmountFrame(self.frame, "X", 1037-54) #Move amount between exposures in X
-        self.y_settings = OffsetAmountFrame(self.frame, "Y", 539-27)  #Move amount between exposures in y
-
-        self.running = False
-        self.stop_requested = False
-        self.tile_dir = Path("tiles")
-        self.tile_size = (3840, 2160)   # pattern pixels per exposure (the projector's full field)
-        self.tile_overlap = (200, 200)  # shared strip holding the alignment marks, in pattern pixels
-
-        # Tiling check must be done before splitting, if needed.
-        self.tiling_check_button = TilingCheckFrame(self.frame, model)
-        self.tiling_check_button.frame.grid(row=0, column=0)
-        _tbtn = dict(sticky="ew", padx=6, pady=3)
-        self.segment_images_button = ttk.Button(self.frame, text="Split pattern into tiles",
-                                                command=self.segment, bootstyle="secondary-outline", width=16)
-        self.segment_images_button.grid(row=1, column=0, **_tbtn)
-        self.begin_tiling_button = ttk.Button(self.frame, text="▶  Start tiling",
-                                              command=self.on_begin, bootstyle="success", width=16)
-        self.begin_tiling_button.grid(row=2, column=0, **_tbtn)
-        self.abort_tiling_button = ttk.Button(self.frame, text="■  Stop tiling",
-                                              command=self.on_abort, bootstyle="danger", width=16, state="disabled")
-        self.abort_tiling_button.grid(row=3, column=0, **_tbtn)
-        self.status = ttk.Label(self.frame, text="Choose a pattern on the 1 · Choose pattern tab, then click "
-                                "Split pattern into tiles.", bootstyle="secondary", wraplength=520, justify="left")
-        self.status.grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 3))
-        self.x_settings.frame.grid(row=1, column=1, rowspan=1, sticky="ew", padx=6, pady=3)
-        self.y_settings.frame.grid(row=2, column=1, rowspan=1, sticky="ew", padx=6, pady=3)
-        for settings in (self.x_settings, self.y_settings):
-            for child in settings.frame.winfo_children():
-                child.grid_configure(padx=4, pady=4)
-
-    # ── Splitting ────────────────────────────────────────────────────────
-    def tile_path(self, x_idx, y_idx) -> Path:
-        return self.tile_dir / f"tile_{y_idx},{x_idx}.png"
-
-    def segment(self):
-        model = self.model
-        if not model.pattern_image_path or not Path(model.pattern_image_path).exists():
-            messagebox.showinfo("Choose a pattern", "Choose the large pattern on the 1 · Choose pattern tab first.")
-            return
-        try:
-            image = Image.open(model.pattern_image_path)
-            image.load()
-        except OSError as exc:
-            messagebox.showerror("Could not open image", str(exc))
-            return
-        width, height = image.size
-        (tile_w, tile_h), (overlap_x, overlap_y) = self.tile_size, self.tile_overlap
-        xs = tile_positions(width, tile_w, overlap_x)
-        ys = tile_positions(height, tile_h, overlap_y)
-        self.overall_pattern_size_w, self.overall_pattern_size_h = width, height
-        self.tile_dir.mkdir(exist_ok=True)
-        for old in self.tile_dir.glob("tile_*.png"):
-            old.unlink()  # never mix tiles from a previous pattern
-        for y_idx, top in enumerate(ys):
-            for x_idx, left in enumerate(xs):
-                # Areas past the image edge come out black (no light), so every tile sits on the
-                # same evenly spaced grid as the stage steps.
-                image.crop((left, top, left + tile_w, top + tile_h)).save(self.tile_path(x_idx, y_idx))
-        self.x_settings.amount_var.set(str(len(xs)))
-        self.y_settings.amount_var.set(str(len(ys)))
-        model.set_red_focus_source(RedFocusSource.PATTERN)
-        first = self.tile_path(0, 0)
-        model.set_pattern_image(load_pattern_image(first), str(first))
-        self.status.configure(text=f"Split into {len(xs)} × {len(ys)} = {len(xs) * len(ys)} tiles. Tile 1 is now the "
-                              "pattern: place and focus it, then click Start tiling.")
-        print(f"Saved {len(xs) * len(ys)} tiles ({len(xs)} x {len(ys)}) to {self.tile_dir}")
-
-    # ── Running ──────────────────────────────────────────────────────────
-    class _Stopped(Exception):
-        pass
-
-    def _check_stop(self):
-        if self.stop_requested:
-            raise self._Stopped("stopped by you")
-
-    def _align_to_previous_tile(self, edge) -> str:
-        model = self.model
-        if model.model is None or model.camera_image is None:
-            return "not aligned: no alignment model or no camera image"
-        image = model.camera_image
-        h, w = image.shape[:2]
-        markers, _ = detect_alignment_markers(model.model, image)
-        centers = filter_edge(marker_centers(markers, w, h), edge)
-        if not centers:
-            return f"not aligned: no marks found on the {edge} edge"
-        dx, dy, _, _ = alignment_correction(centers, model.config.alignment, tiling=True)
-        model.move_relative({"x": dx, "y": dy})
-        return f"aligned ({edge} edge, {len(centers)} mark(s)): moved X {dx:+.1f} µm, Y {dy:+.1f} µm"
-
-    def _expose_tile(self, x_idx, y_idx, x_count, start, step):
-        model = self.model
-        path = self.tile_path(x_idx, y_idx)
-        model.set_pattern_image(load_pattern_image(path), str(path))
-        if (x_idx, y_idx) != (0, 0):
-            # The first tile is exposed where the operator placed it.
-            model.move_absolute({"x": start[0] + step[0] * x_idx, "y": start[1] + step[1] * y_idx})
-        self._check_stop()
-        model.autofocus(blue_only=False)
-        self._check_stop()
-        edge = tiling_alignment_edge(x_idx, y_idx, x_count)
-        note = self._align_to_previous_tile(edge) if edge else "first tile, placed by you"
-        self._check_stop()
-        # Offset for UV focus, then autofocus in UV.
-        model.move_relative({"z": self.red_to_uv_offset})
-        model.non_blocking_delay(0.5)
-        model.enter_uv_mode(mode_switch_autofocus=False)
-        model.autofocus(blue_only=True)
-        self._check_stop()
-        exposures = model.chip.layers[-1].exposures
-        before = len(exposures)
-        model.begin_patterning()
-        # Back to red focus whatever happened.
-        model.enter_red_mode(mode_switch_autofocus=False)
-        model.move_relative({"z": -1 * self.red_to_uv_offset})
-        if len(exposures) == before:
-            raise self._Stopped("the exposure did not start (see the message shown)")
-        if exposures[-1].aborted:
-            raise self._Stopped("the exposure was stopped")
-        return note
-
-    def on_begin(self):
-        model = self.model
-        if self.running or model.patterning_busy or model.autofocus_busy:
-            return
-        try:
-            x_amount, y_amount = int(self.x_settings.amount_var.get()), int(self.y_settings.amount_var.get())
-            x_offset, y_offset = float(self.x_settings.offset_var.get()), float(self.y_settings.offset_var.get())
-            if x_amount == 0 or y_amount == 0 or not (math.isfinite(x_offset) and math.isfinite(y_offset)):
-                raise ValueError
-        except (ValueError, tkinter.TclError):
-            messagebox.showerror("Tiling settings", "Enter a whole number of tiles (not 0) and a distance in µm for X and Y.")
-            return
-        # A negative tile count reverses that axis.
-        x_dir, y_dir = (1 if x_amount > 0 else -1), (1 if y_amount > 0 else -1)
-        x_count, y_count = abs(x_amount), abs(y_amount)
-        missing = [(x, y) for y in range(y_count) for x in range(x_count) if not self.tile_path(x, y).exists()]
-        if missing:
-            messagebox.showinfo("Split the pattern first", "Some tiles have not been made yet. Click Split pattern "
-                                "into tiles first, and keep the tile counts it fills in.")
-            return
-        if model.model is None and (x_count > 1 or y_count > 1):
-            if not messagebox.askokcancel("No alignment", "The alignment model is not available, so tiles after the "
-                                          "first will be placed by stage steps only, without correction.\n\nContinue?"):
-                return
-        if not messagebox.askokcancel("Start tiling", f"Expose {x_count * y_count} tiles ({x_count} × {y_count}) "
-                                      "starting here?\n\nThe stage moves between tiles. Keep hands clear. "
-                                      "Click Stop tiling (or Stop exposure) to stop."):
-            return
-        model.set_red_focus_source(RedFocusSource.PATTERN)
-        start = model.stage_setpoint[:2]
-        step = (-x_dir * x_offset, -y_dir * y_offset)
-        self.running, self.stop_requested = True, False
-        self.begin_tiling_button.configure(state="disabled")
-        self.segment_images_button.configure(state="disabled")
-        self.abort_tiling_button.configure(state="normal")
-        report, stopped_because = [], None
-        try:
-            # Snake order: left to right on even rows, right to left on odd rows.
-            for y_idx in range(y_count):
-                columns = range(x_count) if y_idx % 2 == 0 else range(x_count - 1, -1, -1)
-                for x_idx in columns:
-                    self._check_stop()
-                    number = len(report) + 1
-                    self.status.configure(text=f"Exposing tile {number} of {x_count * y_count}…")
-                    note = self._expose_tile(x_idx, y_idx, x_count, start, step)
-                    report.append(f"Tile {number} (column {x_idx + 1}, row {y_idx + 1}): {note}")
-                    print(report[-1])
-        except self._Stopped as exc:
-            stopped_because = str(exc)
-        except StageError:
-            stopped_because = "the stage did not move (see the message shown)"
-        finally:
-            self.running = False
-            self.begin_tiling_button.configure(state="normal")
-            self.segment_images_button.configure(state="normal")
-            self.abort_tiling_button.configure(state="disabled")
-        total = x_count * y_count
-        headline = (f"Tiling stopped after {len(report)} of {total} tiles: {stopped_because}." if stopped_because
-                    else f"Tiling finished: {total} tiles exposed.")
-        self.status.configure(text=headline)
-        details = "\n".join(report[-12:])
-        (messagebox.showwarning if stopped_because else messagebox.showinfo)("Tiling", headline + ("\n\n" + details if details else ""))
-
-    def on_abort(self):
-        self.stop_requested = True
-        if self.model.patterning_busy:
-            self.model.abort_patterning()
-        self.status.configure(text="Stopping after the current step…")
-
-
-class ProjectorDisplayFrame:
-    """Frame to display what the projector is currently showing"""
-
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent)
-        self.event_dispatcher = event_dispatcher
-
-        # Main label frame
-        self.display_frame = ttk.Labelframe(self.frame, text="What the projector shows")
-        self.display_frame.grid(row=0, column=0)
-
-        # Create placeholder image
-        # Using a similar size to camera preview for consistency
-        self.display_size = (320, 180)
-        placeholder = Image.new("RGB", self.display_size, "black")
-        self.photo = image_to_tk_image(placeholder)
-
-        # Display label
-        self.label = ttk.Label(self.display_frame, image=self.photo, relief="solid", borderwidth=2)
-        self.label.grid(row=0, column=0, padx=5, pady=5)
-
-        # Status label showing current mode
-        self.status_var = StringVar(value="OFF · projector is black")
-        self.status_label = ttk.Label(self.display_frame, textvariable=self.status_var,
-                                      bootstyle="inverse-secondary", padding=(10, 4), anchor="center")
-        self.status_label.grid(row=1, column=0, padx=5, pady=(0, 4), sticky="ew")
-
-        self.label.configure(cursor="hand2")
-        ttk.Label(self.display_frame, text="Click the picture to see it full size", bootstyle="secondary").grid(row=2, column=0, pady=(0, 8))
-
-        # Listen for projector changes
-        event_dispatcher.add_event_listener(Event.SHOWN_IMAGE_CHANGED, self._update_display)
-        event_dispatcher.add_event_listener(Event.PATTERN_IMAGE_CHANGED, self._update_display)
-        event_dispatcher.add_event_listener(Event.IMAGE_ADJUST_CHANGED, self._update_display)
-        event_dispatcher.add_event_listener(Event.PATTERNING_BUSY_CHANGED, self._update_display)
-
-        # Force initial update
-        # self.event_dispatcher.root.after(100, self._update_display)
-
-    def _update_display(self):
-        """Update the display when projector content changes"""
-        shown_image = self.event_dispatcher.shown_image
-
-        # Update status text
-        status_map = {
-            ShownImage.CLEAR: ("OFF · projector is black", "secondary"),
-            ShownImage.PATTERN: ("UV · EXPOSING the pattern", "danger"),
-            ShownImage.FLATFIELD: ("Flatfield correction image", "warning"),
-            ShownImage.RED_FOCUS: ("RED · focusing light (safe for resist)", "success"),
-            ShownImage.UV_FOCUS: ("UV · focus marks (exposes resist!)", "warning"),
-        }
-        if self.event_dispatcher.patterning_busy:
-            text, style = status_map[ShownImage.PATTERN]
-        else:
-            text, style = status_map.get(shown_image, ("Unknown", "secondary"))
-        self.status_var.set(text)
-        self.status_label.configure(bootstyle=f"inverse-{style}")
-
-        # Get the appropriate processed image based on mode
-        # Note: When patterning, we check patterning_busy flag as well
-        img = None
-        if self.event_dispatcher.patterning_busy:
-            img = self.event_dispatcher.pattern.processed()
-        elif shown_image == ShownImage.RED_FOCUS:
-            img = self.event_dispatcher.red_focus.processed()
-        # pattern case above uv focus case: when set_patterning_busy(True) is called,
-        # shown_image is never changed to PATTERN during patterning - it stays as UV_FOCUS
-        elif shown_image == ShownImage.PATTERN or self.event_dispatcher.patterning_busy:
-            img = self.event_dispatcher.pattern.processed()
-        elif shown_image == ShownImage.UV_FOCUS:
-            img = self.event_dispatcher.uv_focus.processed()
-        elif shown_image == ShownImage.FLATFIELD:
-            # Flatfield might not be implemented, use pattern as fallback
-            img = self.event_dispatcher.pattern.processed()
-
-        # Update image
-        if img is None or (shown_image == ShownImage.CLEAR and not self.event_dispatcher.patterning_busy):
-            # Show black placeholder when clear
-            placeholder = Image.new("RGB", self.display_size, "black")
-            self.photo = image_to_tk_image(placeholder)
-        else:
-            display_img = img.copy()
-            display_img.thumbnail(self.display_size, Image.Resampling.LANCZOS)
-            self.photo = image_to_tk_image(display_img)
-
-        self.label.configure(image=self.photo)
-
-class TilingCheckFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Frame(parent)
-        self.event_dispatcher = event_dispatcher
-
-        self.capture_button = ttk.Button(
-            self.frame, 
-            text="Photograph the whole chip", 
-            command=self.capture_and_stitch
-        )
-        self.capture_button.grid(row=0, column=0)
-
-        self.preview_label = ttk.Label(self.frame)
-        self.preview_label.grid(row=1, column=0, padx=5, pady=5, sticky="nsew")
-
-        self.frame.rowconfigure(1, weight=1)
-        self.frame.columnconfigure(0, weight=1)
-
-    def capture_and_stitch(self):
-        self.img = self.event_dispatcher.pattern_image
-        self.img_w, self.img_h = self.img.size # 3840*2, 2160*2 # in pixels 
-        print("self.img_w, self.img_h: ", self.img_w, self.img_h)
-
-        self.tile_width, self.tile_height = 3840, 2160 # in pixels, defined in TilingFrame
-
-        # the distance that the stage will move in um
-        stride_x, stride_y = 798, 448 # 1037 / 1.3 and 583 / 1.3
-        # crop image pixels
-        # each snapshot captured is 1920 x 1080 pixels
-        crop_x, crop_y = 1477, 831 # 1920 / 1.3 and 1080 / 1.3
-        # Disable button during capture
-        self.capture_button.config(state='disabled', text="Capturing...")
-        self.frame.update()
-
-        stitched_image = self.takeAndStitchMapImages(stride_x, stride_y, crop_x, crop_y)
-        if stitched_image:
-            self.display_image(stitched_image, crop_x, crop_y)
-            print("Stitching complete!")
-        else:
-            print("Failed to stitch images")
-
-        self.capture_button.config(state='normal', text="Photograph the whole chip")
-
-    def display_image(self, pil_image, crop_x, crop_y):
-        display_img = pil_image.copy()
-        display_img = display_img.resize((crop_x//4, crop_y//4), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(display_img)
-        self.preview_label.config(image=photo)
-        self.preview_label.image = photo
-
-    def capture_current_image(self):
-        # Get the camera view from the event dispatcher
-        if hasattr(self.event_dispatcher, 'camera_image') and self.event_dispatcher.camera_image is not None:
-            camera_image = self.event_dispatcher.camera_image
-            pil_image = Image.fromarray(camera_image)
-            return pil_image
-        else:
-            print("No camera image available")
-            return None
-
-    def takeAndStitchMapImages(self, stride_x, stride_y, crop_x, crop_y):
-        """
-        Take snapshots num_cols * num_rows times, move in snake pattern
-        Move in stride_x and y um in distance
-        Crop all snapshots to crop_x, crop_y pixels in the center
-        Paste them to the blank canvas
-        Overlay the pattern image in the center
-        """
-        # calculate how many times the stage will move: num cols & rows
-        total_x_um = self.img_w * 1037 / 3840
-        total_y_um = self.img_h * 583 / 2160
-        num_cols = int(total_x_um // stride_x)
-        num_rows = int(total_y_um // stride_y)
-        if num_cols * stride_x < total_x_um:
-            num_cols += 1
-        if num_rows * stride_y < total_y_um:
-            num_rows += 1
-        print("num_cols, num_rows: ", num_cols, num_rows)
-
-        # large blank canvas
-        stitched_width = num_cols * crop_x
-        stitched_height = num_rows * crop_y
-        stitched_image = Image.new('RGB', (stitched_width, stitched_height), color='black')
-
-        # get starting position: center the chip
-        orig_x, orig_y, orig_z = self.event_dispatcher.stage_setpoint
-        delta_x_um = (num_cols * stride_x - total_x_um) / 2
-        delta_y_um = (num_rows * stride_y - total_y_um) / 2
-        start_x = orig_x - delta_x_um
-        start_y = orig_y - delta_y_um
-
-        # move in snake pattern with left to right on even rows
-        # and right to left on odd rows
-        for row in range(num_rows):
-            current_y = start_y + row * stride_y
-
-            if row % 2 == 0:
-                col_range = range(num_cols)
-                first_x = start_x
-            else:
-                col_range = range(num_cols - 1, -1, -1)
-                first_x = start_x + (num_cols - 1) * stride_x
-
-            # move to the next row
-            self.event_dispatcher.move_absolute({
-                "x": first_x,
-                "y": current_y,
-                "z": orig_z
-            })
-            self.event_dispatcher.non_blocking_delay(2)
-
-            # columns in this row
-            for idx, col in enumerate(col_range):
-                current_x = start_x + col * stride_x
-                if idx > 0: # idx = 0 first one don't need to move
-                    self.event_dispatcher.move_absolute({
-                        "x": current_x,
-                        "y": current_y,
-                        "z": orig_z
-                    })
-                    self.event_dispatcher.non_blocking_delay(2.5)
-
-                captured_image = self.capture_current_image()
-                # crop
-                orig_width, orig_height = captured_image.size
-                # each snapshot captured is 1920 x 1080 pixels
-                left = (orig_width - crop_x) // 2
-                top = (orig_height - crop_y) // 2
-                right = left + crop_x
-                bottom = top + crop_y
-                cropped_img = captured_image.crop((left, top, right, bottom))
-                # paste
-                x_pos = col * crop_x
-                y_pos = (num_rows - 1 - row) * crop_y
-                stitched_image.paste(cropped_img, (x_pos, y_pos))
-
-                self.event_dispatcher.non_blocking_delay(0.5)
-                self.frame.update()
-
-        # Return to starting position
-        self.event_dispatcher.move_absolute({
-            "x": orig_x,
-            "y": orig_y,
-            "z": orig_z
-        })
-
-        # Overlay the pattern image at center with 50% transparency
-        pattern_img = self.img.copy().convert('RGBA') # pattern image
-        # resize pattern image to match the snapshot's pixel
-        # each snapshot has half of each tile's w and h
-        pattern_img = pattern_img.resize((self.img_w//2, self.img_h//2), Image.Resampling.LANCZOS)
-        pattern_img.putalpha(int(255 * 0.5))
-        center_x = (stitched_width - self.img_w//2) // 2
-        center_y = (stitched_height - self.img_h//2) // 2
-        stitched_image = stitched_image.convert('RGBA')
-        stitched_image.paste(pattern_img, (center_x, center_y), pattern_img)
-        stitched_image = stitched_image.convert('RGB')
-
-        return stitched_image
-
-class MapFrame:
-    def __init__(self, parent, event_dispatcher: EventDispatcher):
-        self.frame = ttk.Labelframe(parent)
-        self.event_dispatcher = event_dispatcher
-
-        # Map dimensions in micrometers
-        self.map_size_um = 10000.0  # 1 cm * 1 cm
-
-        # Canvas size in pixels
-        self.canvas_size = 350
-
-        # Pattern dimensions: from DLP projector datasheet
-        self.pattern_w = 1037
-        self.pattern_h = 583
-
-        # canvas with plain background
-        self.canvas = tkinter.Canvas(
-            self.frame, 
-            width=self.canvas_size, 
-            height=self.canvas_size,
-            bg='#182632',
-        )
-        self.canvas.grid(row=0, column=0, padx=5, pady=5)
-
-        # coordinates of exposed patterns (list of tuples: (x, y))
-        self.pattern_markers = []
-
-        event_dispatcher.add_event_listener(Event.STAGE_POSITION_CHANGED, self._on_position_changed)
-        event_dispatcher.add_event_listener(Event.PATTERNING_FINISHED, self._on_pattern_exposed)
-        event_dispatcher.add_event_listener(Event.CHIP_CHANGED, self._on_chip_changed)
-
-        self._redraw_all()
-
-    def _um_to_pixels(self, um_x, um_y):
-        """
-        Convert micrometer coordinates to canvas pixel coordinates.
-        (0, 0) in micrometers is at the center of the canvas.
-        """
-        scale = self.canvas_size / self.map_size_um
-
-        # Add half map size to shift origin to center
-        pixel_x = (um_x + self.map_size_um / 2) * scale
-        pixel_y = (um_y + self.map_size_um / 2) * scale
-
-        return pixel_x, pixel_y
-
-    def _um_size_to_pixels(self, um_width, um_height):
-        """Convert micrometer dimensions to pixel dimensions"""
-        scale = self.canvas_size / self.map_size_um
-        return um_width * scale, um_height * scale
-
-    def _draw_pattern_marker(self, x_um, y_um):
-        """ Draw a blue rectangle given x and y """
-        x1_px, y1_px = self._um_to_pixels(x_um, y_um)
-        w_px, h_px = self._um_size_to_pixels(self.pattern_w, self.pattern_h)
-
-        x2_px = x1_px + w_px
-        y2_px = y1_px + h_px
-
-        # shift from bottom down to bottom up
-        y1_px = self.canvas_size - y1_px
-        y2_px = self.canvas_size - y2_px
-
-        marker = self.canvas.create_rectangle(
-            x1_px, y1_px, x2_px, y2_px,
-            fill='#7BB7B7',
-            width=0
-        )
-
-        return marker
-
-    def _draw_current_position(self):
-        """ Draw the red rectangle for current position. """
-        x_um, y_um, z_um = self.event_dispatcher.stage_setpoint
-
-        # Convert top-left corner to pixel coordinates
-        x1_px, y1_px = self._um_to_pixels(x_um, y_um)
-
-        # Get pattern dimensions in pixels
-        w_px, h_px = self._um_size_to_pixels(self.pattern_w, self.pattern_h)
-
-        # Calculate bottom-right corner
-        x2_px = x1_px + w_px
-        y2_px = y1_px + h_px
-
-        y1_px = self.canvas_size - y1_px
-        y2_px = self.canvas_size - y2_px        
-
-        marker = self.canvas.create_rectangle(
-                x1_px, y1_px, x2_px, y2_px,
-                fill='',  # No fill
-                outline='#E86E7F',  # Red outline
-                width=2
-            )
-
-        return marker # marker ID
-
-    def _load_patterns_from_chip(self):
-        """ Load all exposed pattern coordinates from the chip
-        into the self.pattern_markers list """
-
-        self.pattern_markers.clear()
-
-        chip = self.event_dispatcher.chip
-        for layer in chip.layers:
-            for exposure in layer.exposures:
-                if not exposure.aborted:  # Only include successful exposures
-                    x, y, z = exposure.coords
-                    self.pattern_markers.append((x, y))
-
-    def _redraw_all(self):
-        """Redraw all exposed patterns from the chip"""
-        # Clear existing pattern markers
-        self.canvas.delete("all")
-
-        # Draw all exposures from all layers
-        for x_um, y_um in self.pattern_markers:
-            self._draw_pattern_marker(x_um, y_um)
-
-        self._draw_current_position()
-
-    def _on_position_changed(self):
-        self._redraw_all() # TODO: only update current_position?
-
-    def _on_pattern_exposed(self):
-        """ Get the most recent exposure from current layer """
-        chip = self.event_dispatcher.chip
-        if chip.layers and chip.layers[-1].exposures:
-            latest_exposure = chip.layers[-1].exposures[-1]
-            if not latest_exposure.aborted:
-                x, y, z = latest_exposure.coords
-                self.pattern_markers.append((x, y))
-                self._redraw_all()
-
-    def _on_chip_changed(self):
-        """Handle chip changes (load, new chip, etc.) - reload and redraw"""
-        self._load_patterns_from_chip()
-        self._redraw_all()
-
-class ScrollPage:
-    """Scrollable workspace that stays usable on smaller laptop displays."""
-    def __init__(self, parent):
-        self.frame = ttk.Frame(parent)
-        self.canvas = tkinter.Canvas(self.frame, highlightthickness=0, background=ttk.Style().colors.bg)
-        vertical = ttk.Scrollbar(self.frame, orient="vertical", command=self.canvas.yview)
-        horizontal = ttk.Scrollbar(self.frame, orient="horizontal", command=self.canvas.xview)
-        self.canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        vertical.grid(row=0, column=1, sticky="ns")
-        horizontal.grid(row=1, column=0, sticky="ew")
-        self.frame.rowconfigure(0, weight=1)
-        self.frame.columnconfigure(0, weight=1)
-        self.body = ttk.Frame(self.canvas, padding=(28, 28))
-        self.item = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
-        self.body.bind("<Configure>", lambda _: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        def fit(event):
-            width = max(self.body.winfo_reqwidth(), min(event.width, 1240))
-            self.canvas.itemconfigure(self.item, width=width)
-            self.canvas.coords(self.item, max(0, (event.width - width) / 2), 0)
-        self.canvas.bind("<Configure>", fit)
+                             "(HackerfabStepper.log, or the terminal). Help → Open log shows it.")
+
+
+CONFIG_VERSION = 2
+
+
+def migrate_config(config: dict) -> list[str]:
+    """Bring a settings file saved by an older version up to date. Returns what changed."""
+    app = config.setdefault("app", {})
+    try:
+        version = int(app.get("config-version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    changes = []
+    if version < 2:
+        cam = config.setdefault("camera", {})
+        if str(cam.get("exposure", "auto")).strip().lower() not in ("auto", "camera"):
+            # The old manual exposure was a workaround for the stripes; the new automatic
+            # exposure finds the stripe-free value itself.
+            changes.append(f"camera exposure {cam.get('exposure')} -> automatic")
+            cam["exposure"] = "auto"
+        if str(cam.get("mode", "auto")).lower() == "auto":
+            cam["mode"] = "max"
+            changes.append("camera resolution -> highest available")
+    app["config-version"] = CONFIG_VERSION
+    return changes
 
 
 class LithographerGui:
+    MOVABLE_WINDOW = "Movable window"
+
     def __init__(self, config: LithographerConfig, root: tkinter.Tk, settings=None, config_path="config.toml"):
         self.root = root
+        self.config = settings if settings is not None else {}
+        self.config_path = config_path
+        ui = self.config.get("ui", {})
+        configure_theme(root, ui.get("theme", "studio-dark"), ui.get("text-scale", 1.0))
         root.title("HackerFab Stepper")
-        root.geometry("1440x1000")
-        root.minsize(900, 650)
-        root.columnconfigure(1, weight=1)
-        root.rowconfigure(0, weight=1)
-        style = configure_theme(root, (settings or {}).get("ui", {}).get("theme", "studio-dark"), (settings or {}).get("ui", {}).get("text-scale", 1.0))
-        style.configure("TButton", padding=(14, 9))
-        style.configure("TNotebook.Tab", padding=(20, 12))
-        style.configure("TLabelframe", padding=12)
-        self.event_dispatcher = EventDispatcher(config.stage, TkProjector(root), root,
-                                               config.camera, config.red_exposure, config.uv_exposure)
-        self.event_dispatcher.stage_limits = dict(getattr(config, "stage_limits", None) or {})
-        previous_handler = root.report_callback_exception
-        def report_callback_exception(exc_type, exc, tb):
-            if isinstance(exc, StageError):
-                return  # the stage error dialog has already explained what happened
-            previous_handler(exc_type, exc, tb)
-        root.report_callback_exception = report_callback_exception
-        self.event_dispatcher.initialize_alignment(config)
-        self.shown_image = ShownImage.CLEAR
-        sidebar = ttk.Frame(root, padding=(20, 28))
-        sidebar.grid(row=0, column=0, sticky="ns")
-        ttk.Label(sidebar, text="HackerFab", font="StepperSection", bootstyle="info").pack(anchor="w")
-        ttk.Label(sidebar, text="Stepper", font="StepperBrand").pack(anchor="w", pady=(6, 4))
-        ttk.Label(sidebar, text="Photolithography", bootstyle="secondary").pack(anchor="w", pady=(0, 32))
+        self._place_window()
+
+        proj_cfg = self.config.get("projector", {})
+        size = parse_size(proj_cfg.get("resolution", "auto")) or (1920, 1080)
+        self.dispatcher = EventDispatcher(config.stage, TkProjector(root, size=size), root, config.camera,
+                                          config.red_exposure, config.uv_exposure)
+        d = self.dispatcher
+        d.stage_limits = dict(getattr(config, "stage_limits", None) or {})
+        d.initialize_alignment(config)
+        self._apply_saved_settings()
+        d.ensure_output = self.ensure_output
+        d.snapshot_requester = lambda path: self.request_snapshot(path, auto=True)
+        d.add_event_listener(Event.NOTIFY, lambda text, kind="muted": self.toast.show(text, kind))
+
+        self.focus_tracker = FocusTracker()
+        self.camera_generation = 0
+        self._pending_frame = None
+        self.last_frame_at = 0.0
+        self._last_detection_at, self._last_marks = 0.0, []
+        self.snapshot_results = queue.Queue()
+        self.camera_fullscreen: Optional[CameraFullscreen] = None
+        self.adjust_dialog: Optional[CameraAdjustDialog] = None
+        self.preview_window: Optional[ProjectorPreviewWindow] = None
+        self._temporary_output = False
+        self.projector_window = ProjectorWindow(root, on_escape=self._escape, on_close=self._projector_window_changed,
+                                                can_close=self._projector_window_may_close)
+        self.displays = list_displays(root)
+        self.display_choice = ""
+
+        self._build()
+        d.hardware.projector.on_show = self._projector_updated
+        install_wheel_router(root)
+        prepare_dropdowns(root)
+        root.bind("<F1>", lambda _e: self.open_help())
+        root.bind("<Escape>", lambda _e: self._escape(), add="+")
+        root.bind("<KeyPress>", self.handle_key, add="+")
+        root.bind_all("<Button-1>", self._click_focus, add="+")
+        root.protocol("WM_DELETE_WINDOW", self.request_close)
+        d.add_event_listener(Event.PATTERNING_BUSY_CHANGED, self._patterning_changed)
+        d.add_event_listener(Event.MOVEMENT_LOCK_CHANGED, self._lock_changed)
+        self.show_page("operate")
+        self.refresh_display_choices()
+        root.after(0, self._on_start)
+
+    # ================================================================== setup
+    def _place_window(self):
+        root = self.root
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        w, h = min(px(1440), sw - px(40)), min(px(920), sh - px(90))
+        root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 3)}")
+        root.minsize(min(px(980), sw - px(20)), min(px(620), sh - px(60)))
+
+    def maximize(self):
+        """A single laptop screen: use all of it."""
+        if os.name == "nt":
+            try:
+                self.root.state("zoomed")
+            except tkinter.TclError:
+                pass
+
+    def _apply_saved_settings(self):
+        d, cfg = self.dispatcher, self.config
+        cam = cfg.get("camera", {})
+        proj = cfg.get("projector", {})
+        files = cfg.get("files", {})
+        try:
+            d.red_brightness = max(0.02, min(1.0, float(proj.get("red-brightness", 100)) / 100))
+        except (TypeError, ValueError):
+            pass
+        try:
+            seconds = float(cfg.get("exposure", {}).get("seconds", 8))
+            if 0 < seconds <= 3600:
+                d.exposure_time = int(round(seconds * 1000))
+        except (TypeError, ValueError):
+            pass
+        exposure = str(cam.get("exposure", "auto")).strip().lower()
+        d.auto_camera.auto_exposure = exposure in ("auto", "app", "")
+        d.auto_camera.auto_light = setting_flag(cam, "auto-light", True)
+        d.auto_snapshot_on_uv = setting_flag(files, "auto-snapshot", True)
+        folder = files.get("snapshot-folder")
+        if folder:
+            try:
+                d.set_snapshot_directory(Path(folder))
+            except OSError as exc:
+                print(f"Snapshot folder {folder!r} unavailable ({exc}); using {d.snapshot_directory}")
+        plus = Path("src/uvFocusImage/plus.png")
+        if plus.exists():
+            try:
+                d.uv_focus_image = load_pattern_image(plus)
+            except (OSError, ValueError):
+                pass
+        d._refresh_red_focus()
+        d._refresh_uv_focus()
+
+    def _build(self):
+        root = self.root
+        c = palette()
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(2, weight=1)
+        # ---- top bar
+        top = ttk.Frame(root, padding=(px(14), px(8), px(14), px(8)))
+        top.grid(row=0, column=0, sticky="ew")
+        # The status column is the one that gives way on a narrow window, so STOP always stays visible.
+        top.columnconfigure(2, weight=1)
+        brand = ttk.Frame(top)
+        brand.grid(row=0, column=0, sticky="w", padx=(0, px(18)))
+        ttk.Label(brand, text="HackerFab", style="Caption.TLabel").pack(anchor="w")
+        ttk.Label(brand, text="Stepper", font="StepperBrand").pack(anchor="w")
+        self.page_var = StringVar(value="operate")
+        self.nav = Segmented(top, PAGES, self.page_var, command=self.show_page, font="StepperBold", padx=14, pady=6,
+                             equal=False)
+        self.nav.grid(row=0, column=1, sticky="w")
+        status = ttk.Frame(top)
+        status.grid(row=0, column=2, sticky="e", padx=(px(12), px(12)))
+        self.dots = {}
+        for key, label in (("camera", "Camera"), ("stage", "Stage"), ("projector", "Projector"), ("leds", "LEDs")):
+            dot = StatusDot(status, label)
+            dot.pack(side="left", padx=(px(10), 0))
+            self.dots[key] = dot
+        self.help_button = ttk.Button(top, text="Help  F1", bootstyle="dark", command=self.open_help)
+        self.help_button.grid(row=0, column=4, padx=(0, px(8)))
+        self.stop_button = ttk.Button(top, text="■  STOP", bootstyle="danger", command=self.stop_everything)
+        self.stop_button.grid(row=0, column=5)
+        add_tooltip(self.help_button, "Answers to “how do I…” and “what's wrong?”, and what is not ready yet (F1).")
+        add_tooltip(self.stop_button, "Stops whatever is running (exposure, autofocus, homing, tiling) and turns "
+                                      "the projector off. Esc does the same.")
+        ttk.Separator(root).grid(row=1, column=0, sticky="ew")
+        # ---- pages
         host = ttk.Frame(root)
-        host.grid(row=0, column=1, sticky="nsew")
+        host.grid(row=2, column=0, sticky="nsew")
         host.columnconfigure(0, weight=1)
         host.rowconfigure(0, weight=1)
         self.pages = {}
-        self.nav_buttons = {}
-        for name in ("Operate", "Alignment", "Wafer & tiling", "Settings"):
-            page = ScrollPage(host)
-            page.frame.grid(row=0, column=0, sticky="nsew")
-            self.pages[name] = page
-            button = ttk.Button(sidebar, text=PAGE_LABELS[name], command=lambda n=name: self.show_page(n), bootstyle="secondary-link", width=20)
-            button.pack(fill="x", pady=5)
-            self.nav_buttons[name] = button
-        self.help_button = ttk.Button(sidebar, text="Help & guide  (F1)", command=open_guide, bootstyle="info-link", width=20)
-        self.help_button.pack(fill="x", pady=(14, 0))
-        root.bind("<F1>", lambda _event: open_guide())
-        ttk.Label(sidebar, text="Connected equipment", bootstyle="secondary").pack(anchor="w", pady=(28, 12))
-        self.device_status = StringVar(value="Camera · connecting")
-        ttk.Label(sidebar, textvariable=self.device_status, wraplength=195).pack(anchor="w")
-        self.stage_status = StringVar()
-        ttk.Label(sidebar, textvariable=self.stage_status, bootstyle="secondary", wraplength=195).pack(anchor="w", pady=(8, 0))
-        self.stage_status_anchor = ttk.Frame(sidebar)
-        self.stage_status_anchor.pack(anchor="w", fill="x", pady=(0, 8))
-        self.reconnect_stage_button = ttk.Button(self.stage_status_anchor, text="Reconnect stage", bootstyle="warning",
-                                                 command=self.event_dispatcher.reconnect_stage)
-        def stage_connection_changed():
-            if self.event_dispatcher.stage_connected:
-                simulated = type(self.event_dispatcher.hardware.stage) is StageController
-                self.stage_status.set("Stage · simulation (not moving)" if simulated else "Stage · connected")
-                self.reconnect_stage_button.pack_forget()
+        self.pages["operate"] = self._build_operate(host)
+        chip = ScrollFrame(host, padding=px(18), allow_wider=True)
+        self._build_chip_page(chip.body)
+        self.pages["chip"] = chip
+        alignment = ScrollFrame(host, padding=px(18), max_width=1100)
+        self.alignment_page = AlignmentPage(alignment.body, self)
+        self.alignment_page.grid(row=0, column=0, sticky="nsew")
+        alignment.body.columnconfigure(0, weight=1)
+        self.pages["alignment"] = alignment
+        settings = ttk.Frame(host, padding=px(18))
+        settings.columnconfigure(0, weight=1)
+        settings.rowconfigure(0, weight=1)
+        self.settings_page = SettingsPage(settings, self, self.config, self.config_path)
+        self.settings_page.grid(row=0, column=0, sticky="nsew")
+        self.pages["settings"] = settings
+        help_scroll = ScrollFrame(host, padding=px(18), max_width=1000, center=True)
+        self.help_page = HelpPage(help_scroll.body, self)
+        self.help_page.grid(row=0, column=0, sticky="nsew")
+        help_scroll.body.columnconfigure(0, weight=1)
+        self.pages["help"] = help_scroll
+        for page in self.pages.values():
+            page.grid(row=0, column=0, sticky="nsew")
+            page.grid_remove()
+        # ---- status line
+        ttk.Separator(root).grid(row=3, column=0, sticky="ew")
+        bottom = ttk.Frame(root, padding=(px(14), px(4)))
+        bottom.grid(row=4, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        message = tkinter.Label(bottom, text="", anchor="w", font="StepperSmall", background=c["bg"], foreground=c["faint"])
+        message.grid(row=0, column=0, sticky="ew")
+        self.toast = Toast(message, "Ready.")
+        self.toast.clear()
+        ttk.Label(bottom, text="Arrows: move X/Y   PgUp/PgDn: focus   Shift: 10× step   Esc: STOP   F1: Help page",
+                  style="Small.TLabel").grid(row=0, column=1, sticky="e")
+
+    def _build_operate(self, host):
+        page = ttk.Frame(host, padding=(px(12), px(10), px(12), px(10)))
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=1)
+        left = ttk.Frame(page)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, px(12)))
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=1)
+        self.camera_view = CameraView(left, self)
+        self.camera_view.grid(row=0, column=0, sticky="nsew")
+        self.camera_bar = CameraBar(left, self)
+        self.camera_bar.grid(row=1, column=0, sticky="ew")
+        self.camera_bar.show_choice(self.config.get("camera", {}))
+        stage_card = Card(left, "Stage", padding=10)
+        stage_card.grid(row=2, column=0, sticky="ew", pady=(px(10), 0))
+        self.stage_panel = StagePanel(stage_card.body, self)
+        self.stage_panel.grid(row=0, column=0, sticky="ew")
+        right = ttk.Frame(page, width=px(390))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_propagate(False)
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        self.projector_panel = ProjectorPanel(right, self)
+        self.projector_panel.grid(row=0, column=0, sticky="ew")
+        workflow_card = Card(right, "", padding=10)
+        workflow_card.grid(row=1, column=0, sticky="nsew", pady=(px(10), 0))
+        workflow_card.body.rowconfigure(0, weight=1)
+        self.workflow = WorkflowPanel(workflow_card.body, self)
+        self.workflow.grid(row=0, column=0, sticky="nsew")
+        return page
+
+    def _build_chip_page(self, body):
+        d = self.dispatcher
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="Chip & map", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(body, text="Where each pattern was exposed on this chip, layer by layer. Every exposure is added "
+                             "automatically.", style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w",
+                                                                        pady=(px(2), px(14)))
+        map_card = Card(body, "Exposure map")
+        map_card.grid(row=2, column=0, sticky="nw", padx=(0, px(14)))
+        self.map = MapFrame(map_card.body, d)
+        self.map.frame.grid(row=0, column=0)
+        chip_card = Card(body, "Chip record")
+        chip_card.grid(row=2, column=1, sticky="nsew")
+        self.chip_frame = ChipFrame(chip_card.body, d)
+        self.chip_frame.frame.grid(row=0, column=0, sticky="nsew")
+        tiling_card = Card(body, "Tiling: large patterns over several fields (advanced)")
+        tiling_card.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(px(14), 0))
+        self.tiling_frame = TilingFrame(tiling_card.body, d)
+        self.tiling_frame.frame.grid(row=0, column=0, sticky="w")
+
+    # ================================================================== start / stop
+    def _on_start(self):
+        self.start_camera()
+        self.connect_leds(quiet=True)
+        self.dispatcher.show_red()
+        self.auto_open_projector_window()
+        self._poll_frames()
+        self._status_tick()
+        if self.dispatcher.hardware.stage.has_homing():
+            self.dispatcher.home_stage()
+
+    def notify(self, text, kind="muted"):
+        self.toast.show(text, kind)
+
+    def open_help(self):
+        if self.dispatcher.busy_text():
+            open_guide()   # pages are locked while something runs; the guide opens in the browser
+            return
+        self.show_page("help")
+        self.help_page.search.focus_set()
+
+    def show_page(self, name):
+        if name != "operate" and self.dispatcher.shown_image == ShownImage.UV_FOCUS:
+            self.dispatcher.show_red()   # the blue focus mark exposes resist: don't leave it on unseen
+        self.current_page = name
+        self.page_var.set(name)
+        for key, page in self.pages.items():
+            if key == name:
+                page.grid()
             else:
-                self.stage_status.set("Stage · DISCONNECTED")
-                self.reconnect_stage_button.pack(fill="x", pady=(6, 0))
-        self.event_dispatcher.add_event_listener(Event.STAGE_CONNECTION_CHANGED, stage_connection_changed)
-        stage_connection_changed()
-        self.projector_sidebar = StringVar(value="Projector · in this window")
-        ttk.Label(sidebar, textvariable=self.projector_sidebar, bootstyle="secondary", wraplength=195).pack(anchor="w")
-        def clear_projector():
-            if self.event_dispatcher.patterning_busy:
-                self.event_dispatcher.abort_patterning()
-            self.event_dispatcher.set_shown_image(ShownImage.CLEAR)
-        self.clear_button = ttk.Button(sidebar, text="Clear projector (black)", command=clear_projector, bootstyle="secondary-outline")
-        self.clear_button.pack(side="bottom", fill="x", pady=8)
-        self.abort_button = ttk.Button(sidebar, text="Stop exposure", command=self.event_dispatcher.abort_patterning, bootstyle="danger", state="disabled")
-        self.abort_button.pack(side="bottom", fill="x")
-        self.event_dispatcher.add_event_listener(Event.PATTERNING_BUSY_CHANGED, lambda: self.abort_button.configure(state="normal" if self.event_dispatcher.patterning_busy else "disabled"))
-        operation = self.pages["Operate"].body
-        operation.columnconfigure(0, weight=1)
-        ttk.Label(operation, text="Main screen", font="StepperTitle").grid(row=0, column=0, sticky="w")
-        ttk.Label(operation, text="Work through the three tabs below: 1 choose a pattern, 2 focus with red light, 3 expose with UV light.", bootstyle="secondary").grid(row=1, column=0, sticky="w", pady=(4, 20))
-        self.top_panel = ttk.Frame(operation)
-        self.top_panel.grid(row=2, column=0, sticky="ew")
-        self.top_panel.columnconfigure(0, weight=1)
-        self.camera = CameraFrame(self.top_panel, self.event_dispatcher, config.camera, config.camera_scale)
-        self.camera.frame.grid(row=0, column=0, sticky="nsew", padx=(0, 16))
-        self.projector_display = ProjectorDisplayFrame(self.top_panel, self.event_dispatcher)
-        self.projector_display.frame.grid(row=0, column=1, sticky="n")
-        def close_fullscreen(kind):
-            if kind == "projector":
-                if self.event_dispatcher.patterning_busy:
-                    self.event_dispatcher.abort_patterning()
-                if not self.projector_window.is_open:
-                    # This view *was* the projection, so leaving it clears the projector.
-                    # With a projector window it was only a preview.
-                    self.event_dispatcher.set_shown_image(ShownImage.CLEAR)
-        self.fullscreen = FullscreenPreview(root, on_close=close_fullscreen)
-        def camera_picture():
-            image = self.event_dispatcher.camera_image
-            return Image.fromarray(image) if image is not None else None
-        def projector_picture():
-            return getattr(self.event_dispatcher.hardware.projector, "current_image", self.event_dispatcher.current_image)
-        self.camera.label.configure(cursor="hand2")
-        self.camera.label.bind("<Button-1>", lambda _: self.fullscreen.open("camera", camera_picture))
-        self.projector_display.label.bind("<Button-1>", lambda _: self.fullscreen.open("projector", projector_picture))
-        self.projector_settings = (settings or {}).get("projector", {})
-        self.projector_window = ProjectorWindow(root, on_escape=self._escape_exposure, on_close=self._projector_window_changed)
-        root.bind("<Escape>", lambda _event: self._escape_exposure(), add="+")
-        def projector_updated():
-            # With a projector window, every image goes there. Without one, exposures use the
-            # app's own fullscreen view. The exposure timer starts after show() returns.
-            if self.projector_window.is_open:
-                self.projector_window.show(projector_picture())
-            elif self.event_dispatcher.patterning_busy and not self.event_dispatcher.should_abort and self.fullscreen.kind != "projector":
-                self.fullscreen.open("projector", projector_picture)
-            if self.fullscreen.kind == "projector":
-                self.fullscreen.refresh()
-        self.event_dispatcher.hardware.projector.on_show = projector_updated
-        def arrange_preview(event):
-            if event.width < 1080:
-                self.projector_display.frame.grid(row=1, column=0, sticky="w", pady=(16, 0))
-            else:
-                self.projector_display.frame.grid(row=0, column=1, sticky="n", pady=0)
-        self.top_panel.bind("<Configure>", arrange_preview)
-        ttk.Label(operation, text="Click either preview to see it full size (Esc or × to return). Exposures go to the projector window "
-                  "when it is open; otherwise they fill this window, which then has to be on the projector display.",
-                  bootstyle="warning", wraplength=900).grid(row=3, column=0, sticky="w", pady=16)
-        self._build_projector_controls()
-        self.pattern_progress = ttk.Progressbar(operation, bootstyle="info")
-        self.pattern_progress.grid(row=4, column=0, sticky="ew", pady=(0, 16))
-        self.event_dispatcher.add_event_listener(Event.EXPOSURE_PATTERN_PROGRESS_CHANGED, lambda: self.pattern_progress.configure(value=self.event_dispatcher.patterning_progress * 100))
-        self.mode_select_frame = ModeSelectFrame(operation, self.event_dispatcher)
-        self.mode_select_frame.uv_mode_frame.checklist.projector_status = self.projector_status_line
-        red = self.mode_select_frame.red_mode_frame
+                page.grid_remove()
+
+    def step_changed(self, step):
+        d = self.dispatcher
+        if d.patterning_busy:
+            return
+        if d.shown_image == ShownImage.UV_FOCUS and step != "expose":
+            d.show_red()   # the blue focus mark exposes resist: only on the Expose step
+        elif step == "focus" and d.shown_image == ShownImage.CLEAR:
+            d.show_red()
+
+    def handle_key(self, event):
+        if self.camera_fullscreen is None and getattr(self, "current_page", "operate") != "operate":
+            return None
+        if self.stage_panel.handle_key(event):
+            return "break"
+        return None
+
+    def _click_focus(self, event):
+        """Clicking anywhere outside a text field gives the keyboard back to the stage shortcuts."""
+        widget = event.widget
         try:
-            red.red_brightness_var.set(max(2, min(100, float(self.projector_settings.get("red-brightness", 100)))))
-        except (TypeError, ValueError):
-            pass
-        red.on_red_brightness = lambda percent: self.settings_page.config.setdefault("projector", {}).__setitem__(
-            "red-brightness", percent) if hasattr(self, "settings_page") else None
-        self.mode_select_frame.notebook.grid(row=5, column=0, sticky="nsew")
-        alignment = self.pages["Alignment"].body
-        ttk.Label(alignment, text="Image alignment", font="StepperTitle").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 20))
-        self.image_adjust_frame = ImageAdjustFrame(alignment, self.event_dispatcher)
-        self.image_adjust_frame.frame.grid(row=1, column=0, sticky="nw", padx=(0, 20))
-        self.global_settings_frame = GlobalSettingsFrame(alignment, self.event_dispatcher, config.alignment.enabled)
-        self.global_settings_frame.frame.grid(row=1, column=1, sticky="nw")
-        wafer = self.pages["Wafer & tiling"].body
-        ttk.Label(wafer, text="Chip records & tiling", font="StepperTitle").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 20))
-        self.map = MapFrame(wafer, self.event_dispatcher)
-        self.map.frame.grid(row=1, column=0, sticky="nw", padx=(0, 20))
-        self.chip_frame = ChipFrame(wafer, self.event_dispatcher)
-        self.chip_frame.frame.grid(row=1, column=1, sticky="nw")
-        self.tiling_frame = TilingFrame(wafer, self.event_dispatcher)
-        self.tiling_frame.frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=20)
-        self.settings_page = SettingsPage(self.pages["Settings"].body, self, settings or {}, config_path)
-        self.settings_page.frame.pack(fill="both", expand=True)
-        self.exposure_frame = self.mode_select_frame.uv_mode_frame.exposure_frame
-        self.patterning_frame = self.mode_select_frame.uv_mode_frame.patterning_frame
-        prepare_dropdowns(root)
-        def scroll_workspace(event):
-            if event.widget.winfo_class() in ('Listbox', 'Treeview', 'Text', 'TCombobox'):
+            if isinstance(widget, str) or widget.winfo_toplevel() is not self.root:
                 return
-            direction = -1 if getattr(event, 'num', 0) == 4 or getattr(event, 'delta', 0) > 0 else 1
-            widget = event.widget
-            while widget is not None:
-                for page in self.pages.values():
-                    if widget == page.frame:
-                        page.canvas.yview_scroll(direction * 3, 'units')
-                        return 'break'
-                widget = getattr(widget, 'master', None)
-            # On Windows the wheel goes to the focused widget, which may be the main window
-            # itself (e.g. after the projector window opens). Scroll the page on screen.
-            if event.widget == root:
-                self.pages[self.current_page].canvas.yview_scroll(direction * 3, 'units')
-                return 'break'
-        for sequence in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
-            root.bind_all(sequence, scroll_workspace)
-        root.protocol("WM_DELETE_WINDOW", self.request_close)
-        self._add_tooltips()
-        self.show_page("Operate")
-        def on_start():
-            self.camera.start()
-            self.event_dispatcher.enter_red_mode(mode_switch_autofocus=False)
-            self.auto_open_projector_window()
-            if self.event_dispatcher.hardware.stage.has_homing():
-                self.event_dispatcher.home_stage()
+            if widget.winfo_class() in ("Entry", "TEntry", "TSpinbox", "Spinbox", "TCombobox", "Text"):
+                return
+            self.root.focus_set()
+        except (tkinter.TclError, KeyError, AttributeError):
+            pass
+
+    def _escape(self):
+        d = self.dispatcher
+        if d.busy_text():
+            self.stop_everything()
+        elif self._temporary_output and self.projector_window.is_open:
+            self.projector_window.close()
+
+    def stop_everything(self):
+        d = self.dispatcher
+        was = d.busy_text()
+        d.stop_all()
+        if was == "exposure":
+            self.notify("Stopping the exposure… the projector turns off.", "warn")
+        elif was:
+            self.notify(f"Stopping the {was}…", "warn")
+        else:
+            self.notify("Projector turned off (black, LEDs off). Click Red light to see the chip again.", "warn")
+
+    def _patterning_changed(self):
+        busy = self.dispatcher.patterning_busy
+        if not busy and self._temporary_output and self.projector_window.is_open:
+            self.projector_window.close()   # it covered the controls; give the screen back
+        self._lock_changed()
+
+    def _lock_changed(self):
+        """Controls that must not change while an exposure, autofocus, homing or tiling runs."""
+        d = self.dispatcher
+        busy = bool(d.busy_text())
+        self.nav.set_enabled(not busy)
+        self.camera_bar.set_locked(busy)
+        self.projector_panel.set_locked(d.patterning_busy)
+
+    def _refuse_while_busy(self, what: str) -> bool:
+        """True (and a message in the status line) if something is running."""
+        running = self.dispatcher.busy_text()
+        if running:
+            self.notify(f"{what} is not possible while the {running} runs. Press STOP (Esc) first.", "warn")
+            return True
+        return False
+
+    def _projector_window_may_close(self) -> bool:
+        if self.dispatcher.patterning_busy:
+            self.notify("The projector window stays open during an exposure. Press STOP (Esc) to end it.", "warn")
+            return False
+        return True
+
+    def request_close(self):
+        d = self.dispatcher
+        if d.patterning_busy:
+            d.abort_patterning()
+            self.root.after(200, self.request_close)  # let the exposure loop finish first
+            return
+        running = d.busy_text()
+        if running:
+            if not messagebox.askyesno("Still running", f"The {running} is still running. Stop it and close?"):
+                return
+            d.stop_all()
+            self.root.after(300, self.request_close)
+            return
+        if not self.chip_frame.offer_to_save("Close HackerFab Stepper"):
+            return
+        try:
+            self.settings_page.save("Settings saved.")  # remember display, brightness, steps … for next time
+        except Exception as exc:
+            print(f"Settings not saved on exit: {exc}")
+        self.cleanup()
+
+    def cleanup(self):
+        if self.toast._job is not None:
+            try:
+                self.toast.label.after_cancel(self.toast._job)
+            except tkinter.TclError:
+                pass
+        self.projector_window.close(notify=False)
+        for window in (self.camera_fullscreen, self.adjust_dialog, self.preview_window):
+            if window is not None:
+                try:
+                    window.close()
+                except Exception:
+                    pass
+        self.camera_generation += 1
+        camera = self.dispatcher.camera
+        if camera:
+            try:
+                camera.close()
+            except Exception as exc:
+                print(f"Camera close failed: {exc}")
+        if self.dispatcher.leds is not None:
+            try:
+                self.dispatcher.leds.close(0)   # LEDs off: nothing gets projected onto resist after exit
+            except Exception:
+                pass
+        try:
+            self.dispatcher.hardware.stage.close()
+        except Exception:
+            pass
+        try:  # pending timers (pollers, tooltips) must not fire after the window is gone
+            for job in self.root.tk.splitlist(self.root.tk.call("after", "info")):
+                self.root.tk.call("after", "cancel", job)  # raw cancel: widgets delete their own callbacks
+        except tkinter.TclError:
+            pass
+        self.root.destroy()
+
+    # ================================================================== camera
+    def start_camera(self):
+        camera = self.dispatcher.camera
+        if camera is None:
+            self.camera_view.canvas.set_message("Camera off", "Choose a camera in Settings → Camera.")
+            return
+        generation = self.camera_generation
+
+        def on_frame(image, dimensions, fmt):
+            if generation == self.camera_generation:
+                self._pending_frame = (image, dict(getattr(camera, "latest_info", {}) or {}))
+
+        camera.setStreamCaptureCallback(on_frame)
+        if hasattr(camera, "snapshot_listener"):
+            camera.snapshot_listener = lambda result: self.snapshot_results.put(result)
+        self.camera_view.canvas.set_message("Connecting to the camera…", "Searching for the highest resolution it supports.")
+        try:
+            if not camera.open() or not camera.startStreamCapture():
+                self.camera_view.canvas.set_message("Camera failed to start", "Click Reconnect, or choose a camera in Settings.")
+        except Exception as exc:
+            self.camera_view.canvas.set_message("Camera failed to start", str(exc))
+
+    def _poll_frames(self):
+        d = self.dispatcher
+        try:
+            packet, self._pending_frame = self._pending_frame, None
+            if packet is not None:
+                image, info = packet
+                self.last_frame_at = time.monotonic()
+                d.on_camera_frame(image, info)
+                self._check_black_picture(info)
+                self.focus_tracker.update(d.current_focus(blue_only=d.in_uv()))
+                shown = image
+                if d.model is not None and d.realtime_detection:
+                    # Detection takes tens of ms; run it twice a second and reuse the boxes in
+                    # between, so the preview stays smooth.
+                    now = time.monotonic()
+                    if now - self._last_detection_at > 0.5:
+                        self._last_detection_at = now
+                        self._last_marks, _ = detect_alignment_markers(d.model, image)
+                    if self._last_marks:
+                        shown = image.copy()
+                        for corner0, corner1 in self._last_marks:
+                            cv2.rectangle(shown, corner0, corner1, (0, 255, 0), max(2, shown.shape[1] // 400))
+                if self.camera_fullscreen is not None:
+                    self.camera_fullscreen.set_frame(shown, info)
+                elif self.current_page == "operate":
+                    self.camera_view.canvas.set_frame(shown, info)
+                else:
+                    self.camera_view.canvas.image, self.camera_view.canvas.info = shown, info
             else:
-                self.event_dispatcher.sync_stage_position()
-            self.update_status()
-        root.after(0, on_start)
+                camera = d.camera
+                stale = self.last_frame_at and time.monotonic() - self.last_frame_at > 3.0
+                if camera is not None and (getattr(camera, "state", "") == "error" or stale) and d.camera_image is not None:
+                    d.camera_lost()
+                    self.focus_tracker.update(None)
+                if camera is not None and d.camera_image is None:
+                    title = {"error": "No camera picture", "connecting": "Connecting to the camera…"}.get(
+                        getattr(camera, "state", ""), "Waiting for the camera…")
+                    detail = getattr(camera, "status", "")
+                    if self.camera_view.canvas.message != (title, detail):
+                        self.camera_view.canvas.set_message(title, detail)
+                        if self.camera_fullscreen is not None:
+                            self.camera_fullscreen.set_message(title, detail)
+            while True:
+                result = self.snapshot_results.get_nowait()
+                if result.get("ok"):
+                    w, h = result.get("size", (0, 0))
+                    self.notify(f"Snapshot saved ({w} × {h}): {result['path']}", "ok")
+                else:
+                    self.notify(f"Snapshot failed: {result.get('error')}", "bad")
+        except queue.Empty:
+            pass
+        except Exception as exc:
+            print(f"Frame update failed: {exc}")
+        self.root.after(30, self._poll_frames)
 
-    # ── Projector window ─────────────────────────────────────────────────
-    MOVABLE_WINDOW = "Movable window (drag it to the projector)"
+    def _check_black_picture(self, info):
+        """Frames arrive but are black: say so (once per connection) and log the camera's settings."""
+        stats = info.get("stats") or {}
+        p99 = stats.get("p99")
+        if p99 is None:
+            return
+        now = time.monotonic()
+        if p99 >= 8:
+            self._black_since = None
+            return
+        if getattr(self, "_black_since", None) is None:
+            self._black_since = now
+        if now - self._black_since < 4.0 or getattr(self, "_black_reported", -1) == self.camera_generation:
+            return
+        self._black_reported = self.camera_generation
+        camera = self.dispatcher.camera
+        print(f"Camera picture is black (brightest pixels {p99:.0f}/255). Status: {getattr(camera, 'status', '')}; "
+              f"controls: {getattr(camera, 'controls', {})}; ranges: {getattr(camera, 'ranges', {})}; "
+              f"actual: {getattr(camera, 'actual', {})}; red {self.dispatcher.red_brightness:.0%}; "
+              f"projector: {self.dispatcher.shown_image.value}; auto: {self.dispatcher.auto_camera.status}")
+        self.notify("The camera picture is black. Check that red light is on, then Adjust… → Reset. "
+                    "Details are in HackerfabStepper.log.", "warn")
 
-    def _build_projector_controls(self):
-        box = ttk.Frame(self.projector_display.display_frame)
-        box.grid(row=3, column=0, sticky="ew", padx=5, pady=(4, 10))
-        box.columnconfigure(0, weight=1)
-        ttk.Label(box, text="Projector window", font="StepperSection").grid(row=0, column=0, sticky="w")
-        self.projector_choice = StringVar()
-        self.projector_combo = ttk.Combobox(box, textvariable=self.projector_choice, state="readonly", width=34,
-                                            postcommand=self._refresh_display_choices)
-        self.projector_combo.grid(row=1, column=0, sticky="ew", pady=(4, 4))
-        self.projector_combo.bind("<<ComboboxSelected>>", self._on_display_chosen)
-        self.projector_button = ttk.Button(box, text="Open projector window", bootstyle="success",
-                                           command=self.toggle_projector_window)
-        self.projector_button.grid(row=2, column=0, sticky="ew")
-        self.projector_note = ttk.Label(box, text="", wraplength=300, bootstyle="secondary", justify="left")
-        self.projector_note.grid(row=3, column=0, sticky="w", pady=(4, 0))
-        self._refresh_display_choices()
-        self._projector_window_changed()
+    def _status_tick(self):
+        d = self.dispatcher
+        camera = d.camera
+        live = d.camera_image is not None
+        if camera is None:
+            self.camera_bar.update_status("disabled", "Camera off · Settings → Camera", False)
+            self.dots["camera"].set("off", "Camera off")
+        else:
+            state = getattr(camera, "state", "streaming" if live else "connecting")
+            text = getattr(camera, "status", "Vendor camera")
+            self.camera_bar.update_status(state, text, live)
+            self.dots["camera"].set("ok" if live else ("bad" if state == "error" else "warn"), "Camera")
+        stage = d.hardware.stage
+        if not d.stage_connected:
+            self.dots["stage"].set("bad", "Stage: DISCONNECTED")
+        elif not isinstance(stage, GrblStage):
+            self.dots["stage"].set("off", "Stage: simulation")
+        elif stage.state_name().startswith("Alarm"):
+            self.dots["stage"].set("bad", "Stage: ALARM")
+        elif d.homing_busy:
+            self.dots["stage"].set("warn", "Stage: homing")
+        else:
+            self.dots["stage"].set("ok", "Stage")
+        window = self.projector_window
+        if d.in_uv():
+            self.dots["projector"].set("uv", "Projector: BLUE ON")
+        elif window.is_open and window.display is not None and not window.display.primary:
+            self.dots["projector"].set("ok", "Projector")
+        elif window.is_open:
+            self.dots["projector"].set("warn", "Projector: movable window")
+        else:
+            self.dots["projector"].set("bad", "Projector: no output")
+        kind, _text = d.led_summary()
+        self.dots["leds"].set(kind if kind != "off" else "off", "LEDs" if d.leds else "LEDs: off")
+        self.root.after(500, self._status_tick)
 
-    def _refresh_display_choices(self):
+    def set_crosshair(self, on: bool):
+        self.camera_view.canvas.crosshair = on
+        self.camera_view.canvas.render()
+        if self.camera_fullscreen is not None:
+            self.camera_fullscreen.canvas.crosshair = on
+
+    def open_camera_fullscreen(self):
+        if self.camera_fullscreen is None:
+            self.camera_fullscreen = CameraFullscreen(self)
+
+    def camera_fullscreen_closed(self):
+        self.camera_fullscreen = None
+        self.camera_view.canvas.render()
+
+    def open_camera_adjustments(self):
+        if self.adjust_dialog is not None and self.adjust_dialog.is_open:
+            self.adjust_dialog.lift()
+            return
+        self.adjust_dialog = CameraAdjustDialog(self)
+
+    def request_snapshot(self, path, auto=False):
+        d = self.dispatcher
+        camera = d.camera
+        if camera is not None and hasattr(camera, "snapshot") and getattr(camera, "state", "") == "streaming":
+            camera.snapshot(str(path))
+            if not auto:
+                self.notify("Saving snapshot…")
+            return True
+        if d.camera_image is not None:
+            try:
+                saved = write_rgb_image(path, d.camera_image)
+                self.notify(f"Snapshot saved: {saved}", "ok")
+                return True
+            except (OSError, cv2.error) as exc:
+                self.notify(f"Snapshot failed: {exc}", "bad")
+        return False
+
+    def take_snapshot(self):
+        fmt = str(self.config.get("files", {}).get("snapshot-format", "png")).lower()
+        fmt = fmt if fmt in ("png", "jpg", "tif", "bmp") else "png"
+        if not self.request_snapshot(self.dispatcher.snapshot_path("snapshot", fmt)):
+            self.notify("No camera picture to save.", "warn")
+
+    def reconnect_camera(self, settings=None):
+        if self._refuse_while_busy("Reconnecting the camera"):
+            return
+        d = self.dispatcher
+        old = d.camera
+        cam = dict(settings if settings is not None else self.config.get("camera", {}))
+        learned = dict(getattr(old, "settings", {}) or {}) if isinstance(old, Webcam) else {}
+        for key in ("stripe-free-exposure", "stripe-filter", "average-frames", "white-balance"):
+            if key in learned and key not in (settings or {}):
+                cam[key] = learned[key]
+        if isinstance(old, Webcam) and settings is None:
+            cam = {**learned, **{k: v for k, v in cam.items() if k in ("mode", "width", "height", "fps", "device", "backend")}}
+        kind = cam.get("type", "webcam")
+        try:
+            if kind == "webcam":
+                camera = Webcam(settings=cam)
+            elif kind in ("basler", "pylon"):
+                from camera.pylon import BaslerPylon
+                camera = BaslerPylon(int(cam.get("index", 0)))
+            elif kind == "flir":
+                from camera.flir.flir_camera import FlirCamera
+                camera = FlirCamera()
+            else:
+                camera = None
+        except Exception as exc:
+            messagebox.showerror("Camera", f"The camera could not be set up: {exc}")
+            return
+        self.replace_camera(camera)
+
+    def replace_camera(self, camera):
+        d = self.dispatcher
+        self.camera_generation += 1
+        old = d.camera
+        if old is not None:
+            try:
+                old.close()
+            except Exception as exc:
+                print(f"Camera close failed: {exc}")
+        d.camera = camera
+        if d.config is not None:
+            d.config.camera = camera
+        d.camera_lost()
+        d.reset_auto_camera()
+        self._pending_frame = None
+        self.last_frame_at = 0.0
+        self.focus_tracker = FocusTracker()
+        self.camera_view.canvas.image = None
+        self.start_camera()
+        if self.adjust_dialog is not None and self.adjust_dialog.is_open:
+            self.adjust_dialog.close()
+
+    def change_resolution(self, mode):
+        if self._refuse_while_busy("Changing the camera resolution"):
+            self.camera_bar.show_choice(self.config.get("camera", {}))
+            return
+        cam = dict(self.config.get("camera", {}))
+        if mode is None:
+            cam["mode"] = "max"
+        else:
+            cam.update(mode="manual", width=mode.width, height=mode.height, fps=mode.fps, fourcc="YUY2")
+        self.config["camera"] = cam
+        self.settings_page.show_resolution(cam)
+        self.camera_bar.show_choice(cam)
+        old = self.dispatcher.camera
+        if isinstance(old, Webcam):
+            merged = {**old.settings, **{k: cam[k] for k in ("mode", "width", "height", "fps", "fourcc") if k in cam}}
+            self.reconnect_camera(merged)
+        else:
+            self.reconnect_camera(cam)
+        self.notify("Reconnecting the camera at the new resolution…")
+
+    def save_settings(self, message=None):
+        return self.settings_page.save(message)
+
+    # ================================================================== projector output
+    def refresh_display_choices(self):
         self.displays = list_displays(self.root)
         choices = [d.label for d in self.displays] + [self.MOVABLE_WINDOW]
-        self.projector_combo.configure(values=choices)
-        if self.projector_choice.get() not in choices:
-            target = choose_projector_display(self.displays, self.projector_settings.get("display", "auto"))
-            self.projector_choice.set(target.label if target else self.MOVABLE_WINDOW)
+        if self.projector_window.is_open:
+            current = self.projector_window.display.label if self.projector_window.display else self.MOVABLE_WINDOW
+        elif self.display_choice in choices:
+            current = self.display_choice
+        else:
+            target = choose_projector_display(self.displays, self.config.get("projector", {}).get("display", "auto"))
+            current = target.label if target else self.MOVABLE_WINDOW
+        self.display_choice = current
+        window = self.projector_window
+        problem = not (window.is_open and window.display is not None and not window.display.primary)
+        self.projector_panel.show_output(choices, current, window.is_open, self._output_note(), problem)
+
+    def _output_note(self):
+        window = self.projector_window
+        if window.is_open and window.display is not None:
+            if window.display.primary:
+                return "Output covers this screen (press Esc to close it when no exposure runs)."
+            return f"Projecting full screen on display {window.display.number} ({window.display.width} × {window.display.height})."
+        if window.is_open:
+            return "Movable window: drag it onto the projector, then double-click it for fullscreen."
+        if len(self.displays) < 2:
+            return f"Only one display: {OS_NAME} is mirroring the projector. To fix it, {EXTEND_DISPLAYS}, then pick it here."
+        return "Output window closed. Starting an exposure opens it again."
 
     def _chosen_display(self):
-        return next((d for d in self.displays if d.label == self.projector_choice.get()), None)
+        return next((d for d in self.displays if d.label == self.display_choice), None)
 
-    def _on_display_chosen(self, _event=None):
+    def display_chosen(self, label):
+        if self.dispatcher.patterning_busy:
+            self.notify("The projector output cannot change during an exposure.", "warn")
+            self.refresh_display_choices()
+            return
+        self.display_choice = label
         display = self._chosen_display()
         if display is not None and not display.primary:
-            # Remembered by Save settings on the Settings page.
-            self.settings_page.config.setdefault("projector", {})["display"] = display.number
+            self.config.setdefault("projector", {})["display"] = display.number
         if self.projector_window.is_open:
             self.open_projector_window()
+        else:
+            self.refresh_display_choices()
 
-    def open_projector_window(self):
+    def open_projector_window(self, confirm_primary=True):
+        self.displays = list_displays(self.root)   # displays may have changed (display settings, cables)
         display = self._chosen_display()
-        if display is not None and display.primary:
-            if not messagebox.askyesno("Projector window", "That is your main screen, so the projector window "
-                                       "would cover your controls.\n\nTo see the projector as its own display, "
+        if display is not None and display.primary and confirm_primary:
+            if not messagebox.askyesno("Projector output", "That is your main screen, so the output window would cover "
+                                       "these controls (Esc closes it).\n\nTo use the projector as its own screen, "
                                        f"{EXTEND_DISPLAYS}.\n\nOpen it on the main screen anyway?"):
-                return
-        self.projector_window.open(display, getattr(self.event_dispatcher.hardware.projector, "current_image", None))
-        if self.fullscreen.kind == "projector":
-            self.fullscreen.close()
+                return False
+        self._temporary_output = bool(display is not None and display.primary)
+        if display is not None:
+            self._match_projector_resolution(display)
+        self.projector_window.open(display, self._projection_image())
         self._projector_window_changed()
+        return True
+
+    def _match_projector_resolution(self, display):
+        setting = str(self.config.get("projector", {}).get("resolution", "auto")).lower()
+        if setting == "auto":
+            self.dispatcher.set_projector_size((display.width, display.height))
+
+    def apply_projector_resolution(self, value):
+        if self.dispatcher.patterning_busy:
+            self.notify("The image resolution cannot change during an exposure.", "warn")
+            return
+        size = parse_size(value)
+        if size is not None:
+            self.dispatcher.set_projector_size(size)
+        elif self.projector_window.is_open and self.projector_window.display is not None:
+            self.dispatcher.set_projector_size((self.projector_window.display.width, self.projector_window.display.height))
+        self.config.setdefault("projector", {})["resolution"] = value
+        w, h = self.dispatcher.hardware.projector.size()
+        self.notify(f"Projector images are now prepared at {w} × {h}.", "ok")
 
     def toggle_projector_window(self):
         if self.projector_window.is_open:
-            if self.event_dispatcher.patterning_busy:
-                messagebox.showinfo("Projector window", "Stop the exposure before closing the projector window.")
+            if not self._projector_window_may_close():
                 return
             self.projector_window.close()
         else:
             self.open_projector_window()
 
     def auto_open_projector_window(self):
-        if str(self.projector_settings.get("window", "auto")).lower() != "auto":
+        if str(self.config.get("projector", {}).get("window", "auto")).lower() != "auto":
             return
-        target = choose_projector_display(self.displays, self.projector_settings.get("display", "auto"))
+        target = choose_projector_display(self.displays, self.config.get("projector", {}).get("display", "auto"))
         if target is not None:
-            self.projector_choice.set(target.label)
+            self.display_choice = target.label
             self.open_projector_window()
 
+    def ensure_output(self) -> bool:
+        """Before an exposure: make sure the pattern will actually reach the projector."""
+        if self.projector_window.is_open:
+            return True
+        self.displays = list_displays(self.root)
+        chosen = self._chosen_display()
+        if chosen is None or chosen.primary:
+            chosen = choose_projector_display(self.displays, self.config.get("projector", {}).get("display", "auto"))
+        if chosen is not None and not chosen.primary:
+            self.display_choice = chosen.label
+            return self.open_projector_window()
+        if not messagebox.askyesno("No projector display", f"{OS_NAME} shows only one display, so the projector is "
+                                   "mirroring this screen (or is not connected).\n\nShow the pattern fullscreen on this "
+                                   "screen for the exposure? It closes again when the exposure ends.\n\n(Better: "
+                                   f"{EXTEND_DISPLAYS}, and pick the projector on the Projector panel.)"):
+            return False
+        main = next((d for d in self.displays if d.primary), None)
+        if main is not None:
+            self.display_choice = main.label
+        return self.open_projector_window(confirm_primary=False)
+
+    def output_check(self):
+        window = self.projector_window
+        if window.is_open and window.display is not None and not window.display.primary:
+            return "Ok.TLabel", f"✓  Projector output on {window.display.label}"
+        if window.is_open:
+            return "Warn.TLabel", "•  Output is a movable window: make sure it is fullscreen on the projector"
+        if any(not d.primary for d in self.displays):
+            return "Small.TLabel", "•  Projector output opens automatically when you start"
+        return "Warn.TLabel", "•  Only one display: the pattern will fill this screen during the exposure"
+
+    def _projection_image(self):
+        return getattr(self.dispatcher.hardware.projector, "current_image", None)
+
+    def _projector_updated(self):
+        if self.projector_window.is_open:
+            self.projector_window.show(self._projection_image())
+
     def _projector_window_changed(self):
-        window = self.projector_window
-        if window.is_open:
-            self.projector_button.configure(text="Close projector window", bootstyle="secondary-outline")
-            where = window.display.label if window.display else "a movable window"
-            self.projector_sidebar.set(f"Projector · {where}")
-            note = ("Showing on this display. The mouse pointer is hidden over it." if window.display
-                    else "Drag it onto the projector, then double-click it for fullscreen.")
-        else:
-            self.projector_button.configure(text="Open projector window", bootstyle="success")
-            self.projector_sidebar.set("Projector · in this window")
-            if len(self.displays) < 2:
-                note = ("Only one display found, so the projector is probably mirroring this screen. "
-                        f"To fix it, {EXTEND_DISPLAYS}, then pick the projector here.")
-            else:
-                note = "Not open: exposures fill this window instead."
-        self.projector_note.configure(text=note)
+        if not self.projector_window.is_open:
+            self._temporary_output = False
+        self.refresh_display_choices()
 
-    def projector_status_line(self):
-        window = self.projector_window
-        if window.is_open and window.display is not None:
-            return "success", f"✓ Projector window on {window.display.label}"
-        if window.is_open:
-            return "warning", "• Projector window is movable: make sure it is fullscreen on the projector."
-        return "warning", "• No projector window: the pattern fills this window, so it must be on the projector display."
+    def open_projector_preview(self):
+        if self.preview_window is not None and self.preview_window.is_open:
+            self.preview_window.lift()
+            return
+        self.preview_window = ProjectorPreviewWindow(self)
 
-    def _escape_exposure(self):
-        if self.event_dispatcher.patterning_busy:
-            self.event_dispatcher.abort_patterning()
-
-    def show_page(self, name):
-        self.current_page = name
-        self.pages[name].frame.tkraise()
-        for label, button in self.nav_buttons.items():
-            button.configure(bootstyle="primary" if label == name else "secondary-link")
-
-    def update_status(self):
-        camera = self.camera.camera
-        text = "disabled" if camera is None else ("live" if self.event_dispatcher.camera_image is not None else "offline / connecting")
-        self.device_status.set(f"Camera · {text}")
-        self.root.after(500, self.update_status)
-
-    def request_close(self):
-        """Window close button: stop any exposure cleanly and offer to save the chip record."""
-        d = self.event_dispatcher
+    # ================================================================== LEDs
+    def connect_leds(self, quiet=False):
+        d = self.dispatcher
         if d.patterning_busy:
-            d.abort_patterning()
-            self.root.after(200, self.request_close)  # let the exposure loop finish first
+            self.notify("LED control cannot change during an exposure.", "warn")
             return
-        if d.autofocus_busy and not messagebox.askyesno("Autofocus running", "Autofocus is still moving the stage. Close anyway?"):
+        proj = self.config.get("projector", {})
+        if str(proj.get("led-control", "auto")).lower() in ("off", "false", "no"):
+            d.attach_leds(None, "Projector LED control is off (Settings → Projector).")
             return
-        if not self.chip_frame.offer_to_save("Close HackerFab Stepper"):
-            return
-        self.cleanup()
+        self.disconnect_leds(restore=False)
+        pid = proj.get("led-pid")
+        try:
+            pid = int(str(pid), 0) if pid not in (None, "", "auto") else None
+        except ValueError:
+            pid = None
+        controller, status = LedController.connect(pid)
+        d.attach_leds(controller, status)
+        if not quiet or controller is not None:
+            self.notify(status, "ok" if controller is not None else "warn")
 
-    def _add_tooltips(self):
-        tips = {
-            self.nav_buttons["Operate"]: "Everyday work: choose a pattern, focus in red, expose in UV.",
-            self.nav_buttons["Alignment"]: "Shift or rotate the projected image, run autofocus, snapshot options.",
-            self.nav_buttons["Wafer & tiling"]: "Map of exposures and the chip record (which pattern went where).",
-            self.nav_buttons["Settings"]: "Camera, stage and appearance. Save settings to keep changes.",
-            self.help_button: "Open the illustrated how-to guide in your web browser.",
-            self.abort_button: "Stop the running exposure immediately. Esc does the same.",
-            self.clear_button: "Blank the projector. Also stops an exposure if one is running.",
-            self.camera.label: "Click for a fullscreen camera view. Press Esc to return.",
-            self.projector_display.label: "Click to show this image fullscreen. The projector only gets the image "
-                                          "when this window is on the projector display and fullscreen is open.",
-            self.camera.snapshot.name_entry: "Snapshot file name. %T becomes the date and time, %C a counter. "
-                                             "Files go to the snapshot folder (see Alignment page).",
-        }
-        red = self.mode_select_frame.red_mode_frame
-        uv = self.mode_select_frame.uv_mode_frame
-        tips.update({
-            red.red_brightness_scale: "Dims the red image. Lower it when a long camera exposure (needed to remove the "
-                                      "projector's colour bands) makes the preview wash out. Red light does not expose resist.",
-            self.projector_combo: f"Which display the projector window goes on. Pick the projector. If it is missing, {EXTEND_DISPLAYS}.",
-            self.projector_button: "Open or close the borderless projector window on the chosen display.",
-            red.solid_red_rb: "Even red light over the whole field. Best for finding the chip and focusing.",
-            red.pattern_rb: "Your pattern drawn in red, to see exactly where it will land. Red does not expose resist.",
-            red.inv_pattern_rb: "The pattern with light and dark swapped, in red.",
-            red.red_focus_rb: "Your own focusing image. Click the thumbnail below to load one.",
-            uv.exposure_frame.exposure_time_entry.widget: "How long the pattern is shown, in milliseconds. 8000 ms = 8 s.",
-            uv.exposure_frame.posterize_checkbutton: "Turn the pattern into pure black and white at this brightness cutoff.",
-            uv.patterning_frame.begin_patterning_button: "Project the pattern in UV for the exposure time. Waits for the "
-                                                         "stage to stop first. Esc or Stop exposure aborts.",
-            self.global_settings_frame.autofocus_button: "Find the sharpest focus near the current Z automatically. "
-                                                         "Needs a live camera; focus roughly by hand first.",
-        })
-        for frame in (red.stage_position_frame, uv.stage_position_frame):
-            for widget in frame.z_widgets:
-                tips[widget] = "Move focus by the distance per click. +Z brings the camera and chip closer."
-            tips[frame.set_position_button] = "Move the stage to the X, Y and Z typed above (in µm)."
-            for widget in frame.shortcuts:
-                tips[widget] = "Moves all three axes to a fixed position. Needs homing. Asks first."
-        for widget, text in tips.items():
-            add_tooltip(widget, text)
+    def disconnect_leds(self, restore=True):
+        d = self.dispatcher
+        if d.patterning_busy:
+            self.notify("LED control cannot change during an exposure.", "warn")
+            return
+        if d.leds is not None:
+            try:
+                d.leds.close(ALL if restore else None)
+            except Exception:
+                pass
+        d.attach_leds(None, "Projector LED control is off (Settings → Projector).")
 
-    def cleanup(self):
-        self.projector_window.close(notify=False)
-        self.fullscreen.cleanup()
-        self.camera.cleanup()
-        self.event_dispatcher.hardware.stage.close()
-        self.root.destroy()
+    def test_leds(self):
+        d = self.dispatcher
+        if d.leds is None:
+            messagebox.showinfo("Test LEDs", d.led_status)
+            return
+        if self._refuse_while_busy("Testing the LEDs"):
+            return
+        previous_image, previous_source = d.shown_image, d.red_focus_source
+        d.show_red(RedFocusSource.SOLID)
+        window = tkinter.Toplevel(self.root)
+        window.title("Testing projector LEDs")
+        window.transient(self.root)
+        window.resizable(False, False)
+        label = ttk.Label(window, text="", font="StepperBig", padding=px(20), wraplength=px(420))
+        label.pack()
+        steps = [("Red LED on: the projector shows red.", LED_FOCUS),
+                 ("All LEDs off: the projector should go dark now.", 0),
+                 ("Red LED on again.", LED_FOCUS)]
+        state = {"job": None, "done": False}
+
+        def restore():
+            if state["done"]:
+                return
+            state["done"] = True
+            if state["job"] is not None:
+                try:
+                    self.root.after_cancel(state["job"])
+                except tkinter.TclError:
+                    pass
+            try:
+                window.grab_release()
+                window.destroy()
+            except tkinter.TclError:
+                pass
+            if previous_source != RedFocusSource.SOLID:
+                d.set_red_focus_source(previous_source)
+            d.set_shown_image(previous_image)
+            d.set_leds(d.led_mask_for(d.shown_image))   # the LEDs match the picture again
+
+        def run(index=0):
+            state["job"] = None
+            if state["done"]:
+                return
+            if index < len(steps):
+                text, mask = steps[index]
+                try:
+                    label.configure(text=f"Step {index + 1} of {len(steps)}\n\n{text}")
+                except tkinter.TclError:   # the window was closed
+                    restore()
+                    return
+                if not d.set_leds(mask):
+                    label.configure(text="The projector did not accept the USB command.")
+                    state["job"] = self.root.after(2500, restore)
+                    return
+                state["job"] = self.root.after(2500, lambda: run(index + 1))
+                return
+            restore()
+            if messagebox.askyesno("Test LEDs", "Did the projector go dark during step 2?"):
+                self.notify("Projector LED control works.", "ok")
+            else:
+                messagebox.showinfo("Test LEDs", "The projector accepted the commands but nothing changed. Its "
+                                    "firmware may not support switching LEDs this way. Turn LED control off in "
+                                    "Settings → Projector; everything else still works.")
+
+        window.protocol("WM_DELETE_WINDOW", restore)
+        window.bind("<Escape>", lambda _e: restore())
+        window.bind("<Destroy>", lambda e: restore() if e.widget is window else None)
+        window.update_idletasks()
+        try:
+            window.grab_set()   # nothing else can change the projector during the test
+        except tkinter.TclError:
+            pass
+        run()
+
+    # ================================================================== keyboard focus helpers
+    def focus_widget_is_text(self):
+        widget = self.root.focus_get()
+        return widget is not None and widget.winfo_class() in ("Entry", "TEntry", "TSpinbox", "TCombobox", "Text")
 
 
 class _StartupDialog:
@@ -3564,7 +1052,7 @@ class _StartupDialog:
 
     def __init__(self, master: tkinter.Tk):
         self.win = tkinter.Toplevel(master)
-        self.win.title("HackerFab Stepper – Start")
+        self.win.title("HackerFab Stepper – Setup")
         self.win.resizable(False, False)
         self.win.grab_set()  # modal: blocks interaction with the hidden root window
 
@@ -3585,40 +1073,40 @@ class _StartupDialog:
         f.grid(sticky="nsew")
 
         ttk.Label(f, text="HackerFab Stepper",
-                  font=("Arial", 20, "bold"), bootstyle="info").grid(
+                  font="StepperTitle").grid(
             row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(f, text="Photolithography stepper control",
-                  bootstyle="secondary").grid(
+                  style="Muted.TLabel").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(0, 8))
         ttk.Separator(f, orient="horizontal").grid(
             row=2, column=0, columnspan=3, sticky="ew", pady=(0, 10))
 
         # Config file
-        ttk.Label(f, text="Settings file:").grid(
+        ttk.Label(f, text="Config file:").grid(
             row=3, column=0, sticky="e", padx=(0, 8), pady=4)
         self._config_var = StringVar(value="config.toml" if Path("config.toml").exists() else "default.toml")
         ttk.Entry(f, textvariable=self._config_var, width=40).grid(
             row=3, column=1, sticky="ew", pady=4)
         ttk.Button(f, text="Browse…", command=self._browse,
-                   bootstyle="secondary-outline").grid(
+                   bootstyle="dark").grid(
             row=3, column=2, padx=(8, 0), pady=4)
 
         ttk.Separator(f, orient="horizontal").grid(
             row=4, column=0, columnspan=3, sticky="ew", pady=10)
 
         # Stage port
-        ttk.Label(f, text="Stage controller:").grid(
+        ttk.Label(f, text="Stage port:").grid(
             row=5, column=0, sticky="e", padx=(0, 8), pady=4)
         self._port_var = StringVar(value="Scanning…")
         self._combo = ttk.Combobox(f, textvariable=self._port_var,
                                    state="readonly", width=40)
         self._combo.grid(row=5, column=1, sticky="ew", pady=4)
-        ttk.Button(f, text="Rescan", width=8, command=self._scan_ports,
-                   bootstyle="info-outline").grid(
+        ttk.Button(f, text="↺", width=3, command=self._scan_ports,
+                   bootstyle="dark").grid(
             row=5, column=2, padx=(8, 0), pady=4)
 
         self._status_var = StringVar()
-        self._status_lbl = ttk.Label(f, textvariable=self._status_var, foreground="gray")
+        self._status_lbl = ttk.Label(f, textvariable=self._status_var, style="Small.TLabel", wraplength=px(460))
         self._status_lbl.grid(row=6, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
         ttk.Separator(f, orient="horizontal").grid(
@@ -3627,8 +1115,8 @@ class _StartupDialog:
         btns = ttk.Frame(f)
         btns.grid(row=8, column=0, columnspan=3, sticky="e")
         ttk.Button(btns, text="Cancel", command=self.win.destroy,
-                   bootstyle="secondary").pack(side="left", padx=4)
-        ttk.Button(btns, text="Start  →", command=self._launch,
+                   bootstyle="dark").pack(side="left", padx=4)
+        ttk.Button(btns, text="Launch  →", command=self._launch,
                    bootstyle="success").pack(side="left", padx=4)
 
         f.columnconfigure(1, weight=1)
@@ -3644,7 +1132,7 @@ class _StartupDialog:
     def _browse(self) -> None:
         path = filedialog.askopenfilename(
             parent=self.win,
-            title="Choose a settings file",
+            title="Select config file",
             filetypes=[("TOML files", "*.toml"), ("All files", "*.*")],
         )
         if path:
@@ -3707,8 +1195,9 @@ class _StartupDialog:
                 "No serial ports found – connect the board then press  ↺", "#cc5500")
 
     def _status(self, msg: str, color: str = "gray") -> None:
+        kind = {"green": "ok", "dark orange": "warn", "#cc5500": "bad"}.get(color, "muted")
         self._status_var.set(msg)
-        self._status_lbl.configure(foreground=color)
+        self._status_lbl.configure(foreground=palette()[kind])
 
     def _launch(self) -> None:
         path = self._config_var.get().strip()
@@ -3731,12 +1220,15 @@ class _StartupDialog:
     # ── Entry point ──────────────────────────────────────────────────────
 
     def run(self) -> bool:
-        """Block until the dialog is closed; return True if the user clicked Start."""
+        """Block until the dialog is closed; return True if the user clicked Launch."""
         self.win.wait_window()
         return self.launched
 
 
+
+
 def main():
+    enable_dpi_awareness()
     # One root window for the entire app lifetime — ttkbootstrap Style binds to it
     # and must never be destroyed and recreated.
     root = ttk.Window(themename="darkly")
@@ -3751,29 +1243,34 @@ def main():
         return
 
     config = dialog.config
-    theme = config.get("ui", {}).get("theme", "studio-dark")
-    if theme in ttk.Style().theme_names():
-        ttk.Style().theme_use(theme)
-
-    # A typo in the config file should produce a clear warning, not a crash.
+    for change in migrate_config(config):
+        print(f"Settings updated for this version: {change}")
     reader = ConfigReader(config)
     number, flag, problems = reader.number, reader.flag, reader.problems
 
     # ── Stage ────────────────────────────────────────────────────────────
     port = dialog.selected_port
     stage = StageController()
-    if flag("stage", "enabled", True) and port and port != "none":
+    if port and port != "none":
+        # Picking a port in the startup window means "use the stage", even if it was turned off.
+        config.setdefault("stage", {})["enabled"] = True
+        sp = None
         try:
-            sp    = serial.Serial(port, int(number("stage", "baud-rate", 115200, positive=True)))
+            sp = serial.Serial(port, int(number("stage", "baud-rate", 115200, positive=True)))
             stage = GrblStage(sp, flag("stage", "homing", False), invert_z=flag("stage", "invert-z", True))
         except Exception as e:
             print(f"Stage connection failed ({port}): {e}")
-            problems.append(f"Could not connect to the stage on {port}: {e}\n"
+            try:
+                if sp is not None:
+                    sp.close()
+            except Exception:
+                pass
+            problems.append(f"Could not connect to the stage on {port}: {e}.\n"
                             "  The app is running in simulation, so the stage will not move. Close other "
                             "programs using that port, check the cable and power, then restart.")
 
     # ── Camera ───────────────────────────────────────────────────────────
-    cam_cfg  = config.get("camera", {})
+    cam_cfg = config.setdefault("camera", {})
     cam_type = cam_cfg.get("type", "none")
     try:
         if cam_type == "webcam":
@@ -3797,32 +1294,34 @@ def main():
 
     camera_scale = number("camera", "gui-scale", 1.0, positive=True)
     red_exposure = number("camera", "red-exposure", DEFAULT_RED_EXPOSURE, positive=True)
-    uv_exposure  = number("camera", "uv-exposure", DEFAULT_UV_EXPOSURE, positive=True)
+    uv_exposure = number("camera", "uv-exposure", DEFAULT_UV_EXPOSURE, positive=True)
 
     # ── Alignment ────────────────────────────────────────────────────────
     ac = config.get("alignment", {})
     alignment_config = AlignmentConfig(
-        enabled         = flag("alignment", "enabled", False),
-        model_path      = ac.get("model_path",      "ckpts/best.onnx"),
-        right_marker_x  = number("alignment", "right_marker_x",  1820.0),
-        left_marker_x   = number("alignment", "left_marker_x",    280.0),
-        top_marker_y    = number("alignment", "top_marker_y",     269.0),
-        bottom_marker_y = number("alignment", "bottom_marker_y", 1075.0),
-        x_scale_factor  = number("alignment", "x_scale_factor",  -1100),
-        y_scale_factor  = number("alignment", "y_scale_factor",    800),
-        reference_width = number("alignment", "reference-width", 1920, positive=True),
-        reference_height = number("alignment", "reference-height", 1080, positive=True),
+        enabled=flag("alignment", "enabled", False),
+        model_path=ac.get("model_path", "ckpts/best.onnx"),
+        right_marker_x=number("alignment", "right_marker_x", 1820.0),
+        left_marker_x=number("alignment", "left_marker_x", 280.0),
+        top_marker_y=number("alignment", "top_marker_y", 269.0),
+        bottom_marker_y=number("alignment", "bottom_marker_y", 1075.0),
+        x_scale_factor=number("alignment", "x_scale_factor", -1100),
+        y_scale_factor=number("alignment", "y_scale_factor", 800),
+        reference_width=number("alignment", "reference-width", 1920, positive=True),
+        reference_height=number("alignment", "reference-height", 1080, positive=True),
     )
 
-    stage_limits = {axis: limit for axis in AXES if (limit := reader.limits("stage", f"{axis}-limits"))}
+    stage_limits = read_stage_limits(reader)
 
     if problems:
         messagebox.showwarning("Check your settings", "\n\n".join(problems))
 
-    lithographer = LithographerGui(LithographerConfig(
-        stage, camera, camera_scale, red_exposure, uv_exposure, alignment_config, stage_limits,
-    ), root, config, "config.toml" if Path(dialog._config_var.get()).resolve() == Path("default.toml").resolve() else dialog._config_var.get())
+    chosen = Path(dialog._config_var.get())
+    save_path = "config.toml" if chosen.resolve() == Path("default.toml").resolve() else str(chosen)
+    app = LithographerGui(LithographerConfig(stage, camera, camera_scale, red_exposure, uv_exposure, alignment_config,
+                                             stage_limits), root, config, save_path)
     root.deiconify()  # show the main window now that it's fully built
+    app.maximize()
     root.mainloop()
 
 

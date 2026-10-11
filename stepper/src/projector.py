@@ -1,6 +1,6 @@
 from PIL import Image
 
-_DLP_W, _DLP_H = 1280, 720
+DEFAULT_SIZE = (1920, 1080)
 
 
 class ProjectorController:
@@ -8,21 +8,31 @@ class ProjectorController:
         pass
 
     def size(self) -> tuple[int, int]:
-        return (_DLP_W, _DLP_H)
+        return DEFAULT_SIZE
 
     def clear(self):
         pass
 
 
 class TkProjector(ProjectorController):
-    """Projector image state, displayed by the app's on-demand fullscreen view.
+    """What the projector should show, at the projector's own resolution.
 
-    Canvas dimensions stay fixed so opening/closing a preview cannot change
-    pattern processing or alignment coordinates. No second window is created.
+    Images are prepared at exactly the projector display's size (set from the display the
+    projector window is on), so the projector window shows them pixel for pixel. on_show is
+    called after every change; the main window forwards the image to the projector window
+    and the previews.
     """
-    def __init__(self, root, title='Projector', background='#000000'):
-        self.current_image = Image.new('RGB', self.size(), 'black')
+
+    def __init__(self, root=None, title='Projector', background='#000000', size=DEFAULT_SIZE):
+        self._size = (int(size[0]), int(size[1]))
+        self.current_image = Image.new('RGB', self._size, 'black')
         self.on_show = None
+
+    def size(self) -> tuple[int, int]:
+        return self._size
+
+    def set_size(self, size: tuple[int, int]):
+        self._size = (max(1, int(size[0])), max(1, int(size[1])))
 
     def show(self, image: Image.Image):
         self.current_image = image

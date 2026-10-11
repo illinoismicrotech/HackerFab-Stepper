@@ -106,6 +106,22 @@ def choose_projector_display(displays: list[Display], preferred=None) -> Optiona
     return next((d for d in displays if not d.primary), None)
 
 
+def solid_color(image: Image.Image):
+    """(r, g, b) if every pixel of the image has the same colour, else None."""
+    try:
+        extrema = image.getextrema()
+    except Exception:
+        return None
+    if image.mode in ("L", "1", "P", "I", "F"):
+        if image.mode != "L" or extrema[0] != extrema[1]:
+            return None
+        return (extrema[0],) * 3
+    bands = extrema[:3]
+    if any(low != high for low, high in bands):
+        return None
+    return tuple(int(low) for low, _ in bands)
+
+
 class ProjectorWindow:
     """Shows the projector image in its own window.
 
@@ -115,10 +131,11 @@ class ProjectorWindow:
     """
 
     def __init__(self, root: tk.Misc, on_escape: Callable[[], None] | None = None,
-                 on_close: Callable[[], None] | None = None):
+                 on_close: Callable[[], None] | None = None, can_close: Callable[[], bool] | None = None):
         self.root = root
         self.on_escape = on_escape
         self.on_close = on_close
+        self.can_close = can_close    # asked before the user closes the movable window
         self.window: Optional[tk.Toplevel] = None
         self.label: Optional[tk.Label] = None
         self.display: Optional[Display] = None
@@ -143,7 +160,7 @@ class ProjectorWindow:
             self.label.configure(cursor="none")
         else:
             window.geometry("640x360")
-            window.protocol("WM_DELETE_WINDOW", self.close)
+            window.protocol("WM_DELETE_WINDOW", self._close_requested)
             window.bind("<Double-Button-1>", self._toggle_fullscreen)
         window.bind("<Escape>", self._escape)
         window.bind("<Configure>", lambda _event: self._render())
@@ -173,6 +190,17 @@ class ProjectorWindow:
             return
         width, height = self._size()
         image = self.image
+        color = solid_color(image)
+        if color is not None:
+            # Uniform image (black, solid red): just paint the window. Much faster than a
+            # full-resolution photo, which matters at 4K when the red brightness changes.
+            hex_color = "#%02x%02x%02x" % color
+            self.photo = None
+            self.label.configure(image="", background=hex_color)
+            self.window.configure(background=hex_color)
+            return
+        self.label.configure(background="black")
+        self.window.configure(background="black")
         if image.size != (width, height):
             # Fit the whole image without cropping or changing its shape (same as the in-app view).
             ratio = min(width / image.width, height / image.height)
@@ -188,6 +216,10 @@ class ProjectorWindow:
     def _toggle_fullscreen(self, _event=None):
         if self.window is not None:
             self.window.attributes("-fullscreen", not bool(self.window.attributes("-fullscreen")))
+
+    def _close_requested(self):
+        if self.can_close is None or self.can_close():
+            self.close()
 
     def _escape(self, _event=None):
         if self.on_escape:

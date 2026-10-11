@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HackerFab Stepper: how-to guide</title>
+<style>
+:root {
+  --paper: #ffffff; --panel: #f1f3f2; --ink: #1c2226; --muted: #56616a; --rule: #d6dbd9;
+  --red: #b3261e; --red-wash: #fbeceb; --uv: #5436c9; --uv-wash: #efebfb;
+  --amber: #f2b224; --amber-wash: #fff5d9; --amber-ink: #5e4200; --teal: #1f7a6f;
+  --display: "Bahnschrift", "DIN Alternate", "DIN 2014", "Barlow Semi Condensed", "Arial Narrow", sans-serif;
+  --text: Georgia, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+  --mono: "Cascadia Mono", Consolas, "SF Mono", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+html { scroll-padding-top: 1.5rem; }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 17px/1.62 var(--text); -webkit-text-size-adjust: 100%; }
+a { color: var(--uv); text-underline-offset: 2px; }
+a:focus-visible, summary:focus-visible { outline: 3px solid var(--amber); outline-offset: 2px; border-radius: 2px; }
+.masthead { border-bottom: 1px solid var(--rule); }
+.masthead-inner { max-width: 76rem; margin: 0 auto; padding: 3rem 2rem 0; }
+.kicker { font: 600 1rem/1.2 var(--display); color: var(--muted); margin: 0 0 .6rem; letter-spacing: .01em; }
+h1 { font: 700 clamp(2.4rem, 6vw, 4.2rem)/1 "Bahnschrift", "DIN Alternate", "Arial Narrow", sans-serif; letter-spacing: -.01em; margin: 0 0 1rem; font-stretch: condensed; }
+.lede { max-width: 42rem; margin: 0 0 2.2rem; font-size: 1.12rem; color: #2e373d; }
+.modes { display: grid; grid-template-columns: 1fr 1fr; margin: 0 -2rem; }
+.mode { padding: 1.5rem 2rem 1.6rem; color: #fff; }
+.mode.red { background: var(--red); }
+.mode.uv { background: var(--uv); }
+.mode h2 { font: 700 1.55rem/1.1 var(--display); margin: 0 0 .45rem; }
+.mode p { margin: 0; font-size: .98rem; line-height: 1.5; max-width: 30rem; opacity: .96; }
+.mode .tab { font: 600 .9rem/1 var(--display); display: inline-block; border: 1px solid rgba(255,255,255,.7); padding: .25rem .5rem; border-radius: 3px; margin-bottom: .8rem; }
+.layout { max-width: 76rem; margin: 0 auto; padding: 0 2rem 6rem; display: grid; grid-template-columns: 15.5rem minmax(0, 1fr); gap: 3.5rem; }
+.toc { position: sticky; top: 0; align-self: start; max-height: 100vh; overflow-y: auto; padding: 2.4rem 0 2rem; font: 500 .95rem/1.35 var(--display); }
+.toc p { font-weight: 700; margin: 0 0 .8rem; color: var(--muted); }
+.toc ol { list-style: none; margin: 0; padding: 0; counter-reset: part; }
+.toc > ol > li { counter-increment: part; margin: 0 0 .15rem; }
+.toc > ol > li > a { display: grid; grid-template-columns: 1.8rem 1fr; padding: .32rem 0; color: var(--ink); text-decoration: none; }
+.toc > ol > li > a::before { content: counter(part); color: var(--muted); font-variant-numeric: tabular-nums; display: inline-block; min-width: 1.8rem; }
+.toc > ol > li.appendix > a::before { content: ""; }
+.toc a:hover { color: var(--uv); }
+.toc ol ol { padding-left: 1.8rem; margin: 0 0 .4rem; }
+.toc ol ol a { display: block; padding: .18rem 0; color: var(--muted); text-decoration: none; font-weight: 400; font-size: .9rem; }
+main { min-width: 0; padding-top: 1rem; }
+main > section { max-width: 46rem; }
+h2.part { font: 700 2.05rem/1.1 var(--display); margin: 4rem 0 1.2rem; padding-top: 1.4rem; border-top: 3px solid var(--ink); }
+h2.part .n { font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 600; margin-right: .9rem; }
+h3 { font: 700 1.3rem/1.25 var(--display); margin: 2.4rem 0 .7rem; }
+h4 { font: 700 1.05rem/1.3 var(--display); margin: 1.8rem 0 .4rem; }
+p { margin: 0 0 1rem; }
+.tag { display: inline-block; vertical-align: .18em; margin-left: .55rem; font: 600 .78rem/1 var(--display); padding: .3rem .5rem; border-radius: 3px; color: #fff; }
+.tag.red { background: var(--red); } .tag.uv { background: var(--uv); }
+.ui { font: 600 .95em/1 var(--display); white-space: nowrap; }
+.os { font: 700 .72em/1 var(--display); padding: .2em .45em; border-radius: 3px; white-space: nowrap; border: 1px solid currentColor; opacity: .8; margin-right: .3em; letter-spacing: .03em; text-transform: uppercase; }
+.badge { font: 700 .78em/1 var(--display); padding: .22em .5em; border-radius: 3px; white-space: nowrap; letter-spacing: .02em; }
+.badge.red { background: #5a1e22; color: #ff8a8a; } .badge.uv { background: #3a2f73; color: #c9bdff; }
+.badge.off { background: #2e343c; color: #c4ccd4; } .badge.ok { background: #16361f; color: #6fdd8b; }
+.badge.warn { background: #4a3510; color: #f3c46b; } .badge.bad { background: #5c1d1b; color: #ff9b94; }
+code, kbd, .path { font-family: var(--mono); font-size: .84em; }
+code, .path { background: var(--panel); padding: .08em .35em; border-radius: 3px; }
+kbd { border: 1px solid #b9c0bd; border-bottom-width: 2px; border-radius: 4px; padding: .05em .4em; background: #fafbfa; white-space: nowrap; }
+pre { font: .84rem/1.55 var(--mono); background: #1f272c; color: #e8eceb; padding: 1rem 1.2rem; border-radius: 4px; overflow-x: auto; margin: 0 0 1.2rem; }
+pre .c { color: #9fb0a9; }
+ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 0 0 1.4rem; }
+ol.steps > li { counter-increment: step; position: relative; padding: 0 0 .9rem 2.9rem; }
+ol.steps > li::before { content: counter(step); position: absolute; left: 0; top: .12rem; width: 1.9rem; height: 1.9rem; background: var(--ink); color: #fff; border-radius: 50%; font: 700 .95rem/1.9rem var(--display); text-align: center; }
+ol.steps.red > li::before { background: var(--red); } ol.steps.uv > li::before { background: var(--uv); }
+ol.steps > li > strong:first-child { font-family: var(--display); font-weight: 700; }
+ul { padding-left: 1.3rem; margin: 0 0 1rem; } li { margin-bottom: .3rem; }
+.callout { border-left: 4px solid var(--ink); background: var(--panel); padding: .9rem 1.1rem .2rem; margin: 1.2rem 0 1.5rem; border-radius: 0 4px 4px 0; }
+.callout > b:first-child { display: block; font: 700 1rem/1.3 var(--display); margin-bottom: .3rem; }
+.callout.caution { border-color: var(--amber); background: var(--amber-wash); } .callout.caution > b:first-child { color: var(--amber-ink); }
+.callout.stop { border-color: var(--red); background: var(--red-wash); } .callout.stop > b:first-child { color: var(--red); }
+.callout.exe { border-color: var(--uv); background: var(--uv-wash); } .callout.exe > b:first-child { color: var(--uv); }
+.callout.tip { border-color: var(--teal); background: #e8f4f2; } .callout.tip > b:first-child { color: var(--teal); }
+figure { margin: 1.6rem 0 1.8rem; } figure.wide { max-width: 64rem; }
+figure img { display: block; width: 100%; height: auto; border: 1px solid #aeb6b2; border-radius: 4px; }
+figcaption { font: .9rem/1.45 var(--display); color: var(--muted); margin-top: .55rem; }
+.legend { width: 100%; } .legend td:first-child { width: 2.6rem; }
+.dot { display: inline-block; width: 1.65rem; height: 1.65rem; border-radius: 50%; background: var(--amber); border: 2px solid var(--ink); font: 700 .88rem/1.35rem var(--display); text-align: center; color: var(--ink); }
+.table-wrap { overflow-x: auto; margin: 0 0 1.6rem; }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; line-height: 1.5; }
+th { font: 700 .92rem/1.3 var(--display); text-align: left; border-bottom: 2px solid var(--ink); padding: .5rem .8rem .5rem 0; vertical-align: bottom; }
+td { border-bottom: 1px solid var(--rule); padding: .6rem .8rem .6rem 0; vertical-align: top; }
+td code { white-space: nowrap; }
+details { border-top: 1px solid var(--rule); padding: .2rem 0; } details:last-of-type { border-bottom: 1px solid var(--rule); }
+summary { cursor: pointer; font: 600 1.02rem/1.4 var(--display); padding: .7rem 0; list-style: none; display: grid; grid-template-columns: 1.4rem 1fr; }
+summary::-webkit-details-marker { display: none; }
+summary::before { content: "+"; font-weight: 700; color: var(--muted); }
+details[open] summary::before { content: "\2212"; }
+details > div { padding: 0 0 .8rem 1.4rem; }
+.card { border: 2px solid var(--ink); border-radius: 6px; padding: 1.2rem 1.4rem .4rem; margin: 1.4rem 0; }
+.card h4 { margin-top: 0; } .card ul { list-style: none; padding: 0; }
+.card li { padding-left: 1.7rem; position: relative; }
+.card li::before { content: ""; position: absolute; left: 0; top: .28rem; width: .95rem; height: .95rem; border: 2px solid var(--ink); border-radius: 2px; }
+footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid var(--rule); font: .9rem/1.5 var(--display); color: var(--muted); }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; gap: 0; }
+  .toc { position: static; max-height: none; border-bottom: 1px solid var(--rule); padding-bottom: 1.4rem; }
+  .modes { grid-template-columns: 1fr; margin: 0 -1.2rem; }
+  .masthead-inner, .layout { padding-left: 1.2rem; padding-right: 1.2rem; }
+  .mode { padding-left: 1.2rem; padding-right: 1.2rem; }
+}
+@media print {
+  body { font-size: 11pt; } .toc { display: none; } .layout { display: block; padding: 0; }
+  .mode, .badge { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  details > div { display: block !important; } details { break-inside: avoid; }
+  figure, .card, .callout, tr { break-inside: avoid; } h2.part { break-before: page; }
+  a { color: inherit; text-decoration: none; }
+}
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <p class="kicker">Illinois MicroTech / HackerFab, maskless photolithography stepper</p>
+    <h1>HackerFab Stepper</h1>
+    <p class="lede">The complete how-to guide for the HackerFab Stepper app on Windows, macOS and Linux: installing it, connecting the camera, stage and projector, running an exposure from start to finish, and fixing things when they go wrong.</p>
+    <div class="modes" role="group" aria-label="The two kinds of light">
+      <div class="mode red">
+        <span class="tab">Step 2 · Focus</span>
+        <h2>Red light is safe</h2>
+        <p>Photoresist does not react to red. Use red light to find the chip, line the pattern up and focus, for as long as you like.</p>
+      </div>
+      <div class="mode uv">
+        <span class="tab">Step 3 · Expose</span>
+        <h2>Blue light exposes</h2>
+        <p>The pattern is projected in the blue light that exposes the resist, for exactly the exposure time. The stage is locked while it is on.</p>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+  <p>Contents</p>
+  <ol>
+    <li><a href="#begin">Before you begin</a></li>
+    <li><a href="#install">Install and first launch</a></li>
+    <li><a href="#tour">The main window</a></li>
+    <li><a href="#camera">The camera</a></li>
+    <li><a href="#stage">Moving the stage</a></li>
+    <li><a href="#projector">The projector</a></li>
+    <li><a href="#exposure">An exposure, step by step</a>
+      <ol>
+        <li><a href="#exp-prepare">Prepare</a></li>
+        <li><a href="#exp-pattern">1 Pattern</a></li>
+        <li><a href="#exp-focus">2 Focus</a></li>
+        <li><a href="#exp-expose">3 Expose</a></li>
+        <li><a href="#exp-after">Afterwards</a></li>
+      </ol>
+    </li>
+    <li><a href="#alignment">The Alignment page</a></li>
+    <li><a href="#chip">The Chip &amp; map page</a></li>
+    <li><a href="#settings">The Settings page</a></li>
+    <li><a href="#config">Configuration file</a></li>
+    <li><a href="#trouble">Troubleshooting</a></li>
+    <li><a href="#maintainers">For maintainers</a></li>
+    <li class="appendix"><a href="#checklist">Session checklist</a></li>
+    <li class="appendix"><a href="#keys">Mouse and keyboard</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- =============================== 1 =============================== -->
+<section id="begin">
+<h2 class="part"><span class="n">1</span><span>Before you begin</span></h2>
+<p>HackerFab Stepper controls a maskless photolithography stepper. Instead of a physical mask, a DLP projector (TI DLPDLCR471TPEVM) shines a pattern image through the optics onto a resist-coated chip on a motorized stage. A USB microscope camera (Arducam B0477, 20 MP) looks at the same spot so you can see what you are doing.</p>
+<p>This guide covers the standalone app: <span class="path">HackerfabStepper.exe</span> on Windows, <span class="path">HackerfabStepper.app</span> on macOS and the <span class="path">HackerfabStepper</span> program on Linux. It runs without installing Python and includes everything, alignment-marker detection too. It is built from the same source code as the <span class="path">run.bat</span> / <span class="path">run.sh</span> launchers in the repository. Where the operating systems differ, this guide says so with <span class="os">Windows</span>, <span class="os">macOS</span> or <span class="os">Linux</span>.</p>
+<div class="callout"><b>Quick answers inside the app</b>
+<p>Press <kbd>F1</kbd> (or <span class="ui">Help</span> in the top bar) for the <span class="ui">Help</span> page: it shows what is not ready yet with a button to fix each item, and searchable step-by-step answers (“stripes”, “won't move”, “LED” …) written for your operating system. This guide is the long version with pictures.</p></div>
+
+<h3>How a session goes</h3>
+<ol class="steps">
+  <li><strong>Prepare the hardware.</strong> Projector on and set as an extended display (<a href="#extend">how</a>), stage controller plugged in, camera in a USB 3 port. Optionally, the projector board's own USB cable for LED control.</li>
+  <li><strong>Launch.</strong> Pick the stage in the setup window. The camera, the projector output and the LED control connect by themselves.</li>
+  <li><strong>1 Pattern.</strong> Choose the image to expose.</li>
+  <li><strong>2 Focus.</strong> In red light, move to the spot, line up and focus.</li>
+  <li><strong>3 Expose.</strong> Set the time, check the list, press <span class="ui">Start exposure</span>.</li>
+  <li><strong>Record.</strong> Every exposure goes into the chip record with its position, time and pattern file.</li>
+</ol>
+
+<h3>Words used in this guide</h3>
+<div class="table-wrap"><table>
+  <tr><th>Term</th><th>Meaning</th></tr>
+  <tr><td>Stage</td><td>The motorized platform that holds the chip. X and Y move it sideways; Z moves it toward or away from the optics to focus.</td></tr>
+  <tr><td>Controller</td><td>The board that drives the stage motors: a BTT SKR Pico running grblHAL (or an Arduino running GRBL), on a USB serial port: <code>COM5</code> on Windows, <code>/dev/cu.usbmodem…</code> on macOS, <code>/dev/ttyACM0</code> on Linux.</td></tr>
+  <tr><td>Projector</td><td>The DLP projector. The computer sees it as a second display through HDMI. Its board also has a USB port that the app can use to switch its LEDs.</td></tr>
+  <tr><td>Output window</td><td>The borderless window the app puts on the projector's display. Whatever it shows is projected onto the chip.</td></tr>
+  <tr><td>Pattern</td><td>The image you want to print. Bright pixels are where light lands.</td></tr>
+  <tr><td>Red light</td><td>Images shown in red only. Safe for resist. Used for focusing and alignment.</td></tr>
+  <tr><td>Blue light</td><td>The exposing light. The pattern and the blue focus mark are shown in blue.</td></tr>
+  <tr><td>Stripes</td><td>Horizontal coloured bands in the camera picture caused by the projector flashing its colours while the camera's rolling shutter scans the sensor. The app removes them (<a href="#camera">Part 4</a>).</td></tr>
+  <tr><td>Focus meter</td><td>The bar at the top right of the camera picture. Longer means sharper.</td></tr>
+  <tr><td>µm</td><td>Micrometre, one thousandth of a millimetre. All stage distances are in µm.</td></tr>
+  <tr><td>Config file</td><td>The settings file, <span class="path">config.toml</span> (your settings) or <span class="path">default.toml</span> (factory defaults), in the app's folder (<a href="#install">Part 2</a>).</td></tr>
+</table></div>
+
+<h3>Safety</h3>
+<div class="callout stop"><b>Do not look into the projector during an exposure</b>
+<p>The exposure light is intense blue. Do not look into the projector lens or the optical path, and do not look at bright reflections off the chip while a pattern is on.</p></div>
+<div class="callout caution"><b>Keep hands clear of the stage</b>
+<p>The stage moves whenever you press an arrow, a key, <span class="ui">Go to…</span>, <span class="ui">Home</span> or <span class="ui">Autofocus</span>, and during tiling. Moves of several axes at once over long distances ask for confirmation first.</p></div>
+<div class="callout caution"><b>Only blue light exposes, and the blue focus mark is blue light too</b>
+<p>The badge on the <span class="ui">Projector</span> panel always tells you which light is on: <span class="badge red">RED · SAFE</span> is safe for resist, <span class="badge uv">EXPOSING</span> and <span class="badge uv">BLUE MARK</span> expose it. The <span class="ui">Projector</span> dot in the top bar turns purple and reads <span class="ui">BLUE ON</span> whenever blue light is on, on every page. Handle resist-coated chips under your fab's yellow lighting.</p></div>
+</section>
+
+<!-- =============================== 2 =============================== -->
+<section id="install">
+<h2 class="part"><span class="n">2</span><span>Install and first launch</span></h2>
+<h3>What you need</h3>
+<div class="table-wrap"><table>
+  <tr><th>Item</th><th>Requirement</th></tr>
+  <tr><td>Computer</td><td><span class="os">Windows</span> 10 or 11, 64-bit · <span class="os">macOS</span> 13 or newer (Apple silicon or Intel) · <span class="os">Linux</span> x86-64 with a desktop (Ubuntu 22.04 or newer, Fedora, Arch …). A normal user account is fine.</td></tr>
+  <tr><td>Disk</td><td>About 150 MB, plus room for snapshots (a 20 MP PNG is 20 to 40 MB).</td></tr>
+  <tr><td>USB</td><td>A USB 3 port (blue insert or <b>SS</b> logo) for the camera, one port for the stage controller, and optionally one for the projector board.</td></tr>
+  <tr><td>Display</td><td>The projector on HDMI, set up as its own display (extended, not mirrored).</td></tr>
+  <tr><td>Internet</td><td>Not needed.</td></tr>
+</table></div>
+
+<h3>Download</h3>
+<p>Every version is on the repository's <span class="ui">Releases</span> page on GitHub (<span class="ui">Latest build</span> is the newest version of <code>main</code>). Download the file for your computer:</p>
+<div class="table-wrap"><table>
+  <tr><th>Computer</th><th>File</th></tr>
+  <tr><td><span class="os">Windows</span></td><td><span class="path">HackerfabStepper-Windows.exe</span></td></tr>
+  <tr><td><span class="os">macOS</span> with Apple silicon (M1, M2, M3, M4 …)</td><td><span class="path">HackerfabStepper-macOS-arm64.zip</span></td></tr>
+  <tr><td><span class="os">macOS</span> with an Intel processor</td><td><span class="path">HackerfabStepper-macOS-x86_64.zip</span></td></tr>
+  <tr><td><span class="os">Linux</span></td><td><span class="path">HackerfabStepper-Linux-x86_64.tar.gz</span></td></tr>
+</table></div>
+
+<h3>Install</h3>
+<ol class="steps">
+  <li><span class="os">Windows</span> <strong>Create a folder for the app,</strong> for example <span class="path">C:\HackerfabStepper\</span>, put the exe in it and rename it <span class="path">HackerfabStepper.exe</span> if you like. Optional shortcut: right-click the exe, <span class="ui">Show more options</span>, <span class="ui">Send to</span>, <span class="ui">Desktop (create shortcut)</span>.</li>
+  <li><span class="os">macOS</span> <strong>Double-click the zip</strong> and drag <span class="path">HackerfabStepper.app</span> into <span class="path">Applications</span>.</li>
+  <li><span class="os">Linux</span> <strong>Unpack it into a folder of its own:</strong> <code>mkdir ~/HackerfabStepper &amp;&amp; tar -xzf HackerfabStepper-Linux-x86_64.tar.gz -C ~/HackerfabStepper</code>. Allow your user to use the camera and the stage controller once: <code>sudo usermod -aG video,dialout $USER</code> (on Arch use <code>uucp</code> instead of <code>dialout</code>), then log out and back in.</li>
+</ol>
+<p>Replacing the app with a newer version keeps your <span class="path">config.toml</span>.</p>
+
+<h3>First launch</h3>
+<ol class="steps">
+  <li><strong>Start the app.</strong> Nothing may appear for 10 to 30 seconds the first time while it unpacks.</li>
+  <li><span class="os">Windows</span> <strong>"Windows protected your PC":</strong> click <span class="ui">More info</span>, then <span class="ui">Run anyway</span>. The app is not code-signed. If the exe vanishes, your antivirus quarantined it (a common false positive for packaged Python programs): restore it and add an exception for the folder.</li>
+  <li><span class="os">macOS</span> <strong>"can't be opened because it is from an unidentified developer":</strong> right-click (or Control-click) the app, choose <span class="ui">Open</span>, then <span class="ui">Open</span> again. Only the first time. When it asks for the camera, click <span class="ui">Allow</span>.</li>
+  <li><span class="os">Linux</span> <strong>Double-click <span class="path">HackerfabStepper</span></strong>, or run <code>./HackerfabStepper</code> in a terminal in its folder (the terminal then also shows its messages).</li>
+  <li><strong>The setup window opens.</strong> See below.</li>
+</ol>
+<p>On the first start the app creates, in its folder: <span class="path">default.toml</span> (factory settings), <span class="path">src/uvFocusImage/plus.png</span> (the UV focus mark), <span class="path">stepper_captures</span> (snapshots), <span class="path">HOW-TO-GUIDE.html</span> (this guide; replaced when you update the app) and <span class="path">HackerfabStepper.log</span> (status messages and errors, rotated at 2 MB). Your own settings are saved to <span class="path">config.toml</span>. <span class="ui">Help → Open settings folder</span> opens it.</p>
+<div class="callout"><b>Where the app's folder is</b>
+<p><span class="os">Windows</span> <span class="os">Linux</span> the folder the program is in; if that folder is read-only (for example <span class="path">C:\Program Files</span>) it is <span class="path">%LOCALAPPDATA%\HackerfabStepper</span> on Windows and <span class="path">~/.local/share/HackerfabStepper</span> on Linux. <span class="os">macOS</span> <span class="path">Documents/HackerfabStepper</span> in your home folder (an app bundle must not be changed). On any system, the environment variable <code>HACKERFAB_HOME</code> chooses another folder.</p></div>
+
+<h3>The setup window</h3>
+<figure>IMG:setup|The setup window: settings file and stage port.</figure>
+<ol class="steps">
+  <li><strong>Config file.</strong> Leave it on <span class="path">config.toml</span> (or <span class="path">default.toml</span> the very first time).</li>
+  <li><strong>Stage port.</strong> The stage controller is detected and marked <span class="ui">[Arduino / GRBL]</span>. Choose <span class="ui">No stage</span> to run without one (simulation: nothing moves). <span class="ui">↺</span> scans again after plugging something in.</li>
+  <li><strong>Launch.</strong> The main window opens, maximized.</li>
+</ol>
+</section>
+
+<!-- =============================== 3 =============================== -->
+<section id="tour">
+<h2 class="part"><span class="n">3</span><span>The main window</span></h2>
+<p>Everything for an exposure is on one page, <span class="ui">Operate</span>. You do not need to scroll or switch tabs while working.</p>
+<figure class="wide">IMG:operate|The Operate page, focusing in red light.</figure>
+<div class="table-wrap"><table class="legend">
+  <tr><td><span class="dot">1</span></td><td><b>Top bar.</b> Pages (<span class="ui">Operate</span>, <span class="ui">Chip &amp; map</span>, <span class="ui">Alignment</span>, <span class="ui">Settings</span>, <span class="ui">Help</span>); status dots for <span class="ui">Camera</span>, <span class="ui">Stage</span>, <span class="ui">Projector</span> output and projector <span class="ui">LEDs</span> (green = working, amber = needs attention, red = not working, grey = off); <span class="ui">Help F1</span> (the <a href="#help">Help page</a>); the red <span class="ui">■ STOP</span> button, which stops whatever is running (an exposure, autofocus, homing or tiling) and turns the projector off; it stays off until you switch the red light on again (<kbd>Esc</kbd> does the same).</td></tr>
+  <tr><td><span class="dot">2</span></td><td><b>Camera picture.</b> Top left: <span class="ui">● LIVE</span>, the camera's full resolution and frame rate. Top right: the focus meter. The cyan crosshair marks the centre. Double-click for fullscreen.</td></tr>
+  <tr><td><span class="dot">3</span></td><td><b>Camera toolbar.</b> Camera state, resolution list, crosshair on/off, <span class="ui">⛶ Fullscreen</span>, <span class="ui">Snapshot</span>, <span class="ui">Adjust…</span>, and <span class="ui">Reconnect</span> when the camera needs it.</td></tr>
+  <tr><td><span class="dot">4</span></td><td><b>Stage.</b> Arrow pad, focus buttons, step sizes, position, <span class="ui">Go to…</span> and <span class="ui">Home</span>. See <a href="#stage">Part 5</a>.</td></tr>
+  <tr><td><span class="dot">5</span></td><td><b>Projector.</b> What the projector is showing right now: a badge, one sentence, an exact thumbnail and the LED state. Below: <span class="ui">Off</span> / <span class="ui">Red light · safe</span>, <span class="ui">Enlarge</span>, and the output display. See <a href="#projector">Part 6</a>.</td></tr>
+  <tr><td><span class="dot">6</span></td><td><b>The three steps</b> of an exposure: <span class="ui">1 Pattern</span>, <span class="ui">2 Focus</span>, <span class="ui">3 Expose</span>. See <a href="#exposure">Part 7</a>.</td></tr>
+  <tr><td><span class="dot">7</span></td><td><b>Status line.</b> The latest message (saved snapshot, finished exposure, problems) and the keyboard shortcuts.</td></tr>
+</table></div>
+<p>Hover over any control for a short explanation. The window follows the system's display scaling (125 %, 150 % …), so text stays sharp.</p>
+<h3 id="help">The Help page</h3>
+<p>Press <kbd>F1</kbd> or click <span class="ui">Help F1</span>. At the top, <span class="ui">Right now</span> checks the camera, stage, projector output, LEDs, pattern and chip record, and for anything that is not ready says what to do, with a button that goes straight there (for example <span class="ui">Reconnect stage</span> or <span class="ui">Go to 1 Pattern</span>). Below it, type in <span class="ui">Search</span> (“stripes”, “focus”, “won't move”, “LED”) to open the matching answers under <span class="ui">How do I …</span> and <span class="ui">Fix a problem</span>; they are written for the operating system you are using. The buttons along the top open this guide, the log and the settings folder, and <span class="ui">Copy problem report</span> copies everything someone helping you needs (system, equipment status, the last lines of the log) to paste into a message.</p>
+</section>
+
+<!-- =============================== 4 =============================== -->
+<section id="camera">
+<h2 class="part"><span class="n">4</span><span>The camera</span></h2>
+<h3>Connecting</h3>
+<p>Plug the Arducam into a blue USB 3 port directly (no hub or dock). The app finds it by name and opens it at its <b>highest resolution at the lowest frame rate</b>: 5472 × 3648 at 9 fps for the B0477. The picture on screen is a reduced preview; snapshots and focus measurements use the full resolution.</p>
+<p>The camera toolbar shows <span class="badge warn">CONNECTING</span>, then <span class="badge ok">LIVE</span>. If it shows <span class="badge bad">NO CAMERA</span>, the message on the picture says why, and <span class="ui">Reconnect</span> tries again (close Zoom, Teams, OBS, the Camera app and the Arducam viewer first).</p>
+
+<h3>Resolution</h3>
+<p>The list under the picture shows every resolution the camera reports, plus <span class="ui">Highest resolution (recommended)</span>. Choosing one reconnects the camera in a few seconds. For the cameras this app knows, the modes are:</p>
+<div class="table-wrap"><table>
+  <tr><th>Camera</th><th>Modes (each at the frame rate shown)</th></tr>
+  <tr><td>B0477 (IMX283, 20 MP)</td><td>5472 × 3648 @ 9 · 3840 × 2160 @ 20 · 2720 × 1536 @ 40 · 1920 × 1080 @ 60 · 1280 × 720 @ 120</td></tr>
+  <tr><td>IMX519 (16 MP)</td><td>4656 × 3496 @ 9 · 3840 × 2160 @ 20 · 2320 × 1748 @ 40 · 1920 × 1080 @ 60 · 1280 × 720 @ 120</td></tr>
+  <tr><td>IMX477 (12 MP)</td><td>4056 × 3040 @ 10 · 3840 × 2160 @ 20 · 2016 × 1520 @ 50 · 1920 × 1080 @ 60 · 1280 × 720 @ 120</td></tr>
+  <tr><td>Any of them on USB 2</td><td>1280 × 720 @ 10</td></tr>
+</table></div>
+<p>A low frame rate is not a problem here: it leaves room for the longer exposures that remove projector stripes.</p>
+
+<h3>Why the picture had stripes, and how they are removed</h3>
+<p>A DLP projector shows red, green and blue one after another many times a second. The camera reads its sensor row by row (a rolling shutter), so rows exposed at different moments catch different amounts of light: horizontal bands. Three things make them disappear:</p>
+<ol class="steps">
+  <li><strong>Stripe-free exposure.</strong> If each row is exposed for a whole number of the projector's colour cycles, every row gets the same light. While red light is on, the app tries exposures of 16, 31, 62.5 and 125 ms, measures how striped each one is, and keeps the best. This takes about 10 seconds the first time and is remembered.</li>
+  <li><strong>Fixed white balance.</strong> The camera's automatic white balance sees a red-only picture and turns up green and blue, which magnifies the faint green/blue light the projector leaks into bold teal and pink bands. The app keeps white balance fixed at 4500 K.</li>
+  <li><strong>Unused LEDs off.</strong> With the projector's USB cable connected, the app turns the green and blue LEDs off while focusing, so they cannot leak at all (<a href="#projector">Part 6</a>).</li>
+</ol>
+<p>A software <span class="ui">Stripe filter</span> evens out anything left over in the live picture (never in snapshots).</p>
+
+<h3>Automatic brightness</h3>
+<p>With <span class="ui">Auto</span> on next to <span class="ui">Red brightness</span>, the app keeps the brightest parts of the picture bright but not clipped. It does this mostly by dimming or brightening the red light, which keeps the stripe-free exposure and adds no noise; only if that is not enough does it raise camera gain, and as a last resort the exposure. The <span class="ui">2 Focus</span> step shows what it is doing, for example <span class="ui">Auto: settled · exposure -4 (62.5 ms) · red 45% · gain 100</span>.</p>
+<p>Automatic settings only run while red light is on. Moving the red brightness slider yourself turns <span class="ui">Auto</span> brightness off; moving exposure or gain yourself turns auto exposure off.</p>
+
+<h3>Camera adjustments</h3>
+<figure>IMG:adjust|Camera adjustments (Adjust… under the camera picture).</figure>
+<div class="table-wrap"><table>
+  <tr><th>Control</th><th>What it does</th></tr>
+  <tr><td><span class="ui">Auto exposure and gain</span></td><td>The stripe search and gain control described above.</td></tr>
+  <tr><td><span class="ui">Auto red brightness</span></td><td>Dims the red light instead of raising gain.</td></tr>
+  <tr><td><span class="ui">Find stripe-free exposure</span></td><td>Runs the search again, e.g. after changing the projector's refresh rate.</td></tr>
+  <tr><td><span class="ui">Exposure</span></td><td>In log2-second units (the same on every system): −4 = 62.5 ms, −5 = 31 ms, −3 = 125 ms. Each step doubles or halves it.</td></tr>
+  <tr><td><span class="ui">Gain</span>, <span class="ui">Brightness</span>, <span class="ui">Contrast</span>, <span class="ui">Saturation</span></td><td>The camera's own picture controls.</td></tr>
+  <tr><td><span class="ui">White balance</span></td><td>Fixed colour temperature. Leave it around 4500 K.</td></tr>
+  <tr><td><span class="ui">Stripe filter</span></td><td>Evens out leftover horizontal bands in the live picture.</td></tr>
+  <tr><td><span class="ui">Frame averaging</span></td><td>Averages 2, 4 or 8 frames: less noise and flicker, slower to react.</td></tr>
+  <tr><td><span class="ui">Reset</span> / <span class="ui">Save as default</span></td><td>Back to the factory values / keep the current values for next time.</td></tr>
+</table></div>
+
+<h3>Snapshots and fullscreen</h3>
+<p><span class="ui">Snapshot</span> saves the current frame at full resolution into the snapshot folder (<span class="path">stepper_captures\</span> unless changed in <span class="ui">Settings → Files</span>); the status line shows the path. A JPEG snapshot is also saved just before every exposure, so you have a record of the alignment.</p>
+<p><span class="ui">⛶ Fullscreen</span> (or double-clicking the picture) opens the camera on the whole screen the app is on. The stage keys still work there. <kbd>Esc</kbd>, a double-click or <span class="ui">✕ Exit fullscreen</span> returns.</p>
+</section>
+
+<!-- =============================== 5 =============================== -->
+<section id="stage">
+<h2 class="part"><span class="n">5</span><span>Moving the stage</span></h2>
+<figure>IMG:stage|The stage panel under the camera picture.</figure>
+<div class="table-wrap"><table>
+  <tr><th>Control</th><th>Use</th></tr>
+  <tr><td>▲ ◀ ▶ ▼</td><td>Move X/Y by the <span class="ui">X/Y STEP</span>. <b>Hold</b> a button to keep moving: the next step starts only after the previous one has finished, so the stage never runs away with a queue of moves.</td></tr>
+  <tr><td><span class="ui">Z +</span> / <span class="ui">Z −</span></td><td>Focus by the <span class="ui">Z STEP</span>. Also holdable.</td></tr>
+  <tr><td><span class="ui">X/Y STEP · µm</span></td><td>1, 10, 50, 100, 500 or 1000 µm per click. The current value is shown in the middle of the pad.</td></tr>
+  <tr><td><span class="ui">Z STEP · µm</span></td><td>1, 2, 5, 10 or 50 µm per click.</td></tr>
+  <tr><td>X / Y / Z</td><td>Where the stage was sent, in µm. Below it: the controller's state (<span class="ui">● Idle</span>, <span class="ui">● Moving…</span>, <span class="ui">Simulation</span>).</td></tr>
+  <tr><td><span class="ui">Go to…</span></td><td>Type X, Y, Z, or pick a saved position (<span class="ui">Chip origin</span>, <span class="ui">Load / unload</span>; these need homing). Long moves on several axes ask first.</td></tr>
+  <tr><td><span class="ui">Home</span></td><td>Shown only for stages with limit switches (<code>homing = true</code>). Runs the homing cycle after asking; with homing on, the app also homes once at startup. The window stays usable while it runs, the stage controls are locked, and <span class="ui">STOP</span> cancels it (the controller then needs homing again before it moves).</td></tr>
+</table></div>
+<h3>Keyboard</h3>
+<p>Arrow keys move X/Y, <kbd>Page Up</kbd> / <kbd>Page Down</kbd> focus, and holding <kbd>Shift</kbd> makes any of them 10× the step. Holding a key repeats like the buttons. Keys work when you are not typing in a field; click the camera picture to give them back to the stage.</p>
+<p>If ▲ moves the picture the "wrong" way for you, reverse that axis in <span class="ui">Settings → Stage → Arrow buttons and keys</span>. It applies immediately.</p>
+<h3>When the stage refuses to move</h3>
+<p>A message explains why. <b>ALARM</b>: the controller locked itself (after a limit switch, or at power-up with homing enabled): enable homing and restart, or unlock it with <code>$X</code> from a G-code terminal. <b>Travel limits</b>: the target is outside the stage's range. <b>Lost contact</b>: check the USB cable and power, then restart. All stage controls are locked (greyed) while an exposure, autofocus, homing or tiling runs.</p>
+<p>The position readout is read from the controller when the app connects and after homing, so it matches where the stage really is even if the controller kept its position from an earlier session. The arrows and keys make relative moves; <span class="ui">Go to…</span>, saved positions and double-clicking an exposure on the Chip page move to absolute positions in the controller's machine coordinates.</p>
+</section>
+
+<!-- =============================== 6 =============================== -->
+<section id="projector">
+<h2 class="part"><span class="n">6</span><span>The projector</span></h2>
+<h3>The output window</h3>
+<ol class="steps">
+  <li id="extend"><strong>Make the projector its own display.</strong> <span class="os">Windows</span> press <kbd>Win</kbd> + <kbd>P</kbd> and choose <span class="ui">Extend</span>. <span class="os">macOS</span> <span class="ui">System Settings → Displays</span>: the projector must not be set to <span class="ui">Mirror</span>. <span class="os">Linux</span> in your desktop's display settings, turn off mirroring / “join displays”. (Mirrored, the projector only shows the laptop screen.)</li>
+  <li><strong>Start the app.</strong> The output window opens on the first display that is not your main screen. The <span class="ui">Projector</span> dot turns green and the panel shows <span class="ui">OUTPUT</span> with the display's name.</li>
+  <li><strong>To change it,</strong> pick another display under <span class="ui">OUTPUT</span>; <span class="ui">Open</span> / <span class="ui">Close</span> opens or closes the window. Your choice is remembered.</li>
+</ol>
+<p>Images are prepared at exactly the projector display's resolution, so every pattern pixel is one projector pixel. If the computer shows only one display when you start an exposure, the app asks whether to fill this screen with the pattern for the exposure (useful only in Duplicate mode) and gives the screen back afterwards.</p>
+
+<h3>What is being projected</h3>
+<figure>IMG:projector|The Projector panel during an exposure.</figure>
+<div class="table-wrap"><table>
+  <tr><th>Badge</th><th>Meaning</th></tr>
+  <tr><td><span class="badge off">OFF</span></td><td>Black. Nothing is projected (and, with LED control, the LEDs are off).</td></tr>
+  <tr><td><span class="badge red">RED · SAFE</span></td><td>Red light: solid red, your pattern in red, the inverted pattern, or your own focusing image, at the brightness shown. Safe for resist.</td></tr>
+  <tr><td><span class="badge uv">EXPOSING</span></td><td>The pattern in blue light, with the seconds left. Exposes resist.</td></tr>
+  <tr><td><span class="badge uv">BLUE MARK</span></td><td>The blue focus mark (a plus sign). Exposes resist where it lands.</td></tr>
+  <tr><td><span class="badge warn">STARTING</span></td><td>You pressed Start and the app is waiting for the stage to stop. Nothing is exposed yet; <kbd>Esc</kbd> cancels.</td></tr>
+</table></div>
+<p>The thumbnail is the exact image on the output window. Click it, or <span class="ui">Enlarge</span>, for a larger <b>preview</b> window you can resize. The preview only mirrors the output; closing it never changes what is projected.</p>
+
+<h3>LED control over USB (recommended)</h3>
+<p>The projector board has its own USB port next to the HDMI input. With it connected to the computer, the app switches the LEDs:</p>
+<div class="table-wrap"><table>
+  <tr><th>Projector shows</th><th>LEDs on</th><th>Why</th></tr>
+  <tr><td>Red light</td><td>Red only</td><td>No green or blue leaks onto the chip: no coloured bands in the camera, no stray blue on the resist.</td></tr>
+  <tr><td>Pattern / blue mark</td><td>Red + blue</td><td>Blue exposes; red stays on so the exposure can never be dark (the pattern contains no red).</td></tr>
+  <tr><td>Off</td><td>None</td><td>Truly dark.</td></tr>
+  <tr><td>App closed</td><td>None</td><td>The desktop is not projected onto the chip after you close the app.</td></tr>
+</table></div>
+<ol class="steps">
+  <li><strong>Connect the projector board's USB port</strong> to the computer with the cable that came with it. Keep the HDMI cable connected too.</li>
+  <li><strong>Close TI's DLP EVM GUI</strong> if it is open: only one program can use the board at a time.</li>
+  <li><strong>Start the app.</strong> The <span class="ui">LEDs</span> dot turns green and the panel shows <span class="ui">LEDs: red only · USB</span>.</li>
+  <li><strong>Check it once:</strong> <span class="ui">Settings → Projector → Test LEDs</span>. The projector shows red, goes dark for 2.5 seconds, and comes back. Answer the question at the end.</li>
+</ol>
+<p>Before an exposure the app switches the blue LED on and refuses to start if the projector does not accept the command, so an exposure can never silently be dark. If the board's USB cable is unplugged while the app runs, exposures are refused with a message until you plug it back in and click <span class="ui">Settings → Projector → Reconnect LEDs</span> (or turn LED control off); everything else keeps working.</p>
+<details><summary>The LEDs dot stays grey: "no TI projector found on USB"</summary><div>
+<p>The board's USB cable is not connected (the HDMI cable alone carries no commands), or it is connected to a charge-only cable. Connect it and click <span class="ui">Settings → Projector → Reconnect LEDs</span>.</p></div></details>
+<details><summary><span class="os">Windows</span> "Windows has no usable driver for the projector's USB control interface"</summary><div>
+<p>The board normally installs as a standard WinUSB device by itself. If not, install the driver once with Zadig:</p>
+<ol class="steps">
+  <li>Download Zadig from <a href="https://zadig.akeo.ie/">zadig.akeo.ie</a> and run it.</li>
+  <li><span class="ui">Options → List All Devices</span>.</li>
+  <li>Choose the projector's entry (a Texas Instruments / DLPC device; if there are several, the one marked <span class="ui">Interface 0</span>). Do <b>not</b> pick the camera, keyboard or mouse.</li>
+  <li>Make sure the target driver is <span class="ui">WinUSB</span> and click <span class="ui">Install Driver</span> (or <span class="ui">Replace Driver</span>).</li>
+  <li>In the app: <span class="ui">Settings → Projector → Reconnect LEDs</span>.</li>
+</ol></div></details>
+<details><summary><span class="os">Linux</span> "Linux does not let this user open the projector's USB port"</summary><div>
+<p>Allow it once with a udev rule. Create <span class="path">/etc/udev/rules.d/70-hackerfab-dlp.rules</span> containing</p>
+<pre>SUBSYSTEM=="usb", ATTR{idVendor}=="0451", MODE="0666"</pre>
+<p>then run <code>sudo udevadm control --reload</code>, unplug and replug the projector board's USB cable, and click <span class="ui">Settings → Projector → Reconnect LEDs</span>.</p></div></details>
+<details><summary><span class="os">macOS</span> LED control does not connect</summary><div>
+<p>macOS needs no driver for the board. Close TI's DLP EVM GUI and any other program that uses it, replug the board's USB cable and click <span class="ui">Reconnect LEDs</span>.</p></div></details>
+<details><summary>"The projector's USB interface is busy or has the wrong driver"</summary><div>
+<p>Close TI's DLP EVM GUI and any other program that talks to the board, then <span class="ui">Reconnect LEDs</span>. If it persists, see the Zadig steps above.</p></div></details>
+<details><summary>Test LEDs: the projector did not go dark</summary><div>
+<p>The board accepted the commands but nothing changed, so its firmware does not switch LEDs this way. Turn LED control off (<span class="ui">Settings → Projector</span>); the camera's stripe-free exposure and fixed white balance still work without it.</p></div></details>
+</section>
+
+<!-- =============================== 7 =============================== -->
+<section id="exposure">
+<h2 class="part"><span class="n">7</span><span>An exposure, step by step</span></h2>
+
+<h3 id="exp-prepare">Prepare</h3>
+<div class="card">
+<h4>Before you start</h4>
+<ul>
+  <li>Top bar: <span class="ui">Camera</span>, <span class="ui">Stage</span> and <span class="ui">Projector</span> dots green (and <span class="ui">LEDs</span>, if the USB cable is used)</li>
+  <li>Chip record opened or created (<span class="ui">Chip &amp; map</span> page) so exposures are saved to a file</li>
+  <li>Resist-coated chip loaded under yellow light</li>
+</ul></div>
+
+<h3 id="exp-pattern">1 Pattern</h3>
+<figure>IMG:pattern|Step 1: the pattern and a preview of the exposure.</figure>
+<ol class="steps">
+  <li><strong><span class="ui">Choose pattern…</span></strong> PNG, JPEG, BMP or TIFF. Bright pixels get light; transparent pixels count as black.</li>
+  <li><strong>Check the details:</strong> the size, and whether it <span class="ui">fills the projector exactly</span> or is scaled to fit. For pixel-exact results, make the pattern the projector's resolution.</li>
+  <li><strong>Check the preview.</strong> It shows the pattern exactly as it will be projected: blue on black.</li>
+  <li><strong>Options:</strong> <span class="ui">Border</span> leaves a dark margin (percent of the field); <span class="ui">Pure black &amp; white</span> turns grey pixels fully on or off at the cut-off. Shifting or rotating is on the <a href="#alignment">Alignment</a> page.</li>
+  <li><strong><span class="ui">Show it in red</span></strong> projects the pattern in red (safe) and switches to step 2, so you can see where it lands on the chip.</li>
+</ol>
+
+<h3 id="exp-focus">2 Focus <span class="tag red">red light</span></h3>
+<figure>IMG:focus|Step 2: red light, automatic camera settings and autofocus.</figure>
+<ol class="steps red">
+  <li><strong>Choose what the red light shows</strong> under <span class="ui">RED LIGHT SHOWS</span>: <span class="ui">Solid</span> (even red, best for finding the chip and focusing), <span class="ui">Pattern</span> (your pattern in red, to line it up), <span class="ui">Inverted</span>, or <span class="ui">Image…</span> (your own focusing picture).</li>
+  <li><strong>Find the spot</strong> with the arrow pad or arrow keys, a large step first, then smaller.</li>
+  <li><strong>Focus</strong> with <span class="ui">Z +</span> / <span class="ui">Z −</span> (or <kbd>Page Up</kbd> / <kbd>Page Down</kbd>) until the focus bar is as long as it gets, or press <span class="ui">Autofocus</span> (about 20 s; <span class="ui">Stop</span> or <kbd>Esc</kbd> cancels). Autofocus needs a picture with some detail and a start reasonably close to focus. It never moves more than 150 µm from where it started; if it finds no sharpest point, loses the camera, or is stopped, it moves back to the starting Z.</li>
+  <li><strong>Let the camera settle.</strong> The first time, the line under <span class="ui">Auto exposure</span> says <span class="ui">Finding the stripe-free exposure…</span> for about 10 seconds, then <span class="ui">Auto: settled</span>.</li>
+</ol>
+
+<h3 id="exp-expose">3 Expose <span class="tag uv">blue light</span></h3>
+<figure>IMG:expose|Step 3 during an exposure: badge, countdown and Stop.</figure>
+<ol class="steps uv">
+  <li><strong>Exposure time</strong> in seconds (type it, or click 2, 5, 8, 10, 15 or 30 s). The equivalent in milliseconds is shown beside it.</li>
+  <li><strong>Optional blue focus check.</strong> <span class="ui">Show blue focus mark</span> projects a plus sign in blue to check focus in exposing light; it exposes resist where it lands, so use a sacrificial area. It switches back to red light when you leave the Expose step or the Operate page. <span class="ui">Z offset during exposure</span> moves Z by that many µm just before the exposure and back afterwards (blue light focuses slightly differently from red); 0 = no move.</li>
+  <li><strong>Read the checklist</strong> under <span class="ui">BEFORE YOU EXPOSE</span>: pattern, time, projector output, stage, LEDs. A red ✗ must be fixed first. The line just above the Start button sums it up (<span class="ui">Ready: …</span>, a note, or the first problem), so you can see it without scrolling.</li>
+  <li><strong>Press <span class="ui">▶ Start exposure</span>.</strong> The app waits for the stage to stop (badge <span class="badge warn">STARTING</span>; nothing is exposed yet), saves a camera snapshot of the last picture before the light changes, draws the pattern, switches the blue LED on and times the exposure. The badge shows <span class="badge uv">EXPOSING</span> and the seconds left; the stage, the projector output, the camera resolution and the other controls are locked until it ends. The light goes off on time even if a message box happens to be open.</li>
+  <li><strong>To stop early,</strong> press <span class="ui">■ Stop exposure (Esc)</span>, <kbd>Esc</kbd> (also in camera fullscreen), or the red <span class="ui">STOP</span>. The record marks it as stopped with the time the light was really on, and the projector stays off.</li>
+  <li><strong>When it ends,</strong> the projector goes black and returns to the red light you were using. The status line and <span class="ui">Last exposure</span> confirm it.</li>
+</ol>
+
+<h3 id="exp-after">Afterwards</h3>
+<ul>
+  <li>Each exposure is in the chip record (<span class="ui">Chip &amp; map</span>) with its time, position, duration and pattern. When a layer is complete, click <span class="ui">Finish Layer</span>.</li>
+  <li>Snapshots are in the snapshot folder (<span class="ui">Settings → Files → Open</span>).</li>
+  <li>Close the app with the window's ✕. It offers to save an unsaved chip record, remembers your settings, and switches the projector LEDs off.</li>
+</ul>
+</section>
+
+<!-- =============================== 8 =============================== -->
+<section id="alignment">
+<h2 class="part"><span class="n">8</span><span>The Alignment page</span></h2>
+<p><b>Image position on the projector</b> shifts or rotates everything the projector shows (pattern, red light and blue mark together), in projector pixels and degrees. Type values and click <span class="ui">Apply</span>, or use <span class="ui">NUDGE</span>: pick a step (1, 5, 20, 100 px; 0.05, 0.2, 1°) and click the arrows, or ⟲ (counter-clockwise) and ⟳ (clockwise). <span class="ui">Reset</span> returns to 0, 0, 0. Use it with <span class="ui">Show it in red</span> to line up a new layer with features already on the chip.</p>
+<p><b>Alignment markers</b>: the app finds the chip's alignment marks with a trained model (<span class="path">ckpts/best.onnx</span>, built into the app). <span class="ui">Show detected markers on the camera picture</span> draws a green box around each mark it sees. <span class="ui">Auto-align stage</span> moves the stage so the marks land on their calibrated positions; click it again to refine. The calibrated positions and the µm-per-picture scale are in <span class="path">config.toml</span> under <code>[alignment]</code>; they are measured at <code>reference-width</code> × <code>reference-height</code> camera pixels and work at any camera resolution.</p>
+<p><b>Automatic focus</b>: the option to autofocus automatically when tiling switches between red light and exposure.</p>
+</section>
+
+<!-- =============================== 9 =============================== -->
+<section id="chip">
+<h2 class="part"><span class="n">9</span><span>The Chip &amp; map page</span></h2>
+<p><b>Exposure map</b>: a 1 × 1 cm map with the current field (red outline) and every exposure made (filled).</p>
+<p><b>Chip record</b>: <span class="ui">Open</span>, <span class="ui">New</span> and <span class="ui">Save As</span> a chip file (JSON). Exposures of the current layer are listed with a thumbnail and position; double-click one to move the stage back there (it asks first). <span class="ui">Finish Layer</span> starts a new layer; <span class="ui">Delete Exposure</span> removes the selected one. With a chip file chosen, every change is saved immediately.</p>
+<p><b>Tiling</b> (advanced) exposes a pattern larger than one field in several tiles: <span class="ui">1 Split the pattern into tiles</span> cuts the pattern into projector-sized tiles with overlapping alignment marks (saved in <span class="path">stepper_tiles</span> inside the snapshot folder), <span class="ui">2 Begin tiling</span> asks once, then moves, focuses, aligns to the previous tile's marks and exposes, tile by tile. The tiles sit on an even grid (the stage step between them never changes); where the last row or column runs past the pattern it is black. <span class="ui">Capture &amp; Stitch</span> photographs the area and overlays the pattern, then returns the stage to where it started. Manual stage controls are locked during both; <span class="ui">STOP</span> or <kbd>Esc</kbd> ends the run after the current step, and the status line and log report what happened to each tile.</p>
+</section>
+
+<!-- =============================== 10 =============================== -->
+<section id="settings">
+<h2 class="part"><span class="n">10</span><span>The Settings page</span></h2>
+<p>Changes take effect immediately unless marked "after restart". <span class="ui">Save settings</span> writes them to <span class="path">config.toml</span>; the app also saves when you close it. The previous file is kept as a <span class="path">.bak</span> (the five newest).</p>
+<figure>IMG:settings|Settings → Projector.</figure>
+<div class="table-wrap"><table>
+  <tr><th>Tab</th><th>Settings</th></tr>
+  <tr><td><span class="ui">Camera</span></td><td>Camera type, device (<span class="ui">Refresh</span> lists cameras by name), resolution (<span class="os">Windows</span> the camera is read through DirectShow, the only way the Arducam accepts exposure changes), skipping corrupted green frames, <span class="ui">Apply and reconnect camera</span>, <span class="ui">Camera adjustments…</span>, the camera's status and measured frame rate, <span class="ui">Copy camera diagnostics</span>.</td></tr>
+  <tr><td><span class="ui">Projector</span></td><td>Open the output window at startup; image resolution (same as the projector display, recommended); LED control over USB with its status, <span class="ui">Reconnect LEDs</span> and <span class="ui">Test LEDs</span>.</td></tr>
+  <tr><td><span class="ui">Stage</span></td><td>Use the stage, serial port, homing with limit switches, reverse Z (after restart); reverse the X, Y or Z direction of the arrows (immediately).</td></tr>
+  <tr><td><span class="ui">Files</span></td><td>Snapshot folder (<span class="ui">Choose…</span>, <span class="ui">Open</span>), snapshot format (PNG lossless or JPEG smaller), the automatic snapshot before every exposure.</td></tr>
+  <tr><td><span class="ui">Appearance</span></td><td>Dark or light colours; text size 90 % to 130 % on top of the system's display scaling (after restart).</td></tr>
+</table></div>
+</section>
+
+<!-- =============================== 11 =============================== -->
+<section id="config">
+<h2 class="part"><span class="n">11</span><span>Configuration file</span></h2>
+<p>Everything on the Settings page is stored in <span class="path">config.toml</span>, a text file you can also edit in any text editor (with the app closed). <span class="path">default.toml</span> has every setting with a comment. The most useful ones:</p>
+<pre><span class="c"># [camera]</span>
+type = "webcam"            <span class="c"># "basler", "flir", "none"</span>
+device = "auto"            <span class="c"># or the camera's number</span>
+backend = "auto"           <span class="c"># DirectShow / AVFoundation / V4L2</span>
+mode = "max"               <span class="c"># or "manual" with width, height, fps</span>
+exposure = "auto"          <span class="c"># or a number: -4 = 62.5 ms</span>
+white-balance = 4500       <span class="c"># "auto" not recommended</span>
+stripe-filter = true
+average-frames = 1
+stripe-free-exposure = -4  <span class="c"># written by the app after the search</span>
+
+<span class="c"># [stage]</span>
+port = "auto"
+homing = false
+invert-z = true
+jog-invert-x = false       <span class="c"># also -y, -z</span>
+x-limits = [-15000, 0]     <span class="c"># optional travel limits in µm (also y-, z-)</span>
+[stage.presets]
+"Chip origin" = [-14500.0, -13500.0, -13844.0]
+
+<span class="c"># [projector]</span>
+window = "auto"            <span class="c"># "off" = open it yourself</span>
+display = "auto"           <span class="c"># or a display number</span>
+resolution = "auto"        <span class="c"># or "3840x2160" …</span>
+led-control = "auto"       <span class="c"># "off" leaves the LEDs alone</span>
+red-brightness = 100
+
+<span class="c"># [exposure]</span>
+seconds = 8
+
+<span class="c"># [files]</span>
+snapshot-folder = "stepper_captures"
+snapshot-format = "png"
+auto-snapshot = true
+
+<span class="c"># [alignment]</span>
+enabled = false            <span class="c"># show detected marks on the camera picture</span>
+model_path = "ckpts/best.onnx"
+reference-width = 1920     <span class="c"># camera pixels the marker positions were measured at</span>
+reference-height = 1080</pre>
+<p>A typo never stops the app: at startup a <span class="ui">Check your settings</span> message lists values it could not use and what it used instead.</p>
+</section>
+
+<!-- =============================== 12 =============================== -->
+<section id="trouble">
+<h2 class="part"><span class="n">12</span><span>Troubleshooting</span></h2>
+<p>Two things answer most questions: the log <span class="path">HackerfabStepper.log</span> in the app's folder (newest run at the bottom; <span class="ui">Help → Open log</span>) and, for camera problems, <span class="ui">Settings → Camera → Copy camera diagnostics</span>. <span class="ui">Help → Copy problem report</span> copies both kinds of information at once.</p>
+
+<h3>Camera</h3>
+<details><summary>The camera picture is black</summary><div>
+<ol class="steps">
+  <li>Check that the projector shows red light (badge <span class="badge red">RED · SAFE</span>) and that the light reaches the chip.</li>
+  <li>Click <span class="ui">Adjust…</span> under the picture, then <span class="ui">Reset</span>. Then pick a lower resolution from the list under the picture (for example 1920 × 1080) to see whether the picture comes back.</li>
+  <li>After about 4 seconds of black frames the app writes a line starting with <code>Camera picture is black</code> to <span class="path">HackerfabStepper.log</span>, with the camera's settings. Send that line with your report.</li>
+</ol></div></details>
+<details><summary>Coloured stripes are still visible</summary><div>
+<ol class="steps">
+  <li>Make sure red light is on and <span class="ui">Auto exposure</span> is on in step 2, then click <span class="ui">Find stripe-free exposure</span> and wait for <span class="ui">Auto: settled</span>.</li>
+  <li>If the Focus step says <span class="ui">The camera did not accept exposure…</span>, close other camera programs and click <span class="ui">Reconnect</span>. If it keeps saying so, send the camera diagnostics (<span class="ui">Settings → Camera → Copy camera diagnostics</span>).</li>
+  <li>Connect the projector's USB cable for LED control (<a href="#projector">Part 6</a>). This removes the teal/pink bands completely.</li>
+  <li>Check <span class="ui">Adjust… → White balance</span> is a number (about 4500 K), not automatic.</li>
+  <li>If the picture went dark after the search, click <span class="ui">Adjust… → Reset</span> and run the search again with <span class="ui">Red brightness</span> at 100 %. Automatic exposure stays between 15.6 and 125 ms; shorter exposures only make the stripes worse.</li>
+  <li>Turn on <span class="ui">Stripe filter</span> and try <span class="ui">Frame averaging</span> 2 or 4.</li>
+</ol></div></details>
+<details><summary>The picture is solid red, pink or white (overexposed)</summary><div>
+<p>Turn <span class="ui">Auto</span> on next to <span class="ui">Red brightness</span>, or lower the slider. In <span class="ui">Adjust…</span>, <span class="ui">Reset</span> returns the camera to its defaults.</p></div></details>
+<details><summary>"NO CAMERA", or the camera stays "CONNECTING"</summary><div>
+<ol class="steps">
+  <li>Close every other program that might use the camera (Camera, Zoom, Teams, OBS, the Arducam viewer).</li>
+  <li>Unplug the camera, wait five seconds, plug it into a blue USB 3 port directly.</li>
+  <li>Click <span class="ui">Reconnect</span> under the picture.</li>
+  <li>Check the camera permission. <span class="os">Windows</span> <span class="ui">Settings → Privacy &amp; security → Camera → Let desktop apps access your camera</span>. <span class="os">macOS</span> <span class="ui">System Settings → Privacy &amp; Security → Camera</span>: allow HackerFab Stepper, then restart it. <span class="os">Linux</span> your user must be in the <code>video</code> group (<a href="#install">Part 2</a>).</li>
+  <li>Still failing: copy the camera diagnostics and send them with the log.</li>
+</ol></div></details>
+<details><summary>The laptop's own camera is shown instead of the Arducam</summary><div>
+<p><span class="ui">Settings → Camera</span>: <span class="ui">Refresh</span>, choose the Arducam by name, <span class="ui">Apply and reconnect camera</span>, <span class="ui">Save settings</span>.</p></div></details>
+<details><summary>Only 1280 × 720 is available, at 10 fps</summary><div>
+<p>The camera is connected at USB 2 speed. Use a blue USB 3 port, the original cable and no hub; try flipping the USB-C plug at the camera.</p></div></details>
+<details><summary>Green blocks or bands, or flickering</summary><div>
+<p>Image data is being lost on the USB link: same fixes as above. Frames that are mostly solid green are skipped automatically.</p></div></details>
+<details><summary>The camera is slow at the highest resolution</summary><div>
+<p>At 5472 × 3648 the camera delivers 9 frames per second; that is the camera, not the app. For quick navigation choose 1920 × 1080 in the resolution list, then go back to the highest for focusing and snapshots.</p></div></details>
+
+<h3>Projector</h3>
+<details><summary>The projector mirrors the laptop screen</summary><div>
+<p>The displays are mirrored. Make the projector its own display (<a href="#extend">how, for each system</a>), then pick the projector under <span class="ui">OUTPUT</span> and click <span class="ui">Open</span>.</p></div></details>
+<details><summary>Nothing appears on the projector</summary><div>
+<ol class="steps">
+  <li>Check the <span class="ui">Projector</span> dot. Red means no output window: click <span class="ui">Open</span> on the Projector panel.</li>
+  <li>Check the badge: <span class="badge off">OFF</span> means black is projected. Click <span class="ui">Red light · safe</span>.</li>
+  <li>With LED control, check the <span class="ui">LEDs</span> line; <span class="ui">Test LEDs</span> shows whether the board reacts.</li>
+  <li>If the wrong display is covered, choose the projector under <span class="ui">OUTPUT</span>.</li>
+</ol></div></details>
+<details><summary>The pattern is the wrong size or in the wrong place</summary><div>
+<p>Check <span class="ui">Settings → Projector → Image resolution</span> (same as the projector display), <span class="ui">Border</span> 0 in step 1, and <span class="ui">Alignment → Reset</span>.</p></div></details>
+<details><summary>"Exposure not started"</summary><div>
+<p>The message says why: no pattern chosen; no exposure time; the stage did not stop moving within 20 seconds (it shows the controller's state; <b>Alarm</b> is explained under Stage); or the blue LED could not be switched on over USB (check the projector's USB cable, or turn LED control off).</p></div></details>
+<details><summary>The exposure stopped early</summary><div>
+<p><kbd>Esc</kbd>, <span class="ui">Stop exposure</span>, <span class="ui">STOP</span>, or closing the app during an exposure stops it. The record marks it as stopped. If the status line says the exposure finished late, the window was busy; the light itself is switched off on time by a separate timer.</p></div></details>
+
+<h3>Stage</h3>
+<details><summary>"Stage did not move"</summary><div>
+<p>See <a href="#stage">Part 5</a>: ALARM, travel limits, or lost contact.</p></div></details>
+<details><summary>"Stage disconnected", and a Reconnect button under the stage controls</summary><div>
+<p>The controller's USB link dropped (cable, power, or a controller reset). Nothing is sent to the stage and exposures are refused until it is back. Check the cable and the controller's power, then click <span class="ui">Reconnect</span>; the position is read from the controller again. If it happens while the motors move, try a shorter cable, a different port or a powered USB hub.</p></div></details>
+<details><summary>One axis does not move, the others do</summary><div>
+<p>Every command sent to the controller is written to <span class="path">HackerfabStepper.log</span>, for example <code>GRBL &gt; G0 Y0.0100  ok</code>. If the Y commands are there with <code>ok</code>, the controller accepted them and the problem is in the controller's settings or the wiring: check that axis's steps per mm (<code>$101</code> for Y; a large step such as 100 µm shows it more clearly than 1 µm), its driver and its cable. If they are missing or show an error, send the log.</p></div></details>
+<details><summary>No ports appear in the setup window</summary><div>
+<ol class="steps">
+  <li>Check the controller is powered and its USB cable carries data (not charge-only).</li>
+  <li>Click <span class="ui">↺</span> to rescan.</li>
+  <li><span class="os">Windows</span> <span class="ui">Device Manager → Ports (COM &amp; LPT)</span>: a warning icon means a driver is missing (CH340-based boards often need one).</li>
+  <li><span class="os">macOS</span> controllers appear as <code>/dev/cu.usbmodem…</code> or <code>/dev/cu.usbserial…</code>; CH340-based boards need the WCH driver (allow it under <span class="ui">System Settings → Privacy &amp; Security</span>).</li>
+  <li><span class="os">Linux</span> controllers appear as <code>/dev/ttyACM…</code> or <code>/dev/ttyUSB…</code>; your user must be in the <code>dialout</code> group (<code>uucp</code> on Arch), see <a href="#install">Part 2</a>.</li>
+</ol></div></details>
+<details><summary>The top bar says "Stage: simulation" although I picked a port</summary><div>
+<p>Opening the port failed; the reason is in the log (<code>Stage connection failed (COM5): …</code>). Usually another program has the port open (Arduino IDE serial monitor, a G-code sender). Close it and restart.</p></div></details>
+<details><summary>Arrow keys do nothing</summary><div>
+<p>The keyboard is in a text field. Click the camera picture and try again. Keys are also ignored during an exposure, autofocus, homing or tiling.</p></div></details>
+<details><summary>Autofocus stops with a message</summary><div>
+<p>It needs a live picture with detail and a start reasonably close to focus. Focus roughly by hand, show solid red or a pattern with sharp edges, and try again. <i>No sharpest point within ±150 µm</i> means focus is further away than that: get close by hand first. After any failure it returns the stage to the Z it started from.</p></div></details>
+
+<h3>Starting the app</h3>
+<details><summary><span class="os">Windows</span> "Windows protected your PC"</summary><div><p>Click <span class="ui">More info</span>, <span class="ui">Run anyway</span>.</p></div></details>
+<details><summary><span class="os">macOS</span> "can't be opened because it is from an unidentified developer"</summary><div><p>Right-click (or Control-click) the app, <span class="ui">Open</span>, <span class="ui">Open</span>. Only needed once.</p></div></details>
+<details><summary><span class="os">Linux</span> double-clicking does nothing</summary><div><p>Make it executable once (<code>chmod +x HackerfabStepper</code>) and start it from a terminal with <code>./HackerfabStepper</code> to see its messages.</p></div></details>
+<details><summary>An error box appears, or the app closes straight away</summary><div>
+<ol class="steps">
+  <li>Open <span class="path">HackerfabStepper.log</span> and read the last lines.</li>
+  <li>If it mentions the config file, rename <span class="path">config.toml</span> to <span class="path">config.old.toml</span> and start again with the defaults.</li>
+</ol></div></details>
+
+<h3>Reporting a problem</h3>
+<p>Include what you did and what happened, the last 50 lines of <span class="path">HackerfabStepper.log</span>, the camera diagnostics for camera problems, and your operating system and version. <span class="ui">Help → Copy problem report</span> collects all of this for you.</p>
+</section>
+
+<!-- =============================== 13 =============================== -->
+<section id="maintainers">
+<h2 class="part"><span class="n">13</span><span>For maintainers</span></h2>
+<h3>What the app is</h3>
+<p>A PyInstaller build of the <span class="path">stepper/</span> folder: one file on Windows and Linux, an <span class="path">.app</span> bundle on macOS. It bundles Python 3.12, OpenCV (without its video-file codec), NumPy, Pillow, pyserial, toml, ttkbootstrap, pyusb with libusb (projector LEDs), the alignment model <span class="path">ckpts/best.onnx</span> (run on OpenCV, so no PyTorch) and, on Windows, pygrabber/comtypes (DirectShow camera modes and control ranges). It leaves out ultralytics and PyTorch and everything the app never loads (video codecs, unused image formats, test and packaging modules).</p>
+<h3>Code map</h3>
+<div class="table-wrap"><table>
+  <tr><th>File</th><th>Contents</th></tr>
+  <tr><td><span class="path">src/stepper_app.py</span></td><td>Standalone app entry point: working folder per OS, log, smoke test.</td></tr>
+  <tr><td><span class="path">src/gui.py</span></td><td>The main window, startup window and <code>main()</code>.</td></tr>
+  <tr><td><span class="path">src/dispatcher.py</span></td><td>State and actions: projection, LEDs, exposures, autofocus, stage, automatic camera settings.</td></tr>
+  <tr><td><span class="path">src/camera/webcam.py</span></td><td>Capture process: mode choice, live controls, preview, focus and statistics, full-resolution snapshots.</td></tr>
+  <tr><td><span class="path">src/camera/auto_exposure.py</span></td><td>Stripe-free exposure search and brightness control.</td></tr>
+  <tr><td><span class="path">src/camera/processing.py</span>, <span class="path">modes.py</span>, <span class="path">dshow_controls.py</span></td><td>Image processing, camera modes, DirectShow control ranges.</td></tr>
+  <tr><td><span class="path">src/projector_leds.py</span></td><td>DLPC6540 LED enable over USB.</td></tr>
+  <tr><td><span class="path">src/camera_view.py</span>, <span class="path">stage_pad.py</span>, <span class="path">projector_panel.py</span>, <span class="path">steps_panel.py</span></td><td>The Operate page's parts.</td></tr>
+  <tr><td><span class="path">src/settings.py</span>, <span class="path">alignment_page.py</span>, <span class="path">chip_pages.py</span>, <span class="path">help_page.py</span></td><td>The other pages (the Help page's answers are plain lists at the top of <span class="path">help_page.py</span>).</td></tr>
+  <tr><td><span class="path">src/alignment_detector.py</span></td><td>The alignment-marker model on OpenCV DNN (or ultralytics for a <span class="path">.pt</span> file).</td></tr>
+  <tr><td><span class="path">src/platform_text.py</span></td><td>Wording and helpers that differ between Windows, macOS and Linux.</td></tr>
+  <tr><td><span class="path">src/ui_theme.py</span>, <span class="path">ui_kit.py</span></td><td>Colours, fonts, DPI awareness, shared widgets.</td></tr>
+</table></div>
+<h3>Build</h3>
+<p>GitHub Actions builds, smoke-tests and publishes the app for Windows, macOS (Apple silicon and Intel) and Linux on every push (see <span class="path">.github/workflows/build.yml</span>); a tag such as <code>v1.2.0</code> makes a release. To build on your own computer, on any of the three systems, with Python 3.10 to 3.13:</p>
+<pre>cd stepper
+python -m venv .venv-build
+.venv-build/bin/python -m pip install -r packaging/requirements-build.txt   <span class="c"># Windows: .venv-build\Scripts\python</span>
+.venv-build/bin/python packaging/build.py</pre>
+<p><span class="path">packaging/build.py</span> runs PyInstaller with <span class="path">packaging/HackerfabStepper.spec</span>, runs the smoke test and leaves the download in <span class="path">dist/release/</span>. On Linux without a screen, run it under <code>xvfb-run</code>.</p>
+<h3>This guide</h3>
+<p>Edit the text in <span class="path">docs/guide_template.html</span> (screenshots are in <span class="path">docs/guide_images/</span>), then run <code>python tools/build_guide.py</code> to rebuild <span class="path">docs/HOW-TO-GUIDE.html</span>.</p>
+<h3>Smoke test</h3>
+<p><code>HackerfabStepper --smoke-test</code> builds the whole interface with no hardware, visits every page, checks that the USB library loads and the alignment model runs, that child processes start, starts a camera worker process against a camera that does not exist and checks that it reports back. It writes <code>SMOKE TEST PASSED</code> to the log and exits with code 0.</p>
+<h3>Tests</h3>
+<pre>cd stepper
+python -m unittest discover -s tests      <span class="c"># or ./run_tests.sh (Linux: no windows pop up)</span></pre>
+<p>About 190 tests: the camera worker with a simulated camera (mode choice, live controls, snapshots), image processing and the automatic camera settings against a simulated projector, LED control with a simulated USB device, alignment-marker detection and tiling, USB dropouts and travel limits, the Help page, the stepper logic (exposures, LED sequencing, STOP, safety timer, autofocus limits, stage position and homing, GRBL replies) and the main window with simulated camera, stage, displays and LEDs. GUI tests need a display and answer every dialog automatically.</p>
+</section>
+
+<!-- =============================== Appendix =============================== -->
+<section id="checklist">
+<h2 class="part"><span class="n">A</span><span>Session checklist</span></h2>
+<p>Print this page and keep it at the station.</p>
+<div class="card">
+<h4>Before launching</h4>
+<ul>
+  <li>Projector on, HDMI connected, set as its own display (not mirrored)</li>
+  <li>Projector board's USB cable connected (LED control); TI's EVM GUI closed</li>
+  <li>Stage powered, controller plugged in</li>
+  <li>Camera in a blue USB 3 port, no hub; other camera programs closed</li>
+  <li>Stage area clear of hands and tools</li>
+</ul>
+<h4>After launching</h4>
+<ul>
+  <li>Top bar: Camera, Stage, Projector and LEDs dots green</li>
+  <li>Chip record created or opened</li>
+  <li>Step 2 says "Auto: settled", no stripes in the picture</li>
+</ul>
+<h4>Each exposure</h4>
+<ul>
+  <li>Pattern chosen and the preview checked</li>
+  <li>Focused in red (focus bar at its longest)</li>
+  <li>Exposure time set to the calibrated value</li>
+  <li>Checklist in step 3 all ✓</li>
+  <li>Nobody looking into the projector</li>
+</ul>
+<h4>Finishing</h4>
+<ul>
+  <li>Layer finished in the chip record</li>
+  <li>Snapshots copied out of the snapshot folder</li>
+  <li>App closed with ✕ (LEDs switch off), chip unloaded</li>
+</ul>
+</div>
+</section>
+
+<section id="keys">
+<h2 class="part"><span class="n">B</span><span>Mouse and keyboard</span></h2>
+<div class="table-wrap"><table>
+  <tr><th>Action</th><th>Result</th></tr>
+  <tr><td>Arrow keys</td><td>Move X/Y by the step (hold to repeat)</td></tr>
+  <tr><td><kbd>Page Up</kbd> / <kbd>Page Down</kbd></td><td>Focus Z + / Z −</td></tr>
+  <tr><td><kbd>Shift</kbd> + any of those</td><td>10× the step</td></tr>
+  <tr><td>Hold an arrow or Z button</td><td>Keep moving, one step after another</td></tr>
+  <tr><td><kbd>Esc</kbd></td><td>Stop an exposure, autofocus, homing or tiling; leave camera fullscreen</td></tr>
+  <tr><td><kbd>F1</kbd></td><td>The Help page (its first button opens this guide)</td></tr>
+  <tr><td>Double-click the camera picture</td><td>Camera fullscreen (double-click again to return)</td></tr>
+  <tr><td>Click the projector thumbnail</td><td>Larger preview of the projector output</td></tr>
+  <tr><td>Click the focus bar</td><td>Reset its "best so far" mark</td></tr>
+  <tr><td>Double-click an exposure in the chip record</td><td>Move the stage back to it (asks first)</td></tr>
+  <tr><td>Hover over a control</td><td>A short explanation</td></tr>
+  <tr><td><span class="os">Windows</span> <kbd>Win</kbd> + <kbd>P</kbd></td><td>Projection mode; choose Extend</td></tr>
+</table></div>
+</section>
+
+</main>
+</div>
+
+<footer>
+  HackerFab Stepper is MIT licensed, copyright 2024 hacker-fab. This guide describes the app built from illinoismicrotech/Hackerfab-Stepper for Windows, macOS and Linux. Screenshots were taken on a test PC with a simulated camera and stage.
+</footer>
+</body>
+</html>

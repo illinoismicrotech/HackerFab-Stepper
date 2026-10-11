@@ -36,3 +36,6 @@ stepper/dist/
 
 # Local downloads (not part of the project)
 /HackerFabGUI_V2-*.zip
+
+# Experimental slim OpenCV binary (rebuilt by stepper/packaging/build_opencv_slim.sh)
+stepper/packaging/opencv-slim/

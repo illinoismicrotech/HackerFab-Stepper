@@ -1,88 +1,106 @@
-# This section configures the camera used for the GUI's preview.
+# HackerFab Stepper settings.
+# The app saves your choices to config.toml next to this file (Settings → Save settings, and
+# automatically when you close it). Edit this file only to change the defaults for new installs.
+
 [camera]
-# Available options are:
-# "webcam" (for a generic USB camera),
-# "basler" (for a Basler/Pylon camera)
-# "flir" (for a FLIR camera)
-# "none" (to disable camera)
+# "webcam" (any USB camera, e.g. the Arducam B0477), "basler", "flir" or "none".
 type = "webcam"
-# The index field is optional and is only used to select which of multiple webcams or basler/pylon cameras should be used,
-# e.g. on a laptop where there may be a builtin webcam in addition to an external USB camera.
+# "auto" picks the Arducam if it is connected, otherwise the first USB camera.
 device = "auto"
-# Capture API. "auto" = Media Foundation on Windows, V4L2 on Linux, AVFoundation on macOS.
-# Other choices: "msmf", "dshow", "v4l2", "any". Note: with "dshow" the Arducam B0477 shows a solid white image.
+# Capture method. "auto" = DirectShow on Windows (the only one through which the Arducam
+# accepts exposure changes), V4L2 on Linux, AVFoundation on macOS. Others: "dshow", "v4l2",
+# "avfoundation", "any", and "msmf" on Windows.
 backend = "auto"
-# Camera exposure in DirectShow units (log2 of seconds): -11 = 0.5 ms, -6 = 16 ms, -5 = 31 ms, -4 = 62 ms.
-# "auto" leaves the camera's own setting alone. Long exposures (-5 or -4) remove the coloured bands
-# caused by the DLP projector's colour flashes. Setting a number makes "auto" backend use DirectShow.
+# "max" = the camera's highest resolution at its lowest frame rate (B0477: 5472 x 3648 at 9 fps).
+# "manual" uses width/height/fps below (pick a resolution from the list under the camera picture).
+mode = "max"
+width = 1920
+height = 1080
+fps = 60
+# Exposure: "auto" = this app's automatic exposure, which also finds the exposure that removes
+# the projector's stripes. A number fixes it (log2 seconds on every OS: -4 = 62.5 ms).
 exposure = "auto"
-# Auto validates decoded frames and favors moderate-bandwidth MJPEG modes.
-mode = "auto"
-width = 1280
-height = 720
-fps = 30
-fourcc = "MJPG"
+# Dims the red focus light automatically instead of raising camera gain.
+auto-light = true
+# Fixed white balance in kelvin keeps red light red. "auto" lets the camera decide (not
+# recommended: it turns faint projector light into coloured bands).
+white-balance = 4500
+# Evens out leftover horizontal bands in the live picture (snapshots are never filtered).
+stripe-filter = true
+# Average this many frames for the live picture (1 = off).
+average-frames = 1
+# Skip corrupted (solid green) frames that some USB links produce.
 reject-green = true
-# The output from the camera is typically too large to show at full resolution.
-# This parameter adjusts the size of the camera feed before it is displayed in the GUI.
-gui-scale = 0.25
-# The following two values adjust the *camera* exposure in microseconds when viewing red or UV light.
-# Note that using values that are not a multiple of 4167 can lead to flickering.
-red-exposure = 4167.0
-uv-exposure = 25000.0
 
-# This section configures the motion stage
 [stage]
-# Set enabled to false to disable all motion.
+# Set enabled to false to run without the motion stage.
 enabled = true
-# Set homing to false if your stage does not have limit sensors
+# Set homing to true if your stage has limit switches (it then homes at startup).
 homing = false
-# Serial port for the GRBL board.
-# "auto" scans for a connected Arduino/GRBL board automatically (recommended).
-# Set to a specific path (e.g. "/dev/ttyACM0" or "COM3") to override auto-detection.
+# "auto" finds the GRBL board; or a port such as "COM3" (Windows), "/dev/ttyACM0" (Linux)
+# or "/dev/cu.usbmodem1101" (macOS).
 port = "auto"
-
-# GRBL's baud rate is almost always 115200, do not change this value
+# GRBL's baud rate is almost always 115200.
 baud-rate = 115200
-# Reverse the Z axis so that +Z in the app brings the camera and chip closer together.
 invert-z = true
+# Step sizes selected under the camera (µm).
+xy-step = 10
+z-step = 2
 # Optional travel limits in micrometers, as [lowest, highest]. Moves outside them are refused.
 # Measure your stage's real range before turning these on. Example for a homed 15 mm stage:
 # x-limits = [-15000, 0]
 # y-limits = [-15000, 0]
 # z-limits = [-15000, 0]
 
-# This section configures alignment marker detection
+[stage.presets]
+# Saved positions for Go to… (µm, need homing). Add your own: name = [x, y, z]
+"Chip origin" = [-14500.0, -13500.0, -13844.0]
+"Load / unload" = [-14500.0, -14500.0, -14500.0]
+
+[projector]
+# Open the projector output window at startup on the first display that is not your main
+# screen (the projector must extend the desktop, not mirror it). "off" = open it yourself.
+window = "auto"
+# Which display: "auto" or a display number (remembered when you pick one).
+display = "auto"
+# Image resolution: "auto" = the projector display's own resolution (pixel for pixel).
+resolution = "auto"
+# Switch the projector's LEDs over its USB port (red only for focusing, blue for exposures,
+# all off when clear). "off" leaves the LEDs alone. Needs the projector board's USB cable.
+led-control = "auto"
+# Red focus light brightness in percent (2-100); auto-light adjusts it.
+red-brightness = 100
+
+[exposure]
+seconds = 8
+
+[files]
+snapshot-folder = "stepper_captures"
+# "png" (lossless) or "jpg" (smaller)
+snapshot-format = "png"
+# Save a camera snapshot just before every exposure.
+auto-snapshot = true
 
 [alignment]
-# Enable or disable real-time detection of alignment markers
-enabled = true
-# Alignment-marker model. best.onnx runs without PyTorch (also in the standalone app);
-# best.pt needs the ultralytics package. A .pt path also uses a .onnx file next to it.
+# Show detected alignment markers on the camera picture (Auto-align and tiling use the model
+# either way; this can also be switched on the Alignment page).
+enabled = false
+# best.onnx runs on OpenCV, so it works in the standalone app without PyTorch. A .pt path
+# needs the ultralytics package, and also uses a .onnx file next to it if there is one.
 model_path = "ckpts/best.onnx"
 # Camera resolution the marker coordinates below were measured at. They are scaled to
 # whatever resolution the camera actually runs at.
 reference-width = 1920
 reference-height = 1080
-# Alignment marker reference coordinates (in pixels)
-right_marker_x = 1820.0  # x-coordinate for markers on the right side
-top_marker_y = 269.0     # y-coordinate for markers on the top
-bottom_marker_y = 1075.0 # y-coordinate for markers on the bottom
-left_marker_x = 280.0    # x-coordinate for markers on the left side
-# Scaling factors for converting normalized differences to stage movements (in µm)
-x_scale_factor = -1100   # Scaling factor for x-axis movements
-y_scale_factor = 800     # Scaling factor for y-axis movements
+right_marker_x = 1820.0
+top_marker_y = 269.0
+bottom_marker_y = 1075.0
+left_marker_x = 280.0
+x_scale_factor = -1100
+y_scale_factor = 800
 
 [ui]
+# "studio-dark" or "studio" (light)
 theme = "studio-dark"
-
-[projector]
-# Dedicated projector window. "auto" opens it at launch on the first display that is not
-# your main screen (Windows must be set to Extend with Win+P, not Duplicate).
-# "off" never opens it; exposures then fill the main window instead.
-window = "auto"
-# Which display to use: "auto", or a display number such as 2 (saved when you pick one
-# under Projector window and then click Save settings).
-display = "auto"
-# Brightness of the red focus image, in percent (2-100). Lower it if a long camera exposure washes out.
-red-brightness = 100
+# Text size on top of the system's display scaling: 0.9, 1.0, 1.15 or 1.3
+text-scale = 1.0

@@ -77,6 +77,8 @@ def load_marker_detector(model_path) -> Optional[object]:
     """Load the detector named in the config. A .pt path also finds a .onnx file beside it,
     which is preferred because it needs no PyTorch. Returns None (with a printed reason)
     when no usable model is found."""
+    if not str(model_path or "").strip():
+        return None   # detection turned off in the settings
     path = Path(model_path)
     names = [path.with_suffix(".onnx"), path] if path.suffix == ".pt" else [path]
     candidates = list(names)

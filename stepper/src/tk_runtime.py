@@ -22,3 +22,13 @@ def enable_font_support():
     os.environ['TCL_LIBRARY'] = str(prefix / 'lib' / 'tcl9.0')
     os.environ['TK_LIBRARY'] = str(prefix / 'lib' / 'tk9.0')
     return True
+
+
+def safe_console():
+    """Never let a status print crash the app: a console or pipe with a legacy code page
+    (cp1252) cannot encode characters such as → or ✓."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass

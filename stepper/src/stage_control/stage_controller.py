@@ -7,13 +7,18 @@ class UnsupportedCommand(Exception):
     pass
 
 
-# This will be an abstract interface for stage positioning.
 class StageController:
+    """Stage interface. This base class is the simulated stage: it accepts moves and does nothing."""
+
     def move_by(self, amounts: dict[str, float]):
-        print(f"ignoring move_by {amounts} in dummy stage controller")
+        """Relative move, µm per axis."""
 
     def move_to(self, amounts: dict[str, float]):
-        print(f"ignoring move_to {amounts} in dummy_stage controller")
+        """Absolute move, µm per axis, in the coordinates position() reports."""
+
+    def position(self):
+        """Current (x, y, z) in µm, or None when the stage cannot say (the simulated stage)."""
+        return None
 
     def has_homing(self):
         return False
@@ -28,9 +33,8 @@ class StageController:
     def home(self):
         raise UnsupportedCommand()
 
-    def position_um(self):
-        """Current position in micrometers as (x, y, z), or None if unknown."""
-        return None
+    def stop(self):
+        pass
 
     def reconnect(self):
         """Re-open the connection after it was lost. The simulated stage never disconnects."""

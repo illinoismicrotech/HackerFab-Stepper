@@ -6,3 +6,7 @@ pillow>=11.1,<12
 pyserial>=3.5,<4
 toml>=0.10,<0.11
 ttkbootstrap>=1.10,<2
+pyusb>=1.2,<2              # projector LED control over USB
+libusb-package>=1.0.26     # ships the libusb library pyusb needs (Windows, macOS, Linux)
+pygrabber>=0.2,<1; sys_platform == "win32"   # DirectShow camera names and modes
+comtypes>=1.4; sys_platform == "win32"       # DirectShow camera control ranges

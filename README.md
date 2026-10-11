@@ -11,11 +11,11 @@ No Python, no installing, no command line. Go to the **[Releases page](../../rel
 | Windows 10/11 | `HackerfabStepper-Windows.exe` | Put it in its own folder (e.g. `C:\HackerfabStepper\`) and double-click it. If Windows says "Windows protected your PC", click **More info → Run anyway**. |
 | Mac, Apple silicon (M1–M4) | `HackerfabStepper-macOS-arm64.zip` | Double-click the zip, drag **HackerfabStepper.app** to Applications. First time: right-click it → **Open** → **Open** (or System Settings → Privacy & Security → **Open Anyway**). |
 | Mac, Intel | `HackerfabStepper-macOS-x86_64.zip` | Same as above. |
-| Linux (64-bit) | `HackerfabStepper-Linux-x86_64.tar.gz` | `tar xzf HackerfabStepper-Linux-x86_64.tar.gz && ./HackerfabStepper` |
+| Linux (64-bit) | `HackerfabStepper-Linux-x86_64.tar.gz` | `tar xzf HackerfabStepper-Linux-x86_64.tar.gz && ./HackerfabStepper`. Once: `sudo usermod -aG video,dialout $USER` (Arch: `uucp` instead of `dialout`), then log out and in. |
 
 The newest build of `main` is always under **Latest build**; numbered versions (e.g. `v1.0.0`) are the stable releases. Versions marked **Pre-release** (`v0.x`, or names with a dash like `v1.1.0-beta`) are test builds.
 
-When it starts, click **Start** in the small setup window. The full step-by-step guide is built in: press **F1** or click **Help & guide** in the app.
+When it starts, pick the stage controller in the small setup window and click **Launch**. Help is built in: press **F1** (or **Help** in the top bar). The Help page shows what is not ready yet (camera, stage, projector, LEDs, pattern) with a button to fix each item, and searchable step-by-step answers written for your operating system; its first button opens the illustrated guide.
 
 Everything is included, including the alignment-marker detector used by **Auto-align** and **tiling**.
 
@@ -42,8 +42,8 @@ See the [application guide](stepper/README.md) for GRBL setup, camera support, a
 
 ## Alignment and tiling
 
-- **Auto-align** (Image alignment page) finds the alignment marks in the camera view and moves the stage so they line up with the calibrated positions under `[alignment]`. Turn on **Detect alignment markers in real time** first to check the marks are found.
-- **Tiling** (Chip records & tiling page) exposes a pattern bigger than one projector field: **Split pattern into tiles**, then **Start tiling**. Each tile after the first is corrected using the previous tile's marks. **Stop tiling** stops the run.
+- **Auto-align stage** (Alignment page) finds the alignment marks in the camera view and moves the stage so they line up with the calibrated positions under `[alignment]`. Turn on **Show detected markers on the camera picture** first to check the marks are found.
+- **Tiling** (Chip & map page) exposes a pattern bigger than one projector field: **1 Split the pattern into tiles**, then **2 Begin tiling**. Each tile after the first is corrected using the previous tile's marks. **Stop tiling** (or Esc) stops the run.
 - The marker positions in `default.toml` were calibrated on one station's camera. Check them on yours before relying on Auto-align or tiling: see [`stepper/docs/guide.md`](stepper/docs/guide.md#calibrating-alignment-parameters).
 - The detector is a small YOLO model, `stepper/ckpts/best.onnx`, run by OpenCV (no PyTorch). To retrain it, see [`stepper/docs/model.md`](stepper/docs/model.md).
 
@@ -56,4 +56,4 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-To build it yourself, see [Standalone app](stepper/README.md#standalone-app-windows-macos-linux) in the application guide.
+To build it yourself, see [Standalone app](stepper/README.md#standalone-app-no-python-needed-windows-macos-linux) in the application guide.

@@ -145,6 +145,13 @@ def _windows_priority(name):
 
 def _dshow_device_names():
     """Camera names in DirectShow order, i.e. cv2.VideoCapture(i, cv2.CAP_DSHOW)."""
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        try:  # COM must be initialised in every thread that uses it (left initialised: short-lived thread)
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            pass
     from pygrabber.dshow_graph import FilterGraph
     return list(FilterGraph().get_input_devices())
 
