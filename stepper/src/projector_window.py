@@ -25,6 +25,7 @@ class Display:
     width: int
     height: int
     primary: bool = False
+    refresh: int = 0     # refresh rate in Hz (0 = unknown)
 
     @property
     def label(self) -> str:
@@ -44,7 +45,36 @@ def _windows_displays() -> list[Display]:
         _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT), ("rcWork", RECT),
                     ("dwFlags", wintypes.DWORD), ("szDevice", wintypes.WCHAR * 32)]
 
+    class DEVMODEW(ctypes.Structure):
+        _fields_ = [("dmDeviceName", wintypes.WCHAR * 32), ("dmSpecVersion", wintypes.WORD),
+                    ("dmDriverVersion", wintypes.WORD), ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
+                    ("dmFields", wintypes.DWORD), ("dmPositionX", wintypes.LONG), ("dmPositionY", wintypes.LONG),
+                    ("dmDisplayOrientation", wintypes.DWORD), ("dmDisplayFixedOutput", wintypes.DWORD),
+                    ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short), ("dmYResolution", ctypes.c_short),
+                    ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+                    ("dmFormName", wintypes.WCHAR * 32), ("dmLogPixels", wintypes.WORD),
+                    ("dmBitsPerPel", wintypes.DWORD), ("dmPelsWidth", wintypes.DWORD),
+                    ("dmPelsHeight", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
+                    ("dmDisplayFrequency", wintypes.DWORD), ("dmICMMethod", wintypes.DWORD),
+                    ("dmICMIntent", wintypes.DWORD), ("dmMediaType", wintypes.DWORD),
+                    ("dmDitherType", wintypes.DWORD), ("dmReserved1", wintypes.DWORD),
+                    ("dmReserved2", wintypes.DWORD), ("dmPanningWidth", wintypes.DWORD),
+                    ("dmPanningHeight", wintypes.DWORD)]
+
     user32 = ctypes.windll.user32
+
+    def refresh_of(device: str) -> int:
+        """Current refresh rate of a display (Hz), 0 if Windows does not say."""
+        try:
+            mode = DEVMODEW()
+            mode.dmSize = ctypes.sizeof(DEVMODEW)
+            if user32.EnumDisplaySettingsW(device, -1, ctypes.byref(mode)):   # ENUM_CURRENT_SETTINGS
+                hz = int(mode.dmDisplayFrequency)
+                return hz if 1 < hz < 1000 else 0
+        except Exception:
+            pass
+        return 0
+
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
                                        ctypes.POINTER(RECT), wintypes.LPARAM)
     user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
@@ -58,7 +88,8 @@ def _windows_displays() -> list[Display]:
             match = re.search(r"(\d+)$", info.szDevice or "")
             number = int(match.group(1)) if match else len(found) + 1
             found.append(Display(number, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                                 bool(info.dwFlags & 1)))  # MONITORINFOF_PRIMARY
+                                 bool(info.dwFlags & 1),   # MONITORINFOF_PRIMARY
+                                 refresh_of(info.szDevice)))
         return True
 
     user32.EnumDisplayMonitors(None, None, callback_type(visit), 0)
@@ -76,6 +107,36 @@ def parse_xrandr_monitors(text: str) -> list[Display]:
     return found
 
 
+def parse_xrandr_refresh(text: str) -> dict[str, int]:
+    """Current refresh rate (Hz, rounded) per output from plain `xrandr`: the mode line marked '*'
+    under each 'NAME connected ...' line, e.g. '   1920x1080     60.00*+  59.94'."""
+    rates, output = {}, None
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            output = line.split()[0] if " connected" in line else None
+        elif output and output not in rates:
+            match = re.search(r"(\d+(?:\.\d+)?)\*", line)
+            if match:
+                hz = int(round(float(match.group(1))))
+                if 1 < hz < 1000:
+                    rates[output] = hz
+    return rates
+
+
+def _xrandr_displays() -> list[Display]:
+    monitors = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True, timeout=3).stdout
+    displays = parse_xrandr_monitors(monitors)
+    try:
+        rates = parse_xrandr_refresh(subprocess.run(["xrandr"], capture_output=True, text=True, timeout=3).stdout)
+    except Exception:
+        rates = {}
+    if rates:
+        # --listmonitors ends each line with the output name, in the same order as the displays.
+        names = [line.split()[-1] for line in monitors.splitlines() if re.match(r"^\s*\d+:", line)]
+        displays = [replace(d, refresh=rates.get(name, 0)) for d, name in zip(displays, names)] or displays
+    return displays
+
+
 def list_displays(root: tk.Misc) -> list[Display]:
     """All connected displays, main screen first. Never raises; falls back to Tk's screen size."""
     displays: list[Display] = []
@@ -83,8 +144,7 @@ def list_displays(root: tk.Misc) -> list[Display]:
         if platform.system() == "Windows":
             displays = _windows_displays()
         elif platform.system() == "Linux":
-            out = subprocess.run(["xrandr", "--listmonitors"], capture_output=True, text=True, timeout=3).stdout
-            displays = parse_xrandr_monitors(out)
+            displays = _xrandr_displays()
     except Exception as exc:
         print(f"Could not list displays: {exc}")
     if not displays:

@@ -19,6 +19,7 @@ from camera.modes import Mode, dedupe_resolutions, preset_modes
 from camera.webcam import Webcam, capture_backend, setting_flag
 from platform_text import DISPLAY_SCALING, EXTEND_DISPLAYS, open_path
 from ui_kit import ScrollFrame, add_tooltip
+from update_panel import UpdatePanel
 from ui_theme import px
 
 
@@ -109,7 +110,7 @@ class SettingsPage(ttk.Frame):
         notebook.grid(row=2, column=0, sticky='nsew')
         self.notebook = notebook
         pages = {}
-        for title in ('Camera', 'Projector', 'Stage', 'Files', 'Appearance'):
+        for title in ('Camera', 'Projector', 'Stage', 'Files', 'Appearance', 'Updates'):
             scroll = ScrollFrame(notebook, padding=px(18))
             notebook.add(scroll, text=title)
             scroll.body.columnconfigure(1, weight=1)
@@ -119,6 +120,7 @@ class SettingsPage(ttk.Frame):
         self._stage_page(pages['Stage'])
         self._files_page(pages['Files'])
         self._appearance_page(pages['Appearance'])
+        self.updates = UpdatePanel(pages['Updates'], app, config)
         actions = ttk.Frame(self)
         actions.grid(row=3, column=0, sticky='ew', pady=(px(12), 0))
         ttk.Button(actions, text='Save settings', bootstyle='primary', command=self.save).pack(side='left')

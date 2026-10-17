@@ -18,9 +18,9 @@ CArchiveWriter._COMPRESSION_LEVEL = ZlibArchiveWriter._COMPRESSION_LEVEL = 9
 
 hiddenimports = ["gui", "settings", "dispatcher", "ui_kit", "ui_theme", "camera_view", "stage_pad",
                  "projector_panel", "steps_panel", "alignment_page", "chip_pages", "projector_leds", "help_page",
-                 "platform_text", "alignment_detector", "projector_window",
+                 "platform_text", "alignment_detector", "projector_window", "updater", "update_panel",
                  "camera.webcam", "camera.discovery", "camera.modes", "camera.processing", "camera.auto_exposure",
-                 "camera.dshow_controls", "serial.tools.list_ports",
+                 "camera.stripes", "camera.dshow_controls", "serial.tools.list_ports",
                  "usb", "usb.core", "usb.util", "usb.backend.libusb1", "libusb_package",
                  "PIL._tkinter_finder", "PIL.ImageTk"]  # ttkbootstrap draws its widgets with Pillow
 if sys.platform == "win32":
@@ -34,6 +34,7 @@ a = Analysis(
         (os.path.join(src, "uvFocusImage", "plus.png"), os.path.join("src", "uvFocusImage")),
         (os.path.join(root, "docs", "HOW-TO-GUIDE.html"), "."),  # the illustrated guide (Help page)
         (os.path.join(root, "ckpts", "best.onnx"), "ckpts"),     # alignment-marker model (runs on OpenCV)
+        (os.path.join(root, "build", "build_info.json"), "."),   # version and update channel (packaging/build.py)
     ],
     hiddenimports=hiddenimports,
     excludes=["ultralytics", "torch", "torchvision", "matplotlib", "pandas", "scipy", "pytest", "IPython",

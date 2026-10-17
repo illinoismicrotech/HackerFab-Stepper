@@ -108,3 +108,37 @@ jobs:
           gh release create latest downloads/* --prerelease --target "$GITHUB_SHA" \
             --title "Latest build (main)" \
             --notes "Built automatically from the newest commit on main ($GITHUB_SHA). Download the file for your computer: Windows .exe, macOS .zip (Apple silicon = M1/M2/M3/M4, Intel = older Macs), or Linux .tar.gz. See the README for first-run steps."
+
+  install-check:
+    name: Install script on ${{ matrix.label }}
+    # The published downloads must install (and know how to update) on every OS.
+    needs: release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    env:
+      GITHUB_TOKEN: ${{ github.token }}   # shared runners hit GitHub's anonymous API limit
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: Windows }
+          - { os: macos-latest, label: macOS }
+          - { os: ubuntu-22.04, label: Linux }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install with install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./install.ps1
+          if (-not (Test-Path "$env:LOCALAPPDATA\Programs\HackerfabStepper\HackerfabStepper.exe")) { exit 1 }
+      - name: Install with install.sh
+        if: runner.os != 'Windows'
+        run: |
+          sh install.sh
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            "$HOME/.local/share/HackerfabStepper/HackerfabStepper" --update --check
+          else
+            "$HOME/Applications/HackerfabStepper.app/Contents/MacOS/HackerfabStepper" --update --check \
+              || /Applications/HackerfabStepper.app/Contents/MacOS/HackerfabStepper --update --check
+          fi

@@ -8,7 +8,7 @@ from PIL import Image
 
 from projector_panel import scaled_copy
 from projector_window import (Display, ProjectorWindow, choose_projector_display, list_displays,
-                              parse_xrandr_monitors, solid_color)
+                              parse_xrandr_monitors, parse_xrandr_refresh, solid_color)
 
 MAIN = Display(1, 0, 0, 800, 600, primary=True)
 PROJECTOR = Display(2, 800, 0, 640, 360)
@@ -21,6 +21,18 @@ class DisplayHelperTests(unittest.TestCase):
                 " 1: +HDMI-1 1280/700x720/390+1920+0  HDMI-1\n")
         self.assertEqual(parse_xrandr_monitors(text), [Display(1, 0, 0, 1920, 1080, True),
                                                        Display(2, 1920, 0, 1280, 720, False)])
+
+    def test_parse_xrandr_current_refresh_rates(self):
+        text = ("Screen 0: minimum 320 x 200, current 3200 x 1080, maximum 16384 x 16384\n"
+                "eDP-1 connected primary 1920x1080+0+0 (normal left inverted right) 344mm x 194mm\n"
+                "   1920x1080     60.01*+  59.97    48.00\n"
+                "   1680x1050     59.95\n"
+                "HDMI-1 connected 1280x720+1920+0 (normal left inverted right) 700mm x 390mm\n"
+                "   1920x1080     60.00 +  50.00    59.94\n"
+                "   1280x720      60.00    50.00    47.95*\n"
+                "DP-1 disconnected (normal left inverted right x axis y axis)\n"
+                "   1024x768      60.00*\n")
+        self.assertEqual(parse_xrandr_refresh(text), {"eDP-1": 60, "HDMI-1": 48})
 
     def test_choose_prefers_saved_display_then_first_secondary(self):
         third = Display(3, -1280, 0, 1280, 720)

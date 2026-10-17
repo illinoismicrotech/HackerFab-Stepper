@@ -10,6 +10,7 @@ Output, ready to upload, in dist/release/:
 
 On Linux the smoke test needs a display; in CI it runs under xvfb-run.
 """
+import json
 import os
 import platform
 import shutil
@@ -30,7 +31,29 @@ def run(*command, **kwargs):
     subprocess.run([str(c) for c in command], check=True, **kwargs)
 
 
+def write_build_info() -> dict:
+    """build/build_info.json, bundled into the app: the version, the commit, and where its updates
+    come from (src/updater.py). APP_VERSION is set by CI for tag builds (v1.2.0); anything else is
+    a build of main, which updates to the "Latest build" release."""
+    version = os.environ.get("APP_VERSION", "0.0.0").lstrip("v") or "0.0.0"
+    commit = os.environ.get("GITHUB_SHA", "")
+    if not commit:
+        try:
+            commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=STEPPER, capture_output=True, text=True,
+                                    check=True).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            commit = ""
+    channel = os.environ.get("APP_CHANNEL") or ("latest" if version == "0.0.0" else "stable")
+    info = {"version": version, "commit": commit, "channel": channel}
+    path = STEPPER / "build" / "build_info.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")
+    print(f"Build info: {info}")
+    return info
+
+
 def build():
+    write_build_info()
     env = dict(os.environ)
     if sys.platform.startswith("linux"):
         # Standalone Python builds keep libtcl/libtk next to libpython. Let PyInstaller's

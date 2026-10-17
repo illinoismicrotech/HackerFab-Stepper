@@ -12,16 +12,19 @@ if sys.platform == "win32":
     EXTEND_DISPLAYS = "press Win+P and choose Extend"
     DISPLAY_SCALING = "the Windows display scaling"
     FILE_MANAGER = "File Explorer"
+    REFRESH_RATE_SETTING = "Settings → System → Display → choose the projector → Advanced display → refresh rate"
 elif sys.platform == "darwin":
     OS_NAME = "macOS"
     EXTEND_DISPLAYS = "open System Settings → Displays and turn off mirroring"
     DISPLAY_SCALING = "the macOS display scaling"
     FILE_MANAGER = "Finder"
+    REFRESH_RATE_SETTING = "System Settings → Displays → choose the projector → Refresh rate"
 else:
     OS_NAME = "Linux"
     EXTEND_DISPLAYS = "set your display settings to extend (not mirror) the desktop"
     DISPLAY_SCALING = "the desktop's display scaling"
     FILE_MANAGER = "the file manager"
+    REFRESH_RATE_SETTING = "your desktop's display settings (or xrandr --output <projector> --rate 48)"
 
 
 def open_path(path) -> None:

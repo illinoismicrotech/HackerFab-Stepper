@@ -261,6 +261,49 @@ class AutofocusTests(DispatcherCase):
         self.assertFalse(self.d.autofocus_busy)
         self.assertIn("done", self.d.last_autofocus)
 
+    def test_judges_focus_at_the_scale_that_shows_it(self):
+        # Full resolution is pure noise; 1/2 barely changes with focus; 1/4 has a clear peak at 12 µm.
+        rng = np.random.default_rng(1)
+        self.d.stage_setpoint = (0.0, 0.0, 0.0)
+        self.d.camera, self.d.camera_image = object(), np.zeros((4, 4, 3), np.uint8)
+
+        def levels(blue_only):
+            z = self.d.stage_setpoint[2]
+            return [50 + rng.normal(0, 3), 10 + 0.002 * -(z - 12) ** 2 + rng.normal(0, 0.3),
+                    5 * np.exp(-((z - 12) / 15) ** 2) + rng.normal(0, 0.02), 0.5]
+
+        def fresh_frames(count=1, timeout=3.0):
+            self.d.frame_index += count
+            return True
+        with patch.object(self.d, "wait_for_frames", side_effect=fresh_frames), \
+             patch.object(self.d, "current_focus_levels", side_effect=levels), \
+             patch.object(self.d, "non_blocking_delay", lambda _t: None):
+            self.assertTrue(self.d.autofocus(blue_only=False))
+        self.assertEqual(self.d.focus_level, 2)
+        self.assertLessEqual(abs(self.d.stage_setpoint[2] - 12.0), 1.5)
+        self.assertIn("1/4 resolution", self.d.last_autofocus)
+
+    def test_final_move_approaches_from_below_like_the_scan(self):
+        self.run_autofocus(-9.0)
+        z_moves = [m["z"] for m in self.stage.relative if m.get("z")]
+        self.assertGreater(z_moves[-1], 0)   # backlash: the last move goes the same way as the fine scan
+
+    def test_frames_from_while_the_stage_moved_are_skipped(self):
+        self.d.camera, self.d.camera_image = object(), np.zeros((4, 4, 3), np.uint8)
+        self.d._focus_settled_at = 100.0
+        captured = iter([99.0, 99.5, 100.2, 100.4, 100.6])
+        seen = []
+
+        def frame(count=1, timeout=3.0):
+            self.d.camera_info = {"captured": next(captured), "focus_levels": {"red": [1.0, 2.0]}}
+            seen.append(self.d.camera_info["captured"])
+            return True
+        with patch.object(self.d, "wait_for_frames", side_effect=frame):
+            medians, spreads = self.d._measure_focus(blue_only=False)
+        self.assertEqual(seen, [99.0, 99.5, 100.2, 100.4, 100.6])
+        self.assertEqual(medians, [1.0, 2.0])
+        self.assertEqual(spreads, [0.0, 0.0])
+
     def test_explains_when_it_cannot_run(self):
         self.d.camera = self.d.camera_image = None
         self.d.autofocus(blue_only=False, interactive=True)
@@ -298,12 +341,35 @@ class AutoCameraHookTests(DispatcherCase):
         self.d.show_red()
         self.assertEqual(self.d.auto_camera.phase, "search")
 
-    def test_remembered_exposure_skips_the_search(self):
+    def test_remembered_exposure_is_checked_first_and_kept_when_clean(self):
         camera = FakeCamera({"stripe-free-exposure": -4})
         self.d.camera = camera
         self.d.show_red()
-        self.d.on_camera_frame(np.zeros((4, 4, 3), np.uint8), dict(camera.latest_info or {"stats": {"p99": 200}}))
-        self.assertEqual(self.d.auto_camera.phase, "track")
+        info = {"stats": {"p99": 200, "saturated": 0.0, "stripes": 0.001}}
+        for _ in range(40):
+            self.d.on_camera_frame(np.zeros((4, 4, 3), np.uint8), info)
+        auto = self.d.auto_camera
+        self.assertEqual(auto.phase, "track")
+        self.assertEqual(list(auto.results), [-4])          # nothing else had to be tried
+        self.assertEqual(auto.good, [-4])
+        self.assertNotIn(-6, [c.get("exposure") for c in camera.set_calls])
+
+    def test_stale_remembered_exposure_triggers_a_full_search(self):
+        camera = FakeCamera({"stripe-free-exposure": -6})
+        camera.controls["exposure"] = -6
+        self.d.camera = camera
+        self.d.show_red()
+        for _ in range(200):
+            exposure = camera.controls["exposure"]
+            stripes = 0.03 if exposure in (-6, -5) else 0.002     # a 240 Hz projector
+            self.d.on_camera_frame(np.zeros((4, 4, 3), np.uint8),
+                                   {"stats": {"p99": 200, "saturated": 0.0, "stripes": stripes}})
+        auto = self.d.auto_camera
+        self.assertEqual(auto.phase, "track")
+        self.assertEqual(sorted(auto.results), [-6, -5, -4, -3])
+        self.assertEqual(auto.good, [-4, -3])
+        self.assertIn(camera.controls["exposure"], (-4, -3))
+        self.assertIn(camera.settings["stripe-free-exposure"], (-4, -3))
 
 
 class HelperTests(unittest.TestCase):

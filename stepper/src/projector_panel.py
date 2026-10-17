@@ -29,8 +29,9 @@ def scaled_copy(image: Image.Image, box_w: int, box_h: int) -> Image.Image:
     return image.resize(size, Image.Resampling.BOX)
 
 
-def draw_projection(canvas: tk.Canvas, image, holder: dict, outline=None):
-    """Draw the projector image letterboxed in `canvas` (black = no light)."""
+def draw_projection(canvas: tk.Canvas, image, holder: dict, outline=None, note: str = ""):
+    """Draw the projector image letterboxed in `canvas` (black = no light), with an optional note
+    in the bottom corner (e.g. that dimmed red light is shown brighter than it is)."""
     c = palette()
     canvas.delete("all")
     w, h = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
@@ -49,6 +50,11 @@ def draw_projection(canvas: tk.Canvas, image, holder: dict, outline=None):
         else:
             holder["photo"] = ImageTk.PhotoImage(scaled_copy(image, tw, th), master=canvas)
             canvas.create_image(x0, y0, image=holder["photo"], anchor="nw")
+    if note:
+        item = canvas.create_text(w - px(4), h - px(3), text=note, anchor="se", fill="#ffffff", font="StepperSmall")
+        x1, y1, x2, y2 = canvas.bbox(item)
+        back = canvas.create_rectangle(x1 - px(3), y1 - px(1), x2 + px(3), y2 + px(1), fill="#000000", outline="")
+        canvas.tag_lower(back, item)
     canvas.create_rectangle(0, 0, w - 1, h - 1, outline=outline or c["border"])
 
 
@@ -67,7 +73,9 @@ class ProjectorPanel(Card):
         self.thumb.grid(row=0, column=0, sticky="nw", padx=(0, px(10)))
         self.thumb.bind("<Button-1>", lambda _e: app.open_projector_preview())
         self.thumb.bind("<Configure>", lambda _e: self.refresh_image())
-        add_tooltip(self.thumb, "Exactly what the projector shows right now. Click to enlarge.")
+        add_tooltip(self.thumb, "What the projector shows right now (red and blue). Dimmed red light is drawn at full "
+                                "brightness so you can see it; the corner shows how bright it really is. "
+                                "Click to enlarge.")
         self._holder = {}
         text = ttk.Frame(body)
         text.grid(row=0, column=1, sticky="nsew")
@@ -141,10 +149,12 @@ class ProjectorPanel(Card):
         self.enlarge.configure(state="normal")
 
     def refresh_image(self):
-        image = getattr(self.d.hardware.projector, "current_image", None) if self.d.shown_image != ShownImage.CLEAR else None
+        image, note = self.d.preview_image()
         _b, kind, _s = self.d.describe_projection()
         c = palette()
-        draw_projection(self.thumb, image, self._holder, outline=c.get(kind, c["border"]) if image is not None else None)
+        short = f"{self.d.red_brightness:.0%}" if note else ""   # the thumbnail only has room for the number
+        draw_projection(self.thumb, image, self._holder, outline=c.get(kind, c["border"]) if image is not None else None,
+                        note=short)
 
     def set_locked(self, locked: bool):
         """The output cannot change during an exposure."""
@@ -194,7 +204,8 @@ class ProjectorPreviewWindow:
         self._last = 0.0
         self.listeners = []
         for event in (Event.SHOWN_IMAGE_CHANGED, Event.PATTERN_IMAGE_CHANGED, Event.RED_BRIGHTNESS_CHANGED,
-                      Event.IMAGE_ADJUST_CHANGED, Event.PATTERNING_BUSY_CHANGED, Event.LEDS_CHANGED):
+                      Event.RED_SOURCE_CHANGED, Event.IMAGE_ADJUST_CHANGED, Event.PATTERNING_BUSY_CHANGED,
+                      Event.LEDS_CHANGED, Event.PROJECTOR_SIZE_CHANGED):
             d.add_event_listener(event, self.refresh)
             self.listeners.append((event, self.refresh))
         d.add_event_listener(Event.EXPOSURE_PATTERN_PROGRESS_CHANGED, self._progress)
@@ -224,8 +235,8 @@ class ProjectorPreviewWindow:
         badge, kind, sentence = d.describe_projection()
         self.badge.set(badge, kind)
         self.text.configure(text=sentence)
-        image = getattr(d.hardware.projector, "current_image", None) if d.shown_image != ShownImage.CLEAR else None
-        draw_projection(self.canvas, image, self._holder)
+        image, note = d.preview_image()
+        draw_projection(self.canvas, image, self._holder, note=note)
 
     def close(self):
         if self.window is None:

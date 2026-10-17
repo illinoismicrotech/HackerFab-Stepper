@@ -6,11 +6,13 @@ import support  # noqa: F401
 import cv2
 import numpy as np
 
-from camera.auto_exposure import (CANDIDATES, HIGH_P99, LOW_P99, AutoCamera, choose_exposure, exposure_ms)
+from camera.auto_exposure import (CANDIDATES, HIGH_P99, LOW_P99, AutoCamera, choose_exposure, exposure_ms,
+                                  good_exposures, refresh_hint)
 from camera.modes import (SENSOR_PRESETS, USB2_MODE, Mode, best_mode, dedupe_resolutions, ordered_candidates,
                           preset_modes, requested_mode)
-from camera.processing import (FrameAverager, center_crop, compute_focus_score, destripe, downscale, image_stats,
-                               stripe_strength)
+from camera.processing import (FrameAverager, center_crop, compute_focus_score, default_focus_level, destripe,
+                               downscale, focus_measurements, focus_pyramid, image_stats, stripe_strength)
+from camera.stripes import StripeTracker, analyse
 
 
 def chip_image(blur=0, stripes=0.0, h=300, w=400):
@@ -73,6 +75,96 @@ class StripeTests(unittest.TestCase):
     def test_clean_image_returned_unchanged(self):
         image = np.full((64, 64, 3), 120, np.uint8)
         self.assertIs(destripe(image), image)
+
+
+def stepper_view(lines=0.0, coverage=0.45, h=900, w=1350, seed=0, period=23.0):
+    """Roughly what the camera shows: a lit chip between dark margins, a dark area above the chip
+    edge, dark letters, noise, and (optionally) thin bright projector lines with a fixed spacing."""
+    rng = np.random.default_rng(seed)
+    img = np.full((h, w), 4.0, np.float32)
+    x0 = int(w * (0.5 - coverage / 2))
+    img[:, x0:x0 + int(w * coverage)] = 170.0
+    img[: h // 8] *= 0.25                                   # chip edge: everything above it is dim
+    for i in range(6):                                      # dark letters on the chip
+        y = h // 5 + i * h // 8
+        img[y:y + h // 14, x0 + 40:x0 + 90] = 40.0
+    row = np.ones(h)
+    if lines:
+        phase = (np.arange(h) + rng.uniform(0, period)) % period
+        row += lines * np.exp(-0.5 * (phase - period / 2) ** 2 / 1.5 ** 2)    # thin lines
+    img = img * row[:, None] + rng.normal(0, 2.0, (h, w))
+    out = np.zeros((h, w, 3), np.uint8)
+    out[:, :, 2] = np.clip(img, 0, 255).astype(np.uint8)
+    return out, row
+
+
+class StripeSeparationTests(unittest.TestCase):
+    """Lines are found by their fixed spacing, so the chip edge, letters and dark margins do not count."""
+
+    def test_measures_lines_not_the_chip(self):
+        clean = analyse(stepper_view()[0])
+        striped = analyse(stepper_view(lines=0.12)[0])
+        self.assertLess(clean.strength, 0.003)
+        self.assertGreater(striped.strength, 0.015)
+        self.assertAlmostEqual(striped.periods[0], 23.0, delta=0.5)
+
+    def test_works_when_the_chip_covers_little_of_the_picture(self):
+        for coverage in (0.25, 0.45, 0.9):
+            image, row = stepper_view(lines=0.12, coverage=coverage)
+            truth = float(np.std(np.log(row)))
+            self.assertAlmostEqual(analyse(image).strength, truth, delta=0.25 * truth, msg=coverage)
+
+    def test_filter_removes_lines_and_keeps_the_chip_edge(self):
+        image, row = stepper_view(lines=0.12)
+        clean, _ = stepper_view(seed=0)
+        fixed = destripe(image)
+        chip = slice(400, 950)
+
+        def rows(a):
+            return a[:, chip, 2].astype(float).mean(axis=1)
+        # Row-to-row variation compared with the line-free picture (the filter may shift the overall
+        # brightness slightly: it evens rows out to their average, lines included).
+        before = np.std(rows(image)[150:] / rows(clean)[150:])
+        after = np.std(rows(fixed)[150:] / rows(clean)[150:])
+        self.assertLess(after, before / 4)
+        edge = slice(90, 135)   # around the chip edge at row 112: still a sharp step afterwards
+        self.assertGreater(np.ptp(fixed[edge, chip, 2].astype(float).mean(axis=1)), 100)
+
+    def test_tracker_reuses_the_spacing_and_measures_clean_frames_against_it(self):
+        tracker = StripeTracker()
+        striped = tracker.analyse(stepper_view(lines=0.12)[0], now=0.0)
+        clean = tracker.analyse(stepper_view(seed=3)[0], now=1.0)
+        self.assertTrue(tracker.families)
+        self.assertGreater(striped.strength, 10 * clean.strength)
+        self.assertIsNone(clean.gains)        # nothing to correct in a clean frame
+
+
+class FocusScaleTests(unittest.TestCase):
+    def test_every_scale_and_the_dark_channel(self):
+        frame = np.zeros((800, 1200, 3), np.uint8)
+        frame[:, :, 2] = chip_image(h=800, w=1200)[:, :, 0]
+        result = focus_measurements(frame)
+        self.assertEqual(result["crop"], (600, 400))
+        self.assertEqual(len(result["red"]), 6)
+        self.assertEqual(result["blue"], [0.0] * 6)          # blue is dark under red light
+        self.assertIsNone(result["red"][-1])                  # 1/32 of 600 px is too small
+        self.assertEqual(default_focus_level(2736), 2)
+        self.assertEqual(default_focus_level(600), 0)
+
+    def test_coarse_scale_sees_focus_when_full_resolution_is_noise(self):
+        rng = np.random.default_rng(0)
+        base = chip_image(h=600, w=800)[:, :, 0].astype(np.float32)
+
+        def view(blur):
+            img = cv2.GaussianBlur(base, (0, 0), blur) + rng.normal(0, 8, base.shape)
+            return np.clip(img, 0, 255).astype(np.uint8)
+        sharp = [focus_pyramid(view(3.0)) for _ in range(3)]
+        soft = [focus_pyramid(view(5.0)) for _ in range(3)]
+
+        def separation(level):
+            a, b = [x[level] for x in sharp], [x[level] for x in soft]
+            return (np.mean(a) - np.mean(b)) / (np.ptp(a) + np.ptp(b) + 1e-9)
+        self.assertGreater(separation(2), 3 * separation(0))
 
 
 class StatsTests(unittest.TestCase):
@@ -236,6 +328,61 @@ class AutoCameraTests(unittest.TestCase):
         auto.resume(10)
         self.assertEqual(auto.phase, "search")
         self.assertEqual(auto.update(11, {"p99": 200, "stripes": 0.1}, 1.0, -6, 100), [])  # settling
+
+    def test_keeps_full_red_and_uses_longer_exposure_before_gain(self):
+        # A dim scene on a 240 Hz projector with the Arducam's small gain range (4-8).
+        ranges = {"exposure": {"min": -10, "max": -2}, "gain": {"min": 4, "max": 8}}
+        scene = Scene(240, base=45.0)
+        auto = AutoCamera(ranges=ranges)
+        auto.start_search(0)
+        red, exposure, gain = 1.0, -6, 4
+        for index in range(1, 400):
+            stats = scene.stats(red, exposure, gain * 25)
+            for action in auto.update(index, stats, red, exposure, gain):
+                if action.kind == "red":
+                    red = action.value
+                else:
+                    exposure = action.value.get("exposure", exposure)
+                    gain = action.value.get("gain", gain)
+        self.assertEqual(auto.good, [-4, -3])
+        self.assertEqual(red, 1.0)
+        self.assertEqual(exposure, -3)          # longest line-free exposure first ...
+        self.assertGreater(gain, 4)             # ... then gain
+        self.assertTrue(LOW_P99 <= scene.stats(red, exposure, gain * 25)["p99"] <= HIGH_P99)
+
+    def test_exposure_never_leaves_the_line_free_set_and_does_not_hunt(self):
+        ranges = {"exposure": {"min": -10, "max": -2}, "gain": {"min": 4, "max": 8}}
+        auto = AutoCamera(ranges=ranges)
+        auto.phase, auto.good, auto.best_exposure = "track", [-4, -3], -4
+        red, exposure, gain, changes = 1.0, -4, 4, 0
+        for index in range(1, 600):
+            brightness = 160.0 * (1 + 0.2 * np.sin(index / 20.0))     # stage moving over the chip
+            p99 = min(255.0, brightness * red ** 2.2 * 2 ** (exposure + 4) * gain / 4)
+            actions = auto.update(index, {"p99": p99, "saturated": 0.0, "stripes": 0.002}, red, exposure, gain)
+            changes += bool(actions)
+            for action in actions:
+                if action.kind == "red":
+                    red = action.value
+                else:
+                    exposure = action.value.get("exposure", exposure)
+                    gain = action.value.get("gain", gain)
+            self.assertIn(exposure, (-4, -3))
+        self.assertLess(changes, 25)            # a few gain steps per sweep, no back-and-forth every frame
+        self.assertEqual(red, 1.0)
+
+    def test_gain_steps_always_make_progress(self):
+        auto = AutoCamera(ranges={"gain": {"min": 4, "max": 8}})
+        auto.phase, auto.good, auto.best_exposure = "track", [-3], -3
+        _red, _e, gain = auto.plan({"p99": 140.0, "saturated": 0.0}, 1.0, -3, 4, [-3])
+        self.assertEqual(gain, 6)   # 4 x 200/140 = 5.7: rounds to a real step, never stays at 4
+
+    def test_good_set_and_refresh_advice(self):
+        self.assertEqual(good_exposures({-6: .03, -5: .03, -4: .002, -3: .001}), [-4, -3])
+        self.assertEqual(good_exposures({-6: None, -5: None}), [])
+        self.assertIn("48 Hz", refresh_hint(60))
+        self.assertEqual(refresh_hint(48), "")
+        self.assertEqual(refresh_hint(23), "")      # 23.976 Hz: 125 ms is 3 frames
+        self.assertEqual(refresh_hint(0), "")
 
     def test_candidates_cover_common_projector_rates(self):
         self.assertEqual(CANDIDATES, (-6, -5, -4, -3))

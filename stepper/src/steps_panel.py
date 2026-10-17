@@ -89,11 +89,20 @@ class PatternStep(ttk.Frame):
         self.name.grid(row=2, column=0, sticky="w", pady=(px(12), 0))
         self.details = ttk.Label(self, text="", style="Small.TLabel", wraplength=px(330), justify="left")
         self.details.grid(row=3, column=0, sticky="w")
-        self.preview = tk.Canvas(self, height=px(200), highlightthickness=0, background="#000000")
-        self.preview.grid(row=4, column=0, sticky="ew", pady=(px(8), 0))
+        preview = ttk.Frame(self)
+        preview.grid(row=4, column=0, sticky="ew", pady=(px(8), 0))
+        preview.columnconfigure(0, weight=1)
+        self.preview_kind = tk.StringVar(value="blue")
+        self.preview_switch = Segmented(preview, [("blue", "Blue · exposure", "uv"), ("red", "Red · focus", "red")],
+                                        self.preview_kind, command=lambda _v: self.refresh_preview(), padx=6, pady=3)
+        self.preview_switch.grid(row=0, column=0, sticky="ew")
+        add_tooltip(self.preview_switch, "Blue: the exposure, exactly as it will be projected. Red: the same pattern in "
+                                         "safe red light, as 'Show it in red' projects it for lining up and focusing.")
+        self.preview = tk.Canvas(preview, height=px(200), highlightthickness=0, background="#000000")
+        self.preview.grid(row=1, column=0, sticky="ew", pady=(px(4), 0))
         self.preview.bind("<Configure>", lambda _e: self.refresh_preview())
-        ttk.Label(self, text="Preview of the exposure: the pattern in blue light, exactly as it will be projected.",
-                  style="Small.TLabel", wraplength=px(330)).grid(row=5, column=0, sticky="w", pady=(px(4), 0))
+        self.preview_caption = ttk.Label(self, text="", style="Small.TLabel", wraplength=px(330), justify="left")
+        self.preview_caption.grid(row=5, column=0, sticky="w", pady=(px(4), 0))
         self._holder = {}
         section(self, 6, "Pattern options")
         options = ttk.Frame(self)
@@ -149,6 +158,8 @@ class PatternStep(ttk.Frame):
         if not self.d.pattern_image_path:
             messagebox.showinfo("Choose a pattern", "Choose a pattern first.")
             return
+        self.preview_kind.set("red")
+        self.refresh_preview()
         self.d.show_red(RedFocusSource.PATTERN)
         self.app.workflow.show_step("focus", apply=False)
 
@@ -191,8 +202,17 @@ class PatternStep(ttk.Frame):
         self.refresh_preview()
 
     def refresh_preview(self):
-        image = self.d.pattern.processed() if self.d.pattern_image_path else None
+        red = self.preview_kind.get() == "red"
+        if not self.d.pattern_image_path:
+            image = None
+        elif red:
+            image = self.d.red_preview_of_pattern()
+        else:
+            image = self.d.pattern.processed()
         draw_projection(self.preview, image, self._holder)
+        self.preview_caption.configure(text=(
+            "The pattern in red light, as 'Show it in red' projects it: safe, use it to line up and focus."
+            if red else "Preview of the exposure: the pattern in blue light, exactly as it will be projected."))
         if image is None:
             c = palette()
             self.preview.create_text(self.preview.winfo_width() // 2, self.preview.winfo_height() // 2,
@@ -239,8 +259,9 @@ class FocusStep(ttk.Frame):
         row.grid(row=2, column=0, sticky="w", pady=(px(6), 0))
         self.search = ttk.Button(row, text="Find stripe-free exposure", bootstyle="dark", command=d.start_stripe_search)
         self.search.pack(side="left")
-        add_tooltip(self.search, "Tries several camera exposures under red light and keeps the one with the fewest "
-                                 "stripes. About 10 seconds. The result is remembered when you save settings.")
+        add_tooltip(self.search, "Tries several camera exposures under red light and keeps the ones without projector "
+                                 "lines. About 10 seconds. The result is remembered when you save settings and checked "
+                                 "again (a few seconds) the next time red light is switched on.")
         ttk.Button(row, text="Adjust…", bootstyle="dark", command=app.open_camera_adjustments).pack(side="left",
                                                                                                   padx=(px(6), 0))
         section(self, 4, "Focus")
@@ -248,7 +269,9 @@ class FocusStep(ttk.Frame):
         af.grid(row=5, column=0, sticky="ew")
         self.autofocus = ttk.Button(af, text="Autofocus", bootstyle="primary", command=self.run_autofocus)
         self.autofocus.pack(side="left")
-        add_tooltip(self.autofocus, "Finds the sharpest Z near the current one (about 20 s). Focus roughly by hand first.")
+        add_tooltip(self.autofocus, "Finds the sharpest Z near the current one (about 30 s). It measures sharpness at "
+                                    "several image scales and uses the one that shows focus best. Focus roughly by "
+                                    "hand first.")
         self.stop = ttk.Button(af, text="Stop", bootstyle="danger-outline", command=self.stop_autofocus)
         self.stop.pack(side="left", padx=(px(6), 0))
         self.af_result = ttk.Label(self, text="", style="Small.TLabel", wraplength=px(330), justify="left")

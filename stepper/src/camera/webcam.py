@@ -31,11 +31,10 @@ from camera.camera_module import CameraModule
 from camera.discovery import discover_devices, parse_modes, v4l_info
 from camera.modes import (Mode, best_mode, dshow_modes, modes_from_v4l2, ordered_candidates,
                           preset_modes, requested_mode)
-from camera.processing import (FrameAverager, center_crop, compute_focus_score, destripe, downscale,
-                               image_stats, stripe_strength)
+from camera.processing import FrameAverager, downscale, focus_measurements, image_stats
+from camera.stripes import StripeTracker, apply_gains
 
 PREVIEW_MAX = (1600, 1200)      # preview frames sent to the GUI
-FOCUS_CROP = (1200, 1200)       # focus is measured at full resolution in the image centre
 DEFAULT_EXPOSURE = -4           # 62.5 ms = 15 periods of a 240 Hz DLP: no projector stripes
 DEFAULT_WHITE_BALANCE = 4500    # kelvin; fixed so a red-only picture stays red
 WATCHDOG_SECONDS = 15.0
@@ -298,24 +297,31 @@ class _Snapshotter:
         threading.Thread(target=work, daemon=True).start()
 
 
-def _process(frame_bgr, state, index, started):
+def _process(frame_bgr, state, index, started, captured=None):
     """Build the message for one frame: preview, focus scores, statistics."""
-    preview = downscale(frame_bgr, *state["preview_max"])
+    # Large frames are halved once (fast) and that is shared by the preview and the focus scales.
+    half = cv2.pyrDown(frame_bgr) if frame_bgr.shape[1] >= 2 * state["preview_max"][0] else None
+    preview = downscale(half if half is not None else frame_bgr, *state["preview_max"])
     # Exposure statistics and stripes are measured on this frame alone: averaging several
     # frames would hide the stripes the automatic exposure is trying to find.
     stats = image_stats(preview)
-    stats["stripes"] = stripe_strength(preview)
-    preview = state["averager"].add(preview)
+    fit = state["stripes"].analyse(preview)
+    stats["stripes"] = fit.strength
+    stats["stripe_period"] = round(fit.periods[0], 1) if fit.periods else None
     if state["destripe"]:
-        preview = destripe(preview)
-    crop_rgb = cv2.cvtColor(center_crop(frame_bgr, *FOCUS_CROP), cv2.COLOR_BGR2RGB)
+        preview = apply_gains(preview, fit.gains)   # each frame with its own stripes, before averaging
+    preview = state["averager"].add(preview)
+    focus = focus_measurements(frame_bgr, half=half)
+    default = focus["default"]
     return {
         "image": cv2.cvtColor(preview, cv2.COLOR_BGR2RGB),
         "index": index,
         "full_size": (frame_bgr.shape[1], frame_bgr.shape[0]),
-        "focus": (compute_focus_score(crop_rgb, False), compute_focus_score(crop_rgb, True)),
+        "focus": (focus["red"][default], focus["blue"][default]),
+        "focus_levels": {"red": focus["red"], "blue": focus["blue"], "crop": focus["crop"], "default": default},
         "stats": stats,
         "time": time.monotonic() - started,
+        "captured": captured if captured is not None else time.monotonic(),
     }
 
 
@@ -340,7 +346,7 @@ def _capture(settings, channel, stop, commands=None):
     controls = initial_controls(settings)
     state = {"destripe": setting_flag(settings, "stripe-filter", True),
              "averager": FrameAverager(setting_int(settings, "average-frames", 1, 1, 16)),
-             "preview_max": PREVIEW_MAX, "snapshots": []}
+             "stripes": StripeTracker(), "preview_max": PREVIEW_MAX, "snapshots": []}
     failures = []
     for device in devices:
         to_try, offered, source = _modes_to_try(device, backend, settings)
@@ -401,6 +407,8 @@ def _stream(cap, backend, channel, commands, stop, state, reject_green):
                 kind, value = commands.get_nowait()
                 if kind == "set":
                     _send(channel, "controls", {"requested": value, "readback": apply_controls(cap, backend, value)})
+                    if "exposure" in value:
+                        state["stripes"].invalidate()   # look for the stripe spacing again at once
                 elif kind == "process":
                     if "destripe" in value:
                         state["destripe"] = bool(value["destripe"])
@@ -414,6 +422,7 @@ def _stream(cap, backend, channel, commands, stop, state, reject_green):
         except queue.Empty:
             pass
         ok, frame = cap.read()
+        captured = time.monotonic()   # same clock in every process: autofocus compares it with stage moves
         problem = frame_problem(frame, reject_green) if ok else "Camera disconnected or capture failed"
         if problem:
             failures += 1
@@ -427,7 +436,7 @@ def _stream(cap, backend, channel, commands, stop, state, reject_green):
         last_good = frame   # cap.read() returns a new array every time; nothing modifies it
         while state["snapshots"]:
             snapshotter.save(frame, state["snapshots"].pop(0))
-        info = _process(frame, state, index, started)
+        info = _process(frame, state, index, started, captured)
         elapsed = time.monotonic() - window_start
         if elapsed >= 2.0:
             fps, count, window_start = count / elapsed, 0, time.monotonic()

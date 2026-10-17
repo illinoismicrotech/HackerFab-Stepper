@@ -92,12 +92,14 @@ HOW_TO = [
         "Operate → 2 Focus. Under RED LIGHT SHOWS pick Solid (best for finding the chip).",
         "Move with the arrow pad or the arrow keys. Start with a large X/Y step (500 µm), then go smaller.",
         "Focus with Z + / Z − or Page Up / Page Down until the focus bar is at its longest.",
-        "Or press Autofocus (about 20 s). It needs some detail in the picture and a start close to focus; it never "
+        "Or press Autofocus (about 30 s). It needs some detail in the picture and a start close to focus; it never "
         "moves more than 150 µm and goes back to where it started if it fails.",
     ], "focus blurry sharp autofocus z red find chip navigate move", [("Go to 2 Focus", "step:focus")]),
     Topic("Get a clean camera picture (no stripes)", [
         "Red light must be on: the projector badge says RED · SAFE.",
-        "Keep Auto exposure on in 2 Focus and wait until it says “Auto: settled” (about 10 s the first time).",
+        "Keep Auto exposure on in 2 Focus and wait until it says “Auto: settled” (about 10 s the first time, a few "
+        "seconds later on, when it only checks the remembered exposure).",
+        "Keep Red brightness at 100 % (Auto on): dimmed red is drawn with uneven flashes and brings lines back.",
         "Connect the projector board's USB cable: the app then turns the green and blue LEDs off while you focus, "
         "which removes the teal/pink bands completely.",
         "Still stripy? Camera Adjust… → Find stripe-free exposure, and turn on Stripe filter or Frame averaging.",
@@ -165,6 +167,13 @@ HOW_TO = [
         "Open settings folder (below) shows config.toml, the log and default.toml.",
     ], "settings config toml preferences save options folder", [("Open Settings", "page:settings"),
                                                                ("Open settings folder", "open_home")]),
+    Topic("Update the app", [
+        "Settings → Updates → Check for updates. If there is a newer version, Install and restart downloads it, "
+        "checks it and restarts the app with it. Settings, logs and snapshots stay.",
+        "The app also checks once a day when it starts and says so in the status line.",
+        "It waits until no exposure, autofocus or homing is running.",
+        "Run from source (run.sh / run.bat), it runs git pull instead; start the app again with the launcher.",
+    ], "update upgrade new version release download install latest", [("Open Settings", "page:settings")]),
 ]
 
 TROUBLE = [

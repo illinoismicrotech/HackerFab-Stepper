@@ -14,7 +14,7 @@ from support import DialogsAnswered, FakeCamera, FakeLeds, RecordingStage, pump
 import toml
 from PIL import Image
 
-from dispatcher import ShownImage
+from dispatcher import RedFocusSource, ShownImage
 from platform_text import EXTEND_DISPLAYS
 from projector_window import Display
 
@@ -130,6 +130,57 @@ class LayoutTests(GuiCase):
         preview.close()
         self.assertFalse(preview.is_open)
         self.d.show_red()  # listeners removed: no errors after closing
+
+    def test_dimmed_red_is_visible_in_the_previews(self):
+        self.d.set_red_brightness(0.08, by_user=False)
+        image, note = self.d.preview_image()
+        self.assertEqual(image.getpixel((image.width // 2, image.height // 2)), (255, 0, 0))   # full red shown
+        self.assertIn("8%", note)
+        self.app.open_projector_preview()
+        pump(self.root, 0.05)
+        canvas = self.app.preview_window.canvas
+        texts = [canvas.itemcget(i, "text") for i in canvas.find_all() if canvas.type(i) == "text"]
+        self.assertTrue(any("shown brighter" in t for t in texts), texts)
+        thumb = self.app.projector_panel.thumb
+        self.assertIn("8%", [thumb.itemcget(i, "text") for i in thumb.find_all() if thumb.type(i) == "text"])
+        self.app.preview_window.close()
+        self.d.set_red_brightness(1.0, by_user=False)
+
+    def test_pattern_step_previews_blue_and_red(self):
+        path = self.folder / "square.png"
+        img = Image.new("RGB", (200, 200), "black")
+        img.paste((255, 255, 255), (50, 50, 150, 150))
+        img.save(path)
+        step = self.app.workflow.pages["pattern"]
+        self.assertTrue(step.load(path))
+        self.app.workflow.show_step("pattern", apply=False)
+        pump(self.root, 0.05)
+        self.assertIn("blue light", step.preview_caption.cget("text"))
+        step.preview_switch._click("red")
+        red = self.d.red_preview_of_pattern()
+        self.assertEqual(red.getpixel((red.width // 2, red.height // 2)), (255, 0, 0))
+        self.assertIn("red light", step.preview_caption.cget("text"))
+        step.preview_switch._click("blue")
+        step.show_in_red()                     # projecting it in red also shows the red preview
+        self.assertEqual(step.preview_kind.get(), "red")
+        self.assertEqual(self.d.shown_image, ShownImage.RED_FOCUS)
+        self.d.show_red(RedFocusSource.SOLID)  # leave the other tests their solid red
+
+    def test_updates_tab_offers_a_found_update(self):
+        from updater import Update
+        notebook = self.app.settings_page.notebook
+        self.assertIn("Updates", [notebook.tab(t, "text") for t in notebook.tabs()])
+        panel = self.app.settings_page.updates
+        self.assertEqual(str(panel.install_button.cget("state")), "disabled")
+        panel.quiet = True
+        panel._handle("found", Update("version 9.0.0", "v9.0.0", "a.exe", "https://example.invalid/a.exe",
+                                      50_000_000, "0" * 64, "https://example.invalid"))
+        self.assertEqual(str(panel.install_button.cget("state")), "normal")
+        self.assertIn("version 9.0.0", panel.status.get())
+        self.assertIn("Update available", self.app.toast.label.cget("text"))
+        panel._handle("found", None)
+        self.assertEqual(str(panel.install_button.cget("state")), "disabled")
+        self.assertFalse(self.app.restart_after_close)
 
     def test_status_line_and_dots(self):
         self.app.notify("Hello", "ok")

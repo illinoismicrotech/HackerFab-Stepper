@@ -147,6 +147,13 @@ class StreamTests(unittest.TestCase):
         self.assertEqual(info["image"][..., 2].max(), 0)
         self.assertEqual(len(info["focus"]), 2)
         self.assertTrue({"p99", "mean", "saturated", "stripes"} <= set(info["stats"]))
+        # Focus at every scale from the middle half of the full-resolution frame, and a capture time
+        # autofocus can compare with stage moves.
+        levels = info["focus_levels"]
+        self.assertEqual(levels["crop"], (1200, 800))
+        self.assertEqual(len(levels["red"]), len(levels["blue"]))
+        self.assertEqual(info["focus"][0], levels["red"][levels["default"]])
+        self.assertLessEqual(info["captured"], time.monotonic())
 
     def test_live_controls_report_requested_and_readback(self):
         commands = queue.Queue()
@@ -189,9 +196,9 @@ class StreamTests(unittest.TestCase):
         state = {}
         original = webcam._process
 
-        def spy(frame, st, index, started):
+        def spy(frame, st, index, started, captured=None):
             state.update(destripe=st["destripe"], average=st["averager"].count)
-            return original(frame, st, index, started)
+            return original(frame, st, index, started, captured)
         with patch("camera.webcam._process", side_effect=spy):
             run_worker({}, [FakeCap()], [Mode(64, 48, 9)], commands=commands)
         self.assertEqual(state, {"destripe": False, "average": 4})

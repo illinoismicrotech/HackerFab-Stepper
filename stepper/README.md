@@ -23,8 +23,9 @@ This page is for whoever sets up a station or works on the code.
 
 ### Standalone app (no Python)
 
-Download it from the repository's **Releases** page (see the [top-level README](../README.md)).
-It includes everything, alignment-marker detection too.
+Install it with the one-line install command, or download it from the repository's **Releases**
+page (both in the [top-level README](../README.md#install)). It includes everything,
+alignment-marker detection too, and updates itself (see [Updates](#updates)).
 
 | | Windows | macOS | Linux |
 |---|---|---|---|
@@ -33,6 +34,32 @@ It includes everything, alignment-marker detection too.
 | Settings, log, snapshots | the exe's folder (`%LOCALAPPDATA%\HackerfabStepper` if read-only) | `~/Documents/HackerfabStepper` | the program's folder (`~/.local/share/HackerfabStepper` if read-only) |
 
 `HACKERFAB_HOME=/some/folder` puts settings, log and snapshots somewhere else on any system.
+
+### Updates
+
+`src/updater.py` updates the standalone app from the GitHub releases (standard library only):
+
+1. **Which release.** `packaging/build.py` bundles `build_info.json` with the version, commit and
+   channel. Builds of `main` (channel `latest`) move to the **Latest build** pre-release when its
+   commit differs; tag builds (channel `stable`) move to the highest newer `v*` tag (pre-releases
+   only if the installed version is one, e.g. `v0.x`).
+2. **Download and verify.** The asset for this OS and CPU (the same names `build.py` produces;
+   Apple-silicon Macs get the arm64 build even when an Intel copy runs under Rosetta) is
+   downloaded next to the program and checked against the SHA-256 digest GitHub publishes.
+   Without a digest, nothing is installed.
+3. **Swap.** The running program is renamed (`HackerfabStepper.old.exe`, `HackerfabStepper.old`,
+   `HackerfabStepper.app.old`), the new one moved into place, and the original put back if
+   anything fails. Camera worker processes of the still-running app keep using the old copy.
+   The app then closes normally (settings saved, LEDs off) and starts the new version with
+   `--after-update`, the settings file and the stage port it was using, so the setup window is
+   skipped. Until the new version's window is up (a one-file app unpacks itself first, 10-30 s),
+   the old process shows a small "Updating…" window; the new version closes it by writing
+   `.update-ready` in the home folder. The next start deletes the `.old` copy.
+
+The automatic daily check runs only in the standalone app (never in tests, the smoke test, or a
+source checkout) and can be turned off in **Settings → Updates** (`[app] check-for-updates`).
+`HackerfabStepper --update [--check]` does the same from a terminal. A source checkout is updated
+with `git pull --ff-only` from the same tab.
 
 ### From source
 
@@ -120,14 +147,23 @@ which makes wiring and steps-per-mm problems easy to spot.
 
 By default the camera runs at its highest resolution and lowest frame rate (B0477: 5472 × 3648 at
 9 fps; on USB 2 only 1280 × 720 at 10 fps). The preview is reduced in the capture process; focus
-is measured on the full-resolution centre and snapshots are saved at full resolution. Capture runs
+is measured on the middle half of each full-resolution frame at six scales (full, 1/2, 1/4, …)
+and snapshots are saved at full resolution. Capture runs
 in its own process with a watchdog, so a stuck driver cannot freeze the window.
 
-**Stripes.** A DLP projector flashes its colours, so a rolling-shutter camera sees bands unless
-each exposure spans whole colour cycles. While red light is on, the app tries 16, 31, 62.5 and
-125 ms, keeps the least striped one (remembered as `stripe-free-exposure`), keeps the picture
-bright but not clipped by dimming the red light first, then gain, then exposure, and fixes white
-balance at 4500 K so faint green/blue leakage does not become coloured bands.
+**Stripes.** A DLP projector flashes its light, so a rolling-shutter camera sees evenly spaced
+lines unless each exposure spans whole light cycles. While red light is on, the app tries 16, 31,
+62.5 and 125 ms, measures the lines (`camera/stripes.py` finds them by their spacing, so the chip
+edge and dark margins do not count) and keeps every line-free exposure. The best is remembered as
+`stripe-free-exposure` and checked first next time; the full search runs only if it has lines
+again. If none is line-free and the projector display runs at 60 Hz (read on Windows, and on Linux
+through xrandr), the result suggests 48 Hz or 24 Hz.
+
+**Brightness.** Red light stays at 100 % (dimmed red is drawn with uneven mirror flashes, which
+brings the lines back). Too dark: a longer line-free exposure, then gain (up to 4× the minimum).
+Too bright: less gain, a shorter line-free exposure, and only then dimmer red. It reacts only
+after brightness has left a wide band for a few frames, so it does not hunt while the stage moves.
+White balance is fixed at 4500 K so faint green/blue leakage does not become coloured bands.
 
 ## Projector
 
@@ -193,6 +229,9 @@ top_marker_y = 269.0
 bottom_marker_y = 1075.0
 x_scale_factor = -1100     # µm of stage movement per frame width
 y_scale_factor = 800
+
+[app]
+check-for-updates = true   # standalone app: look for a newer version at start, once a day
 ```
 
 Calibrating the `[alignment]` values is explained in [docs/guide.md](docs/guide.md).
@@ -209,7 +248,11 @@ Calibrating the `[alignment]` values is explained in [docs/guide.md](docs/guide.
   coordinates the controller reports (G53 machine coordinates on a standard setup). If the USB
   link drops, moves and exposures are refused and a **Reconnect** button appears.
 - **Homing** runs without freezing the window; STOP cancels it with a soft reset.
-- **Autofocus** never moves more than ±150 µm from where it started and returns there if it fails.
+- **Autofocus** judges sharpness at several image scales and uses the one where focus changes the
+  picture most compared with frame-to-frame noise. It scans in one direction (stage backlash),
+  skips frames exposed while the stage moved, interpolates between 2 µm steps and approaches the
+  result from below. It never moves more than ±150 µm from where it started and returns there if
+  it fails.
 
 ## Troubleshooting notes
 
@@ -237,14 +280,16 @@ station-level notes:
 | `src/gui.py` | Main window, start window and `main()` |
 | `src/stepper_app.py` | Standalone app entry point: working folder per OS, log, `--smoke-test` |
 | `src/dispatcher.py` | State and actions: projection, LEDs, exposures, autofocus, stage, alignment maths |
-| `src/camera/` | Capture process (`webcam.py`), automatic exposure, image processing, camera modes |
+| `src/camera/` | Capture process (`webcam.py`), automatic exposure, projector-line analysis (`stripes.py`), image processing, camera modes |
 | `src/camera_view.py`, `stage_pad.py`, `projector_panel.py`, `steps_panel.py` | The Operate page |
 | `src/settings.py`, `alignment_page.py`, `chip_pages.py`, `help_page.py` | The other pages |
 | `src/alignment_detector.py` | Alignment-marker model on OpenCV DNN |
 | `src/projector_leds.py`, `projector_window.py` | LED control over USB, the output window |
+| `src/updater.py`, `update_panel.py` | Over-the-air updates from the GitHub releases, and Settings → Updates |
 | `src/platform_text.py` | Wording and helpers that differ between Windows, macOS and Linux |
 | `src/ui_theme.py`, `ui_kit.py` | Colours, fonts, DPI awareness, shared widgets |
-| `packaging/` | PyInstaller spec, build script, build requirements |
+| `packaging/` | PyInstaller spec, build script (writes `build_info.json`), build requirements |
+| `../install.sh`, `../install.ps1` | One-line installers / updaters for macOS + Linux and Windows |
 | `docs/guide_template.html`, `docs/guide_images/`, `tools/build_guide.py` | Source of the how-to guide |
 
 ### Tests
@@ -268,7 +313,8 @@ python -m venv .venv-build
 ```
 
 The result, smoke-tested, is in `dist/release/`. On a Linux machine without a screen, run the
-last command under `xvfb-run`.
+last command under `xvfb-run`. A local build updates like a build of `main`; set
+`APP_VERSION=1.2.0` for a release build, or `APP_CHANNEL` to override the channel.
 
 ### Editing the how-to guide
 

@@ -6,10 +6,36 @@ it, while a USB microscope camera watches the chip and a GRBL stage moves it.
 
 It runs on **Windows, macOS and Linux**, either as a ready-made download or from source.
 
-## Download and run
+## Install
 
-No Python, no installing, no command line. Open the **[Releases page](../../releases)** and download
-the file for your computer from **Latest build** (the newest version of `main`):
+One command downloads the right app for your computer from the releases, checks its SHA-256 and
+installs it with a menu entry. Run it again any time to update.
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/illinoismicrotech/HackerFab-Stepper/main/install.ps1 | iex
+```
+
+**macOS / Linux** (terminal):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/illinoismicrotech/HackerFab-Stepper/main/install.sh | sh
+```
+
+| | Installs to | Start it from |
+|---|---|---|
+| Windows | `%LOCALAPPDATA%\Programs\HackerfabStepper` | Start menu / desktop shortcut |
+| macOS | `/Applications` (or `~/Applications`) | Launchpad / Applications |
+| Linux | `~/.local/share/HackerfabStepper` | App menu, or `hackerfab-stepper` |
+
+Add `-Release` (Windows, when run as a saved file) or `sh -s -- --release` (macOS/Linux) to install
+the newest numbered release instead of the Latest build of `main`.
+
+### Or download it by hand
+
+No Python, no command line. Open the **[Releases page](../../releases)** and download the file for
+your computer from **Latest build** (the newest version of `main`):
 
 | Computer | Download | First start |
 |---|---|---|
@@ -23,6 +49,22 @@ a dash such as `v1.1.0-beta`) are test builds.
 
 When it starts, pick the stage controller (or **No stage**) in the setup window and click
 **Launch**.
+
+## Updates
+
+The app updates itself over the air. Once a day at start-up it asks GitHub whether there is a
+newer version and says so in the status line; **Settings → Updates** shows the version you have,
+checks on demand and **Install and restart** downloads the file for your computer, verifies its
+SHA-256 against the checksum GitHub publishes, swaps the program and restarts it with the same
+settings and stage port, without the setup window. Settings, logs,
+chip records and snapshots are never touched, and nothing is installed while an exposure,
+autofocus or homing is running.
+
+- A copy from **Latest build** follows every new build of `main`; a copy from a numbered release
+  (`v1.2.0`) follows numbered releases.
+- `HackerfabStepper --update` updates from a terminal; `--update --check` only reports.
+- Re-running the install command above does the same from outside the app.
+- Run from source, **Settings → Updates** runs `git pull` instead.
 
 ## Getting help
 
@@ -76,7 +118,10 @@ On Windows, double-click `stepper\run.bat`.
 
 GitHub Actions ([`.github/workflows/build.yml`](.github/workflows/build.yml)) runs the tests, then
 builds and smoke-tests the app on Windows, macOS (Apple silicon and Intel) and Linux for every
-push and pull request. A push to `main` refreshes **Latest build**; a tag publishes a release:
+push and pull request. Each build records its version, commit and update channel
+(`build_info.json`), which is how an installed copy knows what to update to. A push to `main`
+refreshes **Latest build** (and then checks that the install scripts work on all three systems);
+a tag publishes a release:
 
 ```bash
 git tag v1.0.0

@@ -104,3 +104,8 @@ y_scale_factor = 800
 theme = "studio-dark"
 # Text size on top of the system's display scaling: 0.9, 1.0, 1.15 or 1.3
 text-scale = 1.0
+
+[app]
+# Check GitHub for a newer version when the standalone app starts (at most once a day).
+# Settings → Updates installs it.
+check-for-updates = true

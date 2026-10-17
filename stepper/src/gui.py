@@ -4,6 +4,7 @@ safe_console()
 
 import os
 import queue
+import sys
 import threading
 import time
 import tkinter
@@ -180,6 +181,8 @@ class LithographerGui:
         root.protocol("WM_DELETE_WINDOW", self.request_close)
         d.add_event_listener(Event.PATTERNING_BUSY_CHANGED, self._patterning_changed)
         d.add_event_listener(Event.MOVEMENT_LOCK_CHANGED, self._lock_changed)
+        # Autofocus may switch the focus bar to another image scale: start its "best so far" afresh.
+        d.add_event_listener(Event.AUTOFOCUS_FINISHED, lambda: self.focus_tracker.reset())
         self.show_page("operate")
         self.refresh_display_choices()
         root.after(0, self._on_start)
@@ -285,6 +288,7 @@ class LithographerGui:
         settings = ttk.Frame(host, padding=px(18))
         settings.columnconfigure(0, weight=1)
         settings.rowconfigure(0, weight=1)
+        self.restart_after_close = ""   # the installed version's label, set by Settings → Updates
         self.settings_page = SettingsPage(settings, self, self.config, self.config_path)
         self.settings_page.grid(row=0, column=0, sticky="nsew")
         self.pages["settings"] = settings
@@ -796,7 +800,9 @@ class LithographerGui:
         if window.is_open and window.display is not None:
             if window.display.primary:
                 return "Output covers this screen (press Esc to close it when no exposure runs)."
-            return f"Projecting full screen on display {window.display.number} ({window.display.width} × {window.display.height})."
+            rate = f", {window.display.refresh} Hz" if getattr(window.display, "refresh", 0) else ""
+            return (f"Projecting full screen on display {window.display.number} "
+                    f"({window.display.width} × {window.display.height}{rate}).")
         if window.is_open:
             return "Movable window: drag it onto the projector, then double-click it for fullscreen."
         if len(self.displays) < 2:
@@ -831,6 +837,7 @@ class LithographerGui:
         self._temporary_output = bool(display is not None and display.primary)
         if display is not None:
             self._match_projector_resolution(display)
+        self.dispatcher.projector_refresh_hz = getattr(display, "refresh", 0) if display is not None else 0
         self.projector_window.open(display, self._projection_image())
         self._projector_window_changed()
         return True
@@ -1237,19 +1244,31 @@ def main():
     root.withdraw()  # stay hidden until the main UI is ready
     root.report_callback_exception = report_unexpected_error
 
-    dialog = _StartupDialog(root)
-    if not dialog.run():
-        root.destroy()
-        return
+    import updater
 
-    config = dialog.config
+    restarted = updater.parse_restart_arguments(sys.argv)   # started by Settings → Updates
+    config = None
+    if restarted is not None:
+        # Same settings file and stage port as before the update: no setup window.
+        config_file, port = restarted
+        try:
+            config = toml.load(config_file)
+        except Exception as exc:
+            print(f"After the update, {config_file} could not be read ({exc}); showing the setup window.")
+    if config is None:
+        restarted = None
+        dialog = _StartupDialog(root)
+        if not dialog.run():
+            root.destroy()
+            return
+        config, port, config_file = dialog.config, dialog.selected_port, dialog._config_var.get()
+
     for change in migrate_config(config):
         print(f"Settings updated for this version: {change}")
     reader = ConfigReader(config)
     number, flag, problems = reader.number, reader.flag, reader.problems
 
     # ── Stage ────────────────────────────────────────────────────────────
-    port = dialog.selected_port
     stage = StageController()
     if port and port != "none":
         # Picking a port in the startup window means "use the stage", even if it was turned off.
@@ -1316,13 +1335,19 @@ def main():
     if problems:
         messagebox.showwarning("Check your settings", "\n\n".join(problems))
 
-    chosen = Path(dialog._config_var.get())
+    chosen = Path(config_file)
     save_path = "config.toml" if chosen.resolve() == Path("default.toml").resolve() else str(chosen)
     app = LithographerGui(LithographerConfig(stage, camera, camera_scale, red_exposure, uv_exposure, alignment_config,
                                              stage_limits), root, config, save_path)
     root.deiconify()  # show the main window now that it's fully built
     app.maximize()
+    if restarted is not None:
+        updater.mark_ready(Path.cwd())   # closes the previous version's "Updating…" window
+        root.after(1500, lambda: app.toast.show(f"Updated to {updater.build_info().label}.", "ok", seconds=12))
     root.mainloop()
+    if app.restart_after_close:
+        # An update was installed: start it with the settings just saved and the same stage port.
+        updater.restart(app.restart_after_close, save_path, port)
 
 
 if __name__ == "__main__":

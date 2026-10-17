@@ -11,6 +11,8 @@ default files there so they can be edited in any text editor:
 
     HackerfabStepper                 normal start
     HackerfabStepper --smoke-test    build the UI with no hardware, then exit (CI check)
+    HackerfabStepper --update        download and install the newest release, then exit
+    HackerfabStepper --update --check   only say whether there is one
 """
 import multiprocessing
 import os
@@ -125,6 +127,7 @@ def _smoke_test() -> int:
     from camera.webcam import Webcam
     from stage_control.stage_controller import StageController
 
+    os.environ["HACKERFAB_NO_UPDATE_CHECK"] = "1"   # never reach out to GitHub from a CI check
     gui.enable_dpi_awareness()
     root = ttk.Window(themename="darkly")
     gui.configure_ui_scale(root)
@@ -197,11 +200,21 @@ def _smoke_test() -> int:
 
 
 def main() -> int:
+    import updater
+
+    if "--update" in sys.argv and sys.stdout is not None:
+        return updater.main(sys.argv)   # started from a terminal: answer there
     home = _home()
     try:
         _redirect_output(home)
     except OSError:
         pass  # no log file; the app still runs
+    if "--update" in sys.argv:
+        return updater.main(sys.argv)   # no terminal (Windows): the answer goes to the log
+    try:
+        updater.cleanup()   # the copy an earlier update replaced, unfinished downloads
+    except Exception as exc:
+        print(f"Update clean-up skipped: {exc}")
     try:
         _prepare_working_directory(home)
         if getattr(sys, "frozen", False) and home != Path(sys.executable).resolve().parent:
