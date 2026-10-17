@@ -130,7 +130,7 @@ class CameraCanvas(tk.Canvas):
         tracker = self.app.focus_tracker
         bar_w, bar_h, gap, pad = px(140 if self.big else 90), px(8), px(8), px(6)
         right = x0 + w - margin
-        label = "FOCUS" if tracker.value is None else f"FOCUS  {tracker.value:.2f}"
+        label = "FOCUS" if tracker.value is None else f"FOCUS  {tracker.value:.3g}"
         text = self.create_text(right - pad - bar_w - gap, y0 + margin, text=label, fill=c["text"],
                                 font="StepperSmall", anchor="ne", tags="overlay")
         x1, y1, x2, y2 = self.bbox(text)
@@ -385,7 +385,7 @@ class CameraAdjustDialog:
         ttk.Checkbutton(body, text="Auto exposure and gain (finds the stripe-free exposure)", bootstyle="round-toggle",
                         variable=self.auto_exposure, command=self._auto_changed).grid(row=row, column=0, sticky="w", pady=(px(6), 0))
         row += 1
-        ttk.Checkbutton(body, text="Auto red brightness (dims the red light instead of raising gain)",
+        ttk.Checkbutton(body, text="Auto red brightness (red stays at 100 %; dimmed only if still too bright)",
                         bootstyle="round-toggle", variable=self.auto_light,
                         command=self._auto_changed).grid(row=row, column=0, sticky="w", pady=(px(6), 0))
         row += 1
@@ -395,8 +395,8 @@ class CameraAdjustDialog:
         self.search = ttk.Button(body, text="Find stripe-free exposure", bootstyle="primary-outline",
                                  command=d.start_stripe_search)
         self.search.grid(row=row, column=0, sticky="w", pady=(px(8), px(4)))
-        add_tooltip(self.search, "Tries exposures from 16 to 125 ms with red light on and keeps the one with the "
-                                 "fewest projector stripes. Takes about 10 seconds.")
+        add_tooltip(self.search, "Tries exposures from 16 to 125 ms with red light on, measures the projector lines "
+                                 "in each and keeps every exposure that is line-free. Takes about 10 seconds.")
         row += 1
         ttk.Separator(body).grid(row=row, column=0, sticky="ew", pady=px(12))
         row += 1
@@ -435,7 +435,7 @@ class CameraAdjustDialog:
         ttk.Label(body, text="Picture", style="Section.TLabel").grid(row=row, column=0, sticky="w")
         row += 1
         self.destripe = tk.BooleanVar(value=setting_flag(settings, "stripe-filter", True))
-        ttk.Checkbutton(body, text="Stripe filter (evens out leftover horizontal bands in the preview)",
+        ttk.Checkbutton(body, text="Stripe filter (removes leftover projector lines from the live picture)",
                         bootstyle="round-toggle", variable=self.destripe,
                         command=self._processing).grid(row=row, column=0, sticky="w", pady=(px(6), 0))
         row += 1

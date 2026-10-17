@@ -28,6 +28,7 @@ a = Analysis(
     hiddenimports=["gui", "settings", "dispatcher", "ui_kit", "ui_theme", "camera_view", "stage_pad",
                    "projector_panel", "steps_panel", "alignment_page", "chip_pages", "projector_leds",
                    "camera.webcam", "camera.discovery", "camera.modes", "camera.processing", "camera.auto_exposure",
+                   "camera.stripes",
                    "camera.dshow_controls", "serial.tools.list_ports", "projector_window", "pygrabber.dshow_graph",
                    "comtypes", "usb", "usb.core", "usb.util", "usb.backend.libusb1", "libusb_package"],
     excludes=["ultralytics", "torch", "torchvision", "matplotlib", "pandas", "scipy", "pytest", "IPython",

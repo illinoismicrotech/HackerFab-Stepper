@@ -33,7 +33,7 @@ def load_yolo():
         return None
 
 
-from camera.auto_exposure import AutoCamera, exposure_ms
+from camera.auto_exposure import CLEAN as CLEAN_LINES, AutoCamera, exposure_ms, refresh_hint
 from camera.camera_module import CameraModule
 from camera.processing import compute_focus_score
 from hardware import ImageProcessSettings, Lithographer, ProcessedImage
@@ -304,6 +304,7 @@ class EventDispatcher:
         self.camera_info: dict = {}       # latest frame details from the camera worker
         self.frame_index = 0              # counts frames shown, for "wait for a fresh frame"
         self.focus_scores = (None, None)  # (red, uv) from the camera worker, full resolution
+        self.focus_level: Optional[int] = None   # image scale the last autofocus judged focus at
         self.root = root
         self.config = None
         self.model = None
@@ -376,6 +377,7 @@ class EventDispatcher:
         # Automatic camera exposure / red brightness
         self.auto_camera = AutoCamera()
         self.auto_camera_wanted = True     # run the stripe search when red light is first shown
+        self.projector_refresh_hz = 0      # refresh rate of the projector display (0 = unknown)
         self._auto_started = False
 
         self.listeners = dict()
@@ -425,6 +427,28 @@ class EventDispatcher:
             case ShownImage.PATTERN:
                 return self.pattern.processed()
         return None
+
+    def preview_image(self) -> tuple[Optional[Image.Image], str]:
+        """(image for the on-screen previews, note). Red light is often dimmed to a few percent for
+        the camera, which would make the preview look black; the previews show its shape at full
+        brightness and say how bright the projector really is."""
+        if self.shown_image == ShownImage.CLEAR:
+            return None, ""
+        if self.shown_image == ShownImage.RED_FOCUS and self.red_brightness < 0.999:
+            return self.red_focus.processed(), f"red at {self.red_brightness:.0%}: shown brighter here"
+        return getattr(self.hardware.projector, "current_image", None), ""
+
+    def red_preview_of_pattern(self) -> Optional[Image.Image]:
+        """The pattern as 'Show it in red' projects it (red light, same size and position)."""
+        if not self.pattern_image_path:
+            return None
+        image = self.pattern.processed()
+        key = id(image)
+        if getattr(self, "_red_pattern_cache", (None, None))[0] != key:
+            rgb = image.convert("RGB")
+            blank = Image.new("L", rgb.size, 0)
+            self._red_pattern_cache = (key, Image.merge("RGB", (rgb.getchannel("B"), blank, blank)))
+        return self._red_pattern_cache[1]
 
     @staticmethod
     def led_mask_for(shown: ShownImage) -> int:
@@ -853,6 +877,12 @@ class EventDispatcher:
         self.focus_scores = (None, None)
 
     def current_focus(self, blue_only: bool) -> Optional[float]:
+        """Focus score for the live focus bar: at the scale the last autofocus found best, else the
+        camera's default scale (about 700 px across the centre of the picture)."""
+        levels = ((self.camera_info or {}).get("focus_levels") or {}).get("blue" if blue_only else "red")
+        if levels and self.focus_level is not None and self.focus_level < len(levels) \
+                and levels[self.focus_level] is not None:
+            return float(levels[self.focus_level])
         score = self.focus_scores[1 if blue_only else 0] if self.focus_scores else None
         if score is not None:
             return float(score)
@@ -896,6 +926,7 @@ class EventDispatcher:
         auto._last_index = -1
         auto.ranges = {}
         self._auto_started = False
+        self.focus_level = None   # another camera or resolution: the scales differ
         self.on_event(Event.CAMERA_AUTO_CHANGED)
 
     def start_stripe_search(self):
@@ -926,8 +957,11 @@ class EventDispatcher:
                 auto.ranges = getattr(self.camera, "ranges", {}) or {}
                 self._auto_started = True
                 found = getattr(self.camera, "settings", {}).get("stripe-free-exposure")
-                if auto.auto_exposure and self.auto_camera_wanted and found is None:
-                    auto.start_search(self.frame_index)
+                if auto.auto_exposure and self.auto_camera_wanted:
+                    # A remembered exposure is checked first (a few seconds) and kept if it is still
+                    # line-free; otherwise every candidate is tried. A stale value (another resolution,
+                    # another projector setting) used to bring the lines back for the whole session.
+                    auto.start_search(self.frame_index, remembered=found)
                 else:
                     auto.phase, auto.status = "track", "Auto: adjusting…"
                     auto.best_exposure = found
@@ -959,6 +993,9 @@ class EventDispatcher:
                 settings = getattr(self.camera, "settings", None)
                 if isinstance(settings, dict):
                     settings["stripe-free-exposure"] = auto.best_exposure
+                measured = [v for v in auto.results.values() if v is not None]
+                if measured and min(measured) > 2 * CLEAN_LINES:
+                    auto.summary += refresh_hint(self.projector_refresh_hz)
                 self.notify(f"Stripe-free exposure found: {auto.best_exposure} "
                             f"({exposure_ms(auto.best_exposure):g} ms).", "ok")
             self.on_event(Event.CAMERA_AUTO_CHANGED)
@@ -1198,28 +1235,119 @@ class EventDispatcher:
             self.notify("Exposure finished. " + self.last_exposure, "ok")
 
     # ------------------------------------------------------------------ autofocus
-    def _measure_focus(self, blue_only: bool, frames: int = 3) -> float:
-        # The frame being captured while the stage moved is blurred; skip it.
-        if not self.wait_for_frames(1, timeout=4.0):
-            raise RuntimeError("the camera stopped sending pictures")
-        scores = []
-        for _ in range(frames):
+    def current_focus_levels(self, blue_only: bool) -> list:
+        """Focus scores of the latest frame at every scale (full resolution, 1/2, 1/4, ...).
+        A camera without per-scale scores gives a single value."""
+        levels = (self.camera_info or {}).get("focus_levels") or {}
+        values = levels.get("blue" if blue_only else "red")
+        if values:
+            return list(values)
+        return [self.current_focus(blue_only)]
+
+    def _focus_settle_seconds(self) -> float:
+        """How long after the stage stops a frame can still contain light from while it moved:
+        the exposure, plus one frame time for the rolling shutter's readout, plus a margin."""
+        controls = getattr(self.camera, "controls", {}) or {}
+        try:
+            exposure = exposure_ms(float(controls.get("exposure", -4))) / 1000.0
+        except (TypeError, ValueError):
+            exposure = 0.0625
+        fps = float((self.camera_info or {}).get("fps") or getattr(self.camera, "measured_fps", 0) or 5.0)
+        return min(1.5, exposure + 1.0 / max(fps, 1.0) + 0.05)
+
+    def _measure_focus(self, blue_only: bool, frames: int = 3) -> tuple[list, list]:
+        """(median score per scale, frame-to-frame spread per scale) over `frames` fresh frames.
+
+        Frames carry the time they were captured; any that could have been exposed while the stage
+        was still moving are skipped. Without capture times, the first frame is skipped instead."""
+        settled_at = getattr(self, "_focus_settled_at", 0.0)
+        collected, skipped, skip_first = [], 0, True
+        while len(collected) < frames:
             if not self.wait_for_frames(1, timeout=4.0):
                 raise RuntimeError("the camera stopped sending pictures")
-            score = self.current_focus(blue_only)
-            if score is None:
+            captured = (self.camera_info or {}).get("captured")
+            if captured is not None:
+                if captured < settled_at and skipped < 12:
+                    skipped += 1
+                    continue
+            elif skip_first:
+                skip_first = False
+                continue
+            levels = self.current_focus_levels(blue_only)
+            if not levels or all(v is None for v in levels):
                 raise RuntimeError("no focus measurement from the camera")
-            scores.append(score)
-        return sorted(scores)[len(scores) // 2]
+            collected.append(levels)
+        count = min(len(levels) for levels in collected)
+        medians, spreads = [], []
+        for level in range(count):
+            values = [levels[level] for levels in collected]
+            if any(v is None for v in values):
+                medians.append(None)
+                spreads.append(None)
+                continue
+            values = sorted(float(v) for v in values)
+            medians.append(values[len(values) // 2])
+            spreads.append(values[-1] - values[0])
+        return medians, spreads
+
+    @staticmethod
+    def choose_focus_level(entries: list) -> int:
+        """The scale at which focus is easiest to judge: the one where the score changes the most
+        across the measured heights, compared with how much it jitters from frame to frame.
+        `entries` are (medians, spreads) pairs. On a near tie the finer scale wins (sharper peak)."""
+        if not entries:
+            return 0
+        count = min(len(m) for m, _s in entries)
+        best_level, best_snr = 0, -1.0
+        for level in range(count):
+            values = [m[level] for m, _s in entries]
+            spreads = [sp[level] for _m, sp in entries]
+            if any(v is None for v in values) or any(v is None for v in spreads):
+                continue
+            span = max(values) - min(values)
+            noise = sorted(spreads)[len(spreads) // 2]
+            noise = max(noise, 1e-9 * max(abs(v) for v in values), 1e-12)
+            snr = span / noise
+            if snr > best_snr * 1.25:
+                best_level, best_snr = level, snr
+        return best_level
+
+    @staticmethod
+    def _peak_of(zs: list, values: list) -> float:
+        """Height of the sharpest point: a parabola through the best measurement and its
+        neighbours (up to two each side), so the result can fall between the 2 µm steps."""
+        i = max(range(len(values)), key=values.__getitem__)
+        lo, hi = max(0, i - 2), min(len(values), i + 3)
+        if hi - lo < 3:
+            return zs[i]
+        z = np.array(zs[lo:hi], float)
+        v = np.array(values[lo:hi], float)
+        a, b, _c = np.polyfit(z - zs[i], v, 2)
+        if a >= 0:
+            return zs[i]
+        step = abs(zs[1] - zs[0]) if len(zs) > 1 else 1.0
+        return zs[i] + float(np.clip(-b / (2 * a), -step, step))
+
+    def focus_level_text(self, level: int) -> str:
+        crop = ((self.camera_info or {}).get("focus_levels") or {}).get("crop")
+        scale = "full resolution" if level == 0 else f"1/{2 ** level} resolution"
+        if crop:
+            return f"{scale} ({max(1, crop[0] >> level)} × {max(1, crop[1] >> level)} px of the picture's centre)"
+        return scale
 
     def autofocus(self, blue_only, log=False, interactive=False) -> bool:
         """Find the sharpest Z near the current position and move there.
 
-        Samples the focus score at the start and 20 µm either side to pick a direction,
-        climbs in 10 µm steps until the score drops, scans ±8 µm around the best point in
-        2 µm steps, and finally moves to the best Z it measured. Never travels more than
-        autofocus_max_travel from the start; if it finds no peak, or is stopped, it goes back
-        to the starting Z.
+        1. Coarse: the score at the start and 20 µm either side picks the direction, then 10 µm
+           steps climb until the score has dropped twice.
+        2. Fine: a scan in 2 µm steps over ±12 µm around the best coarse height (widened if the best
+           point is at an end), always moving the same way so stage backlash cannot skew it.
+        3. The score is measured at every image scale; the scale where focus changes the score the
+           most compared with frame-to-frame noise is used (a 20 MP picture at full resolution is
+           mostly noise; a heavily shrunk one barely changes with focus).
+        4. The peak is interpolated between steps and approached from below, like the scan.
+        Never travels more than autofocus_max_travel from the start; if it finds no peak, or is
+        stopped, it goes back to the starting Z.
         """
         def tell(message, kind="warn"):
             self.last_autofocus = message
@@ -1232,65 +1360,110 @@ class EventDispatcher:
             return False
         if self.autofocus_busy or self.patterning_busy or self.homing_busy:
             return False
-        samples: dict[float, float] = {}
         limit = float(self.autofocus_max_travel)
+        coarse: dict[float, tuple] = {}
 
-        def sample():
-            score = self._measure_focus(blue_only)
-            samples[round(self.stage_setpoint[2], 3)] = score
-            return score
+        def settle_mark():
+            self._focus_settled_at = time.monotonic() + self._focus_settle_seconds()
 
-        def step(dz):
+        def move_to(z):
             if self.autofocus_abort:
                 raise AutofocusStopped("stopped")
-            self.move_relative({"z": dz})
+            if abs(z - start_z) > limit + 1e-6:
+                raise _OutOfRange()
+            self.move_relative({"z": z - self.stage_setpoint[2]})
             self.wait_for_stage_idle(10.0)
             self.non_blocking_delay(0.1)
-            return sample()
+            settle_mark()
+
+        def measure(store):
+            entry = self._measure_focus(blue_only)
+            store[round(self.stage_setpoint[2], 3)] = entry
+            return entry
+
+        def value(entry, level):
+            v = entry[0][level] if level < len(entry[0]) else None
+            return float("-inf") if v is None else v
+
+        class _OutOfRange(Exception):
+            pass
 
         self.autofocus_abort = False
         self.set_autofocus_busy(True)
         start_z = self.stage_setpoint[2]
         success = False
         try:
-            mid_score = sample()
-            neg_score = step(-20.0)
-            pos_score = step(40.0)
-            self.move_relative({"z": -20.0})
-            self.wait_for_stage_idle(10.0)
-            if neg_score < mid_score < pos_score:
+            settle_mark()
+            measure(coarse)
+            move_to(start_z - 20.0)
+            measure(coarse)
+            move_to(start_z + 20.0)
+            measure(coarse)
+            level = self.choose_focus_level(list(coarse.values()))
+            mid = value(coarse[round(start_z, 3)], level)
+            neg = value(coarse[round(start_z - 20.0, 3)], level)
+            pos = value(coarse[round(start_z + 20.0, 3)], level)
+            if neg < mid < pos:
                 direction = 1.0
-            elif neg_score > mid_score > pos_score:
+            elif neg > mid > pos:
                 direction = -1.0
-            elif neg_score < mid_score and pos_score < mid_score:
+            elif neg < mid and pos < mid:
                 direction = 0.0
             else:
                 tell("could not tell which way is sharper. Focus roughly by hand first, and show solid red or a "
                      "pattern with sharp edges so the camera has detail to measure.")
                 return False
             if direction:
-                last = mid_score
-                while True:
-                    if abs(self.stage_setpoint[2] + 10.0 * direction - start_z) > limit:
-                        tell(f"no sharpest point within ±{limit:g} µm, so the stage went back to the start. "
-                             "Focus roughly by hand first.")
-                        return False
-                    score = step(10.0 * direction)
-                    if score < last:
-                        break
-                    last = score
-            best_z = max(samples, key=samples.get)
-            self.move_relative({"z": best_z - 8.0 - self.stage_setpoint[2]})
-            self.wait_for_stage_idle(10.0)
-            sample()
-            for _ in range(8):
-                step(2.0)
-            best_z = max(samples, key=samples.get)
-            self.move_relative({"z": best_z - self.stage_setpoint[2]})
-            self.wait_for_stage_idle(10.0)
+                z, best, last, drops = start_z, mid, mid, 0
+                while drops < 2:
+                    z += 10.0 * direction
+                    move_to(z)          # past the travel limit: _OutOfRange, handled below
+                    score = value(measure(coarse), level)
+                    drops = drops + 1 if score < last else 0
+                    best, last = max(best, score), score
+            else:
+                for dz in (-10.0, 10.0):
+                    move_to(start_z + dz)
+                    measure(coarse)
+            level = self.choose_focus_level(list(coarse.values()))
+            centre = max(coarse, key=lambda key: value(coarse[key], level))
+
+            # Fine scan, always moving up (+Z) so every measurement sees the same backlash.
+            fine: dict[float, tuple] = {}
+            low = max(centre - 12.0, start_z - limit)
+            high = min(centre + 12.0, start_z + limit)
+
+            def scan(z_from, z_to):
+                move_to(max(start_z - limit, z_from - 6.0))
+                z = z_from
+                while z <= z_to + 1e-6:
+                    move_to(z)
+                    measure(fine)
+                    z += 2.0
+            scan(low, high)
+            for _ in range(2):   # widen when the best point is at an end of the scan
+                level = self.choose_focus_level(list(fine.values()))
+                zs = sorted(fine)
+                top = max(zs, key=lambda key: value(fine[key], level))
+                if top >= zs[-1] - 1e-6 and zs[-1] + 2.0 <= start_z + limit:
+                    scan(zs[-1] + 2.0, min(zs[-1] + 10.0, start_z + limit))
+                elif top <= zs[0] + 1e-6 and zs[0] - 2.0 >= start_z - limit:
+                    scan(max(zs[0] - 10.0, start_z - limit), zs[0] - 2.0)
+                else:
+                    break
+            level = self.choose_focus_level(list(fine.values()))
+            zs = sorted(fine)
+            best_z = self._peak_of(zs, [value(fine[z], level) for z in zs])
+            # Approach the result from below, the same way the scan moved.
+            move_to(max(start_z - limit, best_z - 6.0))
+            move_to(best_z)
+            self.focus_level = level
             success = True
-            tell(f"done · Z {start_z:,.1f} → {best_z:,.1f} µm", "ok")
+            tell(f"done · Z {start_z:,.1f} → {best_z:,.1f} µm · judged at {self.focus_level_text(level)}", "ok")
             return True
+        except _OutOfRange:
+            tell(f"no sharpest point within ±{limit:g} µm, so the stage went back to the start. "
+                 "Focus roughly by hand first.")
         except StageError:
             self.last_autofocus = "stopped: the stage did not move"
         except AutofocusStopped:

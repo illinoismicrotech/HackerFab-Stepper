@@ -158,6 +158,8 @@ class LithographerGui:
         root.protocol("WM_DELETE_WINDOW", self.request_close)
         d.add_event_listener(Event.PATTERNING_BUSY_CHANGED, self._patterning_changed)
         d.add_event_listener(Event.MOVEMENT_LOCK_CHANGED, self._lock_changed)
+        # Autofocus may switch the focus bar to another image scale: start its "best so far" afresh.
+        d.add_event_listener(Event.AUTOFOCUS_FINISHED, lambda: self.focus_tracker.reset())
         self.show_page("operate")
         self.refresh_display_choices()
         root.after(0, self._on_start)
@@ -751,7 +753,9 @@ class LithographerGui:
         if window.is_open and window.display is not None:
             if window.display.primary:
                 return "Output covers this screen (press Esc to close it when no exposure runs)."
-            return f"Projecting full screen on display {window.display.number} ({window.display.width} × {window.display.height})."
+            rate = f", {window.display.refresh} Hz" if getattr(window.display, "refresh", 0) else ""
+            return (f"Projecting full screen on display {window.display.number} "
+                    f"({window.display.width} × {window.display.height}{rate}).")
         if window.is_open:
             return "Movable window: drag it onto the projector, then double-click it for fullscreen."
         if len(self.displays) < 2:
@@ -786,6 +790,7 @@ class LithographerGui:
         self._temporary_output = bool(display is not None and display.primary)
         if display is not None:
             self._match_projector_resolution(display)
+        self.dispatcher.projector_refresh_hz = getattr(display, "refresh", 0) if display is not None else 0
         self.projector_window.open(display, self._projection_image())
         self._projector_window_changed()
         return True

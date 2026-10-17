@@ -282,16 +282,18 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
 <p>A low frame rate is not a problem here: it leaves room for the longer exposures that remove projector stripes.</p>
 
 <h3>Why the picture had stripes, and how they are removed</h3>
-<p>A DLP projector shows red, green and blue one after another many times a second. The camera reads its sensor row by row (a rolling shutter), so rows exposed at different moments catch different amounts of light: horizontal bands. Three things make them disappear:</p>
+<p>A DLP projector shows red, green and blue one after another many times a second, and draws each brightness level as a pattern of very short mirror flashes. The camera reads its sensor row by row (a rolling shutter), so rows exposed at different moments catch different amounts of light: thin horizontal lines with an even spacing. These things make them disappear:</p>
 <ol class="steps">
-  <li><strong>Stripe-free exposure.</strong> If each row is exposed for a whole number of the projector's colour cycles, every row gets the same light. While red light is on, the app tries exposures of 16, 31, 62.5 and 125 ms, measures how striped each one is, and keeps the best. This takes about 10 seconds the first time and is remembered.</li>
+  <li><strong>Stripe-free exposure.</strong> If each row is exposed for a whole number of the projector's light cycles, every row gets the same light. While red light is on, the app tries exposures of 16, 31, 62.5 and 125 ms, measures the lines in each, and keeps every exposure that is line-free (the <i>line-free set</i>). This takes about 10 seconds. The result is remembered; the next time red light comes on, the remembered exposure is checked first (a few seconds) and the full search runs again only if lines have come back.</li>
+  <li><strong>Full red light.</strong> A dimmed red is drawn by the projector's mirrors with fewer, unevenly spread flashes, which brings lines back at any exposure. The automatic brightness therefore keeps red at 100 % and uses the exposure (within the line-free set) and gain instead; it dims red only when the picture is still too bright at the shortest line-free exposure.</li>
   <li><strong>Fixed white balance.</strong> The camera's automatic white balance sees a red-only picture and turns up green and blue, which magnifies the faint green/blue light the projector leaks into bold teal and pink bands. The app keeps white balance fixed at 4500 K.</li>
   <li><strong>Unused LEDs off.</strong> With the projector's USB cable connected, the app turns the green and blue LEDs off while focusing, so they cannot leak at all (<a href="#projector">Part 6</a>).</li>
 </ol>
-<p>A software <span class="ui">Stripe filter</span> evens out anything left over in the live picture (never in snapshots).</p>
+<p>A software <span class="ui">Stripe filter</span> removes what is left in the live picture (never in snapshots). It finds the lines by their even spacing and removes only that repeating pattern, so the chip edge, letters and the dark area around the chip are left alone. (A real, evenly spaced horizontal grating that fills most of the picture can look like lines to it: turn the filter off to inspect one.)</p>
+<p><b>Projector refresh rate.</b> At 60 Hz none of the camera's exposure steps lasts a whole number of projector frames (16.7 ms), so faint lines can remain. If the search reports that, and Windows offers 48 Hz or 24 Hz for the projector display (<span class="ui">Settings → System → Display</span> → the projector → <span class="ui">Advanced display</span>), try it and run <span class="ui">Find stripe-free exposure</span> again: 125 ms is then exactly 6 or 3 frames. The output line on the Projector panel shows the display's current refresh rate.</p>
 
 <h3>Automatic brightness</h3>
-<p>With <span class="ui">Auto</span> on next to <span class="ui">Red brightness</span>, the app keeps the brightest parts of the picture bright but not clipped. It does this mostly by dimming or brightening the red light, which keeps the stripe-free exposure and adds no noise; only if that is not enough does it raise camera gain, and as a last resort the exposure. The <span class="ui">2 Focus</span> step shows what it is doing, for example <span class="ui">Auto: settled · exposure -4 (62.5 ms) · red 45% · gain 100</span>.</p>
+<p>With <span class="ui">Auto</span> on, the app keeps the brightest parts of the picture bright but not clipped, without bringing lines back: red light stays at 100 %; too dark, it switches to a longer line-free exposure, then raises gain (at most 4× the minimum); too bright, it lowers gain, then switches to a shorter line-free exposure, and only then dims red. The exposure never leaves the line-free set. It reacts only when brightness has been outside a wide band for a few frames, then aims for the middle, so it stays still while you move around the chip. The <span class="ui">2 Focus</span> step shows what it is doing, for example <span class="ui">Auto: settled · exposure -3 (125 ms) · red 100% · gain 6</span>.</p>
 <p>Automatic settings only run while red light is on. Moving the red brightness slider yourself turns <span class="ui">Auto</span> brightness off; moving exposure or gain yourself turns auto exposure off.</p>
 
 <h3>Camera adjustments</h3>
@@ -299,12 +301,12 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
 <div class="table-wrap"><table>
   <tr><th>Control</th><th>What it does</th></tr>
   <tr><td><span class="ui">Auto exposure and gain</span></td><td>The stripe search and gain control described above.</td></tr>
-  <tr><td><span class="ui">Auto red brightness</span></td><td>Dims the red light instead of raising gain.</td></tr>
+  <tr><td><span class="ui">Auto red brightness</span></td><td>Lets the app dim the red light, only when the picture is too bright even at the shortest line-free exposure and lowest gain.</td></tr>
   <tr><td><span class="ui">Find stripe-free exposure</span></td><td>Runs the search again, e.g. after changing the projector's refresh rate.</td></tr>
   <tr><td><span class="ui">Exposure</span></td><td>In Windows camera units: −4 = 62.5 ms, −5 = 31 ms, −3 = 125 ms. Each step doubles or halves it.</td></tr>
   <tr><td><span class="ui">Gain</span>, <span class="ui">Brightness</span>, <span class="ui">Contrast</span>, <span class="ui">Saturation</span></td><td>The camera's own picture controls.</td></tr>
   <tr><td><span class="ui">White balance</span></td><td>Fixed colour temperature. Leave it around 4500 K.</td></tr>
-  <tr><td><span class="ui">Stripe filter</span></td><td>Evens out leftover horizontal bands in the live picture.</td></tr>
+  <tr><td><span class="ui">Stripe filter</span></td><td>Removes leftover, evenly spaced projector lines from the live picture.</td></tr>
   <tr><td><span class="ui">Frame averaging</span></td><td>Averages 2, 4 or 8 frames: less noise and flicker, slower to react.</td></tr>
   <tr><td><span class="ui">Reset</span> / <span class="ui">Save as default</span></td><td>Back to the factory values / keep the current values for next time.</td></tr>
 </table></div>
@@ -357,7 +359,7 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
   <tr><td><span class="badge uv">BLUE MARK</span></td><td>The blue focus mark (a plus sign). Exposes resist where it lands.</td></tr>
   <tr><td><span class="badge warn">STARTING</span></td><td>You pressed Start and the app is waiting for the stage to stop. Nothing is exposed yet; <kbd>Esc</kbd> cancels.</td></tr>
 </table></div>
-<p>The thumbnail is the exact image on the output window. Click it, or <span class="ui">Enlarge</span>, for a larger <b>preview</b> window you can resize. The preview only mirrors the output; closing it never changes what is projected.</p>
+<p>The thumbnail shows the image on the output window, in red or blue. Red light dimmed for the camera (often well below 100 %) would look black, so it is drawn at full brightness with its real level in the corner (for example <span class="ui">8%</span>). Click it, or <span class="ui">Enlarge</span>, for a larger <b>preview</b> window you can resize. The preview only mirrors the output; closing it never changes what is projected.</p>
 
 <h3>LED control over USB (recommended)</h3>
 <p>The projector board has its own USB port next to the HDMI input. With it connected to the computer, the app switches the LEDs:</p>
@@ -410,7 +412,7 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
 <ol class="steps">
   <li><strong><span class="ui">Choose pattern…</span></strong> PNG, JPEG, BMP or TIFF. Bright pixels get light; transparent pixels count as black.</li>
   <li><strong>Check the details:</strong> the size, and whether it <span class="ui">fills the projector exactly</span> or is scaled to fit. For pixel-exact results, make the pattern the projector's resolution.</li>
-  <li><strong>Check the preview.</strong> It shows the pattern exactly as it will be projected: blue on black.</li>
+  <li><strong>Check the preview.</strong> <span class="ui">Blue · exposure</span> shows the pattern exactly as it will be exposed: blue on black. <span class="ui">Red · focus</span> shows it in safe red light, as <span class="ui">Show it in red</span> projects it for lining up and focusing.</li>
   <li><strong>Options:</strong> <span class="ui">Border</span> leaves a dark margin (percent of the field); <span class="ui">Pure black &amp; white</span> turns grey pixels fully on or off at the cut-off. Shifting or rotating is on the <a href="#alignment">Alignment</a> page.</li>
   <li><strong><span class="ui">Show it in red</span></strong> projects the pattern in red (safe) and switches to step 2, so you can see where it lands on the chip.</li>
 </ol>
@@ -420,8 +422,8 @@ footer { max-width: 76rem; margin: 0 auto; padding: 2rem; border-top: 1px solid 
 <ol class="steps red">
   <li><strong>Choose what the red light shows</strong> under <span class="ui">RED LIGHT SHOWS</span>: <span class="ui">Solid</span> (even red, best for finding the chip and focusing), <span class="ui">Pattern</span> (your pattern in red, to line it up), <span class="ui">Inverted</span>, or <span class="ui">Image…</span> (your own focusing picture).</li>
   <li><strong>Find the spot</strong> with the arrow pad or arrow keys, a large step first, then smaller.</li>
-  <li><strong>Focus</strong> with <span class="ui">Z +</span> / <span class="ui">Z −</span> (or <kbd>Page Up</kbd> / <kbd>Page Down</kbd>) until the focus bar is as long as it gets, or press <span class="ui">Autofocus</span> (about 20 s; <span class="ui">Stop</span> or <kbd>Esc</kbd> cancels). Autofocus needs a picture with some detail and a start reasonably close to focus. It never moves more than 150 µm from where it started; if it finds no sharpest point, loses the camera, or is stopped, it moves back to the starting Z.</li>
-  <li><strong>Let the camera settle.</strong> The first time, the line under <span class="ui">Auto exposure</span> says <span class="ui">Finding the stripe-free exposure…</span> for about 10 seconds, then <span class="ui">Auto: settled</span>.</li>
+  <li><strong>Focus</strong> with <span class="ui">Z +</span> / <span class="ui">Z −</span> (or <kbd>Page Up</kbd> / <kbd>Page Down</kbd>) until the focus bar is as long as it gets, or press <span class="ui">Autofocus</span> (about 30 s; <span class="ui">Stop</span> or <kbd>Esc</kbd> cancels). Autofocus judges sharpness in the middle half of the picture at several scales at once (full resolution, ½, ¼, …) and uses the scale where focus changes the picture most compared with frame-to-frame noise; at full resolution a 20 MP camera mostly sees noise. It finds the peak roughly in 10 µm steps, then scans ±12 µm in 2 µm steps, always moving upward so stage backlash cannot shift the result, interpolates between steps and approaches the final height from below. Its message says which scale it used, and the focus bar then uses the same scale. It needs a picture with some detail and a start reasonably close to focus. It never moves more than 150 µm from where it started; if it finds no sharpest point, loses the camera, or is stopped, it moves back to the starting Z.</li>
+  <li><strong>Let the camera settle.</strong> The line under <span class="ui">Auto exposure</span> says <span class="ui">Checking the remembered stripe-free exposure…</span> or <span class="ui">Finding the stripe-free exposure…</span> for a few seconds, then <span class="ui">Auto: settled</span>.</li>
 </ol>
 
 <h3 id="exp-expose">3 Expose <span class="tag uv">blue light</span></h3>
@@ -532,7 +534,9 @@ auto-snapshot = true</pre>
   <li>If the Focus step says <span class="ui">The camera did not accept exposure…</span>, close other camera programs and click <span class="ui">Reconnect</span>. If it keeps saying so, send the camera diagnostics (<span class="ui">Settings → Camera → Copy camera diagnostics</span>).</li>
   <li>Connect the projector's USB cable for LED control (<a href="#projector">Part 6</a>). This removes the teal/pink bands completely.</li>
   <li>Check <span class="ui">Adjust… → White balance</span> is a number (about 4500 K), not automatic.</li>
-  <li>If the picture went dark after the search, click <span class="ui">Adjust… → Reset</span> and run the search again with <span class="ui">Red brightness</span> at 100 %. Automatic exposure stays between 15.6 and 125 ms; shorter exposures only make the stripes worse.</li>
+  <li>If <span class="ui">Red brightness</span> is well below 100 %, lines can come back: the dimmed red is drawn with uneven flashes. Turn <span class="ui">Auto</span> back on next to it (it then stays at 100 % unless the picture is too bright).</li>
+  <li>If the search says lines remain at every exposure and mentions the refresh rate, try 48 Hz or 24 Hz for the projector display (see <a href="#camera">Part 4</a>).</li>
+  <li>If the picture went dark after the search, click <span class="ui">Adjust… → Reset</span> and run the search again. Automatic exposure stays between 15.6 and 125 ms; shorter exposures only make the lines worse.</li>
   <li>Turn on <span class="ui">Stripe filter</span> and try <span class="ui">Frame averaging</span> 2 or 4.</li>
 </ol></div></details>
 <details><summary>The picture is solid red, pink or white (overexposed)</summary><div>
@@ -587,7 +591,7 @@ auto-snapshot = true</pre>
 <details><summary>Arrow keys do nothing</summary><div>
 <p>The keyboard is in a text field. Click the camera picture and try again. Keys are also ignored during an exposure, autofocus, homing or tiling.</p></div></details>
 <details><summary>Autofocus stops with a message</summary><div>
-<p>It needs a live picture with detail and a start reasonably close to focus. Focus roughly by hand, show solid red or a pattern with sharp edges, and try again. <i>No sharpest point within ±150 µm</i> means focus is further away than that: get close by hand first. After any failure it returns the stage to the Z it started from.</p></div></details>
+<p>It needs a live picture with detail and a start reasonably close to focus. Focus roughly by hand, show solid red or a pattern with sharp edges, and try again. If it finishes but the picture is not the sharpest, check its message: it names the image scale it judged focus at; the chip may have too little detail in the middle half of the picture, so move to an area with edges. <i>No sharpest point within ±150 µm</i> means focus is further away than that: get close by hand first. After any failure it returns the stage to the Z it started from.</p></div></details>
 
 <h3>Starting the app</h3>
 <details><summary>"Windows protected your PC"</summary><div><p>Click <span class="ui">More info</span>, <span class="ui">Run anyway</span>.</p></div></details>
@@ -612,8 +616,9 @@ auto-snapshot = true</pre>
   <tr><td><span class="path">src/stepper_app.py</span></td><td>Exe entry point: working folder, log, smoke test.</td></tr>
   <tr><td><span class="path">src/gui.py</span></td><td>The main window, startup window and <code>main()</code>.</td></tr>
   <tr><td><span class="path">src/dispatcher.py</span></td><td>State and actions: projection, LEDs, exposures, autofocus, stage, automatic camera settings.</td></tr>
-  <tr><td><span class="path">src/camera/webcam.py</span></td><td>Capture process: mode choice, live controls, preview, focus and statistics, full-resolution snapshots.</td></tr>
+  <tr><td><span class="path">src/camera/webcam.py</span></td><td>Capture process: mode choice, live controls, preview, focus at every image scale, line measurement and statistics, full-resolution snapshots.</td></tr>
   <tr><td><span class="path">src/camera/auto_exposure.py</span></td><td>Stripe-free exposure search and brightness control.</td></tr>
+  <tr><td><span class="path">src/camera/stripes.py</span></td><td>Finds the projector lines by their even spacing: measures them and removes them from the live picture.</td></tr>
   <tr><td><span class="path">src/camera/processing.py</span>, <span class="path">modes.py</span>, <span class="path">dshow_controls.py</span></td><td>Image processing, camera modes, DirectShow control ranges.</td></tr>
   <tr><td><span class="path">src/projector_leds.py</span></td><td>DLPC6540 LED enable over USB.</td></tr>
   <tr><td><span class="path">src/camera_view.py</span>, <span class="path">stage_pad.py</span>, <span class="path">projector_panel.py</span>, <span class="path">steps_panel.py</span></td><td>The Operate page's parts.</td></tr>
@@ -629,7 +634,7 @@ auto-snapshot = true</pre>
 <h3>Tests</h3>
 <pre>cd stepper
 python -m unittest discover -s tests</pre>
-<p>156 tests: the camera worker with a simulated camera (mode choice, live controls, snapshots), image processing and the automatic camera settings against a simulated projector, LED control with a simulated USB device, the stepper logic (exposures, LED sequencing, STOP, safety timer, autofocus limits, stage position and homing, GRBL replies) and the main window with simulated camera, stage, displays and LEDs. GUI tests need a display and answer every dialog automatically.</p>
+<p>172 tests: the camera worker with a simulated camera (mode choice, live controls, snapshots), image processing and the automatic camera settings against a simulated projector, LED control with a simulated USB device, the stepper logic (exposures, LED sequencing, STOP, safety timer, autofocus limits, stage position and homing, GRBL replies) and the main window with simulated camera, stage, displays and LEDs. GUI tests need a display and answer every dialog automatically.</p>
 </section>
 
 <!-- =============================== Appendix =============================== -->

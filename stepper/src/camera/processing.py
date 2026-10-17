@@ -5,6 +5,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from camera.stripes import analyse, apply_gains
+
 
 def fit_size(width: int, height: int, max_w: int, max_h: int) -> tuple[int, int]:
     """Largest size with the same aspect ratio that fits inside max_w x max_h (never upscales)."""
@@ -21,50 +23,22 @@ def downscale(image: np.ndarray, max_w: int, max_h: int) -> np.ndarray:
 
 
 def destripe(image: np.ndarray, degree: int = 3) -> np.ndarray:
-    """Remove horizontal bands (rolling shutter vs. a flickering light source).
+    """Remove the projector's horizontal stripes (rolling shutter vs. pulsed DLP light).
 
-    Each row is scaled so its median brightness follows a smooth top-to-bottom trend
-    (a low-order polynomial), per colour channel. Real image content survives as long as
-    it does not fill most of a row; full-width horizontal features are flattened, so this
-    is an option, not a fix for the light source.
-    """
-    if image.ndim != 3 or image.shape[0] < 8:
+    Only the evenly spaced, repeating part of the row brightness is removed (see camera.stripes),
+    so the chip edge, letters and the dark area around the chip are left as they are. Returns the
+    same array when there is nothing to remove. `degree` is kept for compatibility."""
+    if image.ndim != 3 or image.shape[0] < 16:
         return image
-    h = image.shape[0]
-    step = max(1, image.shape[1] // 240)  # ~240 samples per row is plenty for a median
-    rows = np.median(image[:, ::step, :], axis=1).astype(np.float32)  # H x C
-    y = np.linspace(-1.0, 1.0, h)
-    gain = np.ones_like(rows)
-    for c in range(rows.shape[1]):
-        profile = rows[:, c]
-        if profile.max() < 4.0:  # channel essentially dark: nothing to correct
-            continue
-        trend = np.polyval(np.polyfit(y, profile, degree), y)
-        valid = profile > 2.0
-        gain[valid, c] = np.clip(trend[valid] / profile[valid], 0.25, 4.0)
-    if np.allclose(gain, 1.0):
-        return image
-    out = image.astype(np.float32)
-    out *= gain[:, None, :]
-    np.clip(out, 0, 255, out=out)
-    return out.astype(np.uint8)
+    return apply_gains(image, analyse(image).gains)
 
 
 def stripe_strength(image: np.ndarray):
-    """How striped the image is: relative row-to-row variation of the brightest channel's
-    row medians after removing the smooth trend (0 = none, ~0.1 = clearly visible).
+    """How striped the image is: RMS of the repeating row-to-row brightness change (0.01 = 1 %).
     None when the picture is too dark to tell (a dark picture is not a stripe-free one)."""
-    if image.ndim != 3 or image.shape[0] < 8:
+    if image.ndim != 3 or image.shape[0] < 16:
         return None
-    step = max(1, image.shape[1] // 240)
-    rows = np.median(image[:, ::step, :], axis=1).astype(np.float32)
-    c = int(np.argmax(rows.mean(axis=0)))
-    profile = rows[:, c]
-    if profile.mean() < 4.0:
-        return None
-    y = np.linspace(-1.0, 1.0, len(profile))
-    trend = np.polyval(np.polyfit(y, profile, 3), y)
-    return float(np.std(profile - trend) / max(1.0, float(np.mean(trend))))
+    return analyse(image).strength
 
 
 class FrameAverager:
@@ -124,6 +98,66 @@ def compute_focus_score(camera_image: np.ndarray, blue_only: bool) -> float:
     gx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=1))
     row_brightness = gray.mean(axis=1, keepdims=True) + 1.0
     return float((gx / row_brightness).var())
+
+
+FOCUS_LEVELS = 6        # full resolution, 1/2, 1/4, 1/8, 1/16, 1/32
+FOCUS_FRACTION = 0.5    # focus is judged on the middle half (width and height) of the picture
+FOCUS_DEFAULT_WIDTH = 700
+
+
+def gradient_score(gray: np.ndarray) -> float:
+    """Sharpness of one grey image: mean squared horizontal gradient, each row divided by its own
+    brightness so projector stripes (whole rows brighter or darker) cannot change the score.
+    ×1000 only to give readable numbers."""
+    if gray.size == 0 or float(gray.mean()) <= 0.5:
+        return 0.0
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=1)   # [-1 0 1] along the row: rows are never mixed
+    row = gray.mean(axis=1, keepdims=True) + 1.0
+    return float(np.mean(np.square(gx / row))) * 1000.0
+
+
+def focus_pyramid(channel: np.ndarray, levels: int = FOCUS_LEVELS, half: np.ndarray | None = None) -> list:
+    """Sharpness at full resolution and at 1/2, 1/4, ... of it (None once the picture gets tiny).
+
+    Which scale is best depends on the optics and the chip: at full resolution a 20 MP sensor
+    mostly sees noise (and under red light only every other pixel has a red filter); at a coarse
+    scale the score barely changes with focus. Autofocus measures them all and uses the one where
+    focus changes the score the most compared with frame-to-frame noise.
+    `half`, if given, is the same picture already reduced to half size (saves recomputing it)."""
+    scores = [gradient_score(channel.astype(np.float32)) if min(channel.shape[:2]) >= 24 else None]
+    img = (half if half is not None else cv2.pyrDown(channel)).astype(np.float32)
+    for level in range(1, levels):
+        if level > 1:
+            img = cv2.pyrDown(img)
+        scores.append(gradient_score(img) if min(img.shape[:2]) >= 24 else None)
+    return scores
+
+
+def default_focus_level(crop_width: int) -> int:
+    """The scale shown on the live focus bar until an autofocus picks one: about 700 px wide."""
+    if crop_width <= FOCUS_DEFAULT_WIDTH:
+        return 0
+    return int(min(FOCUS_LEVELS - 1, max(0, round(np.log2(crop_width / FOCUS_DEFAULT_WIDTH)))))
+
+
+def focus_measurements(frame_bgr: np.ndarray, fraction: float = FOCUS_FRACTION, half: np.ndarray | None = None) -> dict:
+    """Focus scores for the red and blue channels at every scale, from the middle of the
+    full-resolution frame. `half` is the whole frame at half size if the caller has it already.
+    A channel that is essentially dark (blue under red light) scores 0 without being measured."""
+    h, w = frame_bgr.shape[:2]
+    cw, ch = max(16, int(w * fraction)), max(16, int(h * fraction))
+    crop = center_crop(frame_bgr, cw, ch)
+    half_crop = center_crop(half, max(8, cw // 2), max(8, ch // 2)) if half is not None else None
+    means = crop[::16, ::16].reshape(-1, 3).mean(axis=0)
+    result = {"crop": (crop.shape[1], crop.shape[0]), "default": default_focus_level(crop.shape[1])}
+    for name, index in (("red", 2), ("blue", 0)):
+        if means[index] < 0.04 * max(float(means.max()), 1.0) or means[index] < 0.5:
+            result[name] = [0.0] * FOCUS_LEVELS
+            continue
+        channel = np.ascontiguousarray(crop[:, :, index])
+        sub = np.ascontiguousarray(half_crop[:, :, index]) if half_crop is not None else None
+        result[name] = focus_pyramid(channel, half=sub)
+    return result
 
 
 def center_crop(image: np.ndarray, max_w: int = 1200, max_h: int = 1200) -> np.ndarray:

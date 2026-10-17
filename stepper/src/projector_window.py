@@ -25,6 +25,7 @@ class Display:
     width: int
     height: int
     primary: bool = False
+    refresh: int = 0     # refresh rate in Hz (0 = unknown)
 
     @property
     def label(self) -> str:
@@ -44,7 +45,36 @@ def _windows_displays() -> list[Display]:
         _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT), ("rcWork", RECT),
                     ("dwFlags", wintypes.DWORD), ("szDevice", wintypes.WCHAR * 32)]
 
+    class DEVMODEW(ctypes.Structure):
+        _fields_ = [("dmDeviceName", wintypes.WCHAR * 32), ("dmSpecVersion", wintypes.WORD),
+                    ("dmDriverVersion", wintypes.WORD), ("dmSize", wintypes.WORD), ("dmDriverExtra", wintypes.WORD),
+                    ("dmFields", wintypes.DWORD), ("dmPositionX", wintypes.LONG), ("dmPositionY", wintypes.LONG),
+                    ("dmDisplayOrientation", wintypes.DWORD), ("dmDisplayFixedOutput", wintypes.DWORD),
+                    ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short), ("dmYResolution", ctypes.c_short),
+                    ("dmTTOption", ctypes.c_short), ("dmCollate", ctypes.c_short),
+                    ("dmFormName", wintypes.WCHAR * 32), ("dmLogPixels", wintypes.WORD),
+                    ("dmBitsPerPel", wintypes.DWORD), ("dmPelsWidth", wintypes.DWORD),
+                    ("dmPelsHeight", wintypes.DWORD), ("dmDisplayFlags", wintypes.DWORD),
+                    ("dmDisplayFrequency", wintypes.DWORD), ("dmICMMethod", wintypes.DWORD),
+                    ("dmICMIntent", wintypes.DWORD), ("dmMediaType", wintypes.DWORD),
+                    ("dmDitherType", wintypes.DWORD), ("dmReserved1", wintypes.DWORD),
+                    ("dmReserved2", wintypes.DWORD), ("dmPanningWidth", wintypes.DWORD),
+                    ("dmPanningHeight", wintypes.DWORD)]
+
     user32 = ctypes.windll.user32
+
+    def refresh_of(device: str) -> int:
+        """Current refresh rate of a display (Hz), 0 if Windows does not say."""
+        try:
+            mode = DEVMODEW()
+            mode.dmSize = ctypes.sizeof(DEVMODEW)
+            if user32.EnumDisplaySettingsW(device, -1, ctypes.byref(mode)):   # ENUM_CURRENT_SETTINGS
+                hz = int(mode.dmDisplayFrequency)
+                return hz if 1 < hz < 1000 else 0
+        except Exception:
+            pass
+        return 0
+
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
                                        ctypes.POINTER(RECT), wintypes.LPARAM)
     user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
@@ -58,7 +88,8 @@ def _windows_displays() -> list[Display]:
             match = re.search(r"(\d+)$", info.szDevice or "")
             number = int(match.group(1)) if match else len(found) + 1
             found.append(Display(number, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                                 bool(info.dwFlags & 1)))  # MONITORINFOF_PRIMARY
+                                 bool(info.dwFlags & 1),   # MONITORINFOF_PRIMARY
+                                 refresh_of(info.szDevice)))
         return True
 
     user32.EnumDisplayMonitors(None, None, callback_type(visit), 0)

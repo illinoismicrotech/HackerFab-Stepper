@@ -43,7 +43,7 @@ video-file codec. Most of what remains is OpenCV itself.
 - Alignment marker detection (YOLO) is not included in the exe, because PyTorch would make it over 1 GB. Use `run.bat` when you need it.
 - **One screen to operate**: the Operate page shows the live camera, the stage pad, what the projector is showing (badge, sentence and exact thumbnail) and the three steps of an exposure (1 Pattern, 2 Focus, 3 Expose). See `HOW-TO-GUIDE.html` (F1 in the app).
 - **Projector output** opens on the projector's display at launch (Windows must be set to Extend with Win+P), at that display's own resolution so patterns are projected pixel for pixel. `[projector] window = "off"` disables the automatic opening.
-- **Camera**: the highest resolution at the lowest frame rate by default (Arducam B0477: 5472 × 3648 at 9 fps). Automatic exposure finds the exposure that removes the projector's stripes, keeps the picture bright but not clipped by dimming the red light, and keeps white balance fixed so red stays red.
+- **Camera**: the highest resolution at the lowest frame rate by default (Arducam B0477: 5472 × 3648 at 9 fps). Automatic exposure finds the exposures that are free of projector lines, keeps the picture bright but not clipped with red light at 100 % (exposure within the line-free set, then gain; red is dimmed only as a last resort), and keeps white balance fixed so red stays red.
 - **Projector LEDs over USB** (optional): connect the projector board's USB port to the PC and the app switches the unused LEDs off (red only while focusing, blue for exposures, all off when clear). This removes the remaining coloured bands and keeps stray blue light off the resist.
 - Every push to `main` or `UI+Packaging` builds the exe on GitHub Actions (**Actions → Build Windows exe → Artifacts**).
 - To build it locally on Windows, run `.\packaging\build_exe.ps1` from this folder. The result is `dist\HackerfabStepper.exe`. `.\packaging\build_exe.ps1 -SlimOpenCV` builds a 29 MB exe with the experimental slim OpenCV in `packaging\opencv-slim\` (a MinGW cross-build, `packaging/build_opencv_slim.sh`). It is not the default until it has been confirmed on the stepper's camera.
@@ -335,7 +335,10 @@ The **Operate** page is everything you need for an exposure on one screen:
   chip record) use the coordinates the controller reports (machine coordinates with G53 on
   a standard GRBL setup, work coordinates if `$10` reports WPos).
 - **Homing** runs without freezing the window; STOP cancels it with a GRBL soft reset.
-- **Autofocus** never moves more than ±150 µm from where it started and returns there if it
+- **Autofocus** judges sharpness at several image scales (full resolution, 1/2, 1/4, …) and uses
+  the one where focus changes the picture most compared with frame-to-frame noise. It scans in
+  one direction only (stage backlash), interpolates between 2 µm steps, and approaches the result
+  from below. It never moves more than ±150 µm from where it started and returns there if it
   fails or is stopped.
 
 ## Camera settings
@@ -348,18 +351,24 @@ fallback). Choose another resolution from the list under the camera picture or i
 **Settings → Camera**.
 
 The live picture is a preview (at most 1600 px wide) computed in the capture
-process; focus is measured on the full-resolution centre of each frame, and
-snapshots are written at full resolution by the capture process.
+process; focus is measured on the middle half of each full-resolution frame at six
+scales, and snapshots are written at full resolution by the capture process.
 
 Automatic settings (on by default, while the projector shows red light):
 
-1. **Stripe-free exposure.** DLP projectors flash their colours; a rolling-shutter
-   camera sees stripes unless the exposure spans a whole number of flashes. The app
-   tries 16, 31, 62.5 and 125 ms, measures the stripes and keeps the best (the
-   result is remembered in `stripe-free-exposure`).
-2. **Brightness.** It keeps the brightest pixels high but below clipping by
-   dimming or brightening the red light (gamma-aware), then by camera gain, and only
-   as a last resort by changing exposure.
+1. **Stripe-free exposure.** DLP projectors flash their light; a rolling-shutter
+   camera sees evenly spaced lines unless the exposure spans a whole number of light
+   cycles. The app tries 16, 31, 62.5 and 125 ms, measures the lines (`camera/stripes.py`
+   finds them by their spacing, so the chip edge and dark margins do not count) and
+   keeps every exposure that is line-free. The best is remembered in
+   `stripe-free-exposure` and checked first next time; the full search runs only if
+   it has lines again. If none is line-free and the projector display runs at 60 Hz,
+   the result suggests 48 Hz or 24 Hz (125 ms is then a whole number of frames).
+2. **Brightness.** Red light stays at 100 % (dimmed red is drawn with uneven mirror
+   flashes, which brings lines back). Too dark: a longer line-free exposure, then
+   gain (up to 4× the minimum). Too bright: less gain, a shorter line-free exposure,
+   and only then dimmer red. It acts only after brightness has left a wide band for
+   a few frames, then aims for the middle, so it does not keep adjusting while you move.
 3. **Fixed white balance** (4500 K) so red light stays red; automatic white
    balance turns faint green/blue projector light into coloured bands.
 
@@ -396,7 +405,7 @@ Mode discovery follows the [V4L2 format enumeration API](https://docs.kernel.org
 Requested properties may differ from driver results, as documented by
 [OpenCV's capture property API](https://docs.opencv.org/4.x/d4/d15/group__videoio__flags__base.html).
 
-Run the regression checks (156 tests) with:
+Run the regression checks (172 tests) with:
 
 ```bash
 PYTHONPATH=src .venv-3.12/bin/python -m unittest discover -s tests -v
